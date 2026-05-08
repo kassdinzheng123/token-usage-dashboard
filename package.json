@@ -1,0 +1,13 @@
+{
+  "name": "token-usage-dashboard",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-native-mac.mjs",
+    "build:rust-backend": "cargo build --release --manifest-path rust-backend/Cargo.toml",
+    "build:native-mac": "node scripts/build-native-mac.mjs",
+    "dist:native-mac": "node scripts/build-native-mac.mjs --dmg --notarize",
+    "dist:native-mac:local": "node scripts/build-native-mac.mjs --dmg"
+  }
+}

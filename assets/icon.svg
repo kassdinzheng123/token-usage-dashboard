@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Rising usage chart icon">
+  <defs>
+    <filter id="icon-shadow" x="-12%" y="-12%" width="124%" height="124%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#000000" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#ffffff"/>
+
+  <g filter="url(#icon-shadow)">
+    <rect x="210" y="657" width="112" height="181" rx="17" fill="#000000"/>
+    <rect x="375" y="574" width="113" height="264" rx="17" fill="#000000"/>
+    <rect x="540" y="485" width="113" height="353" rx="17" fill="#000000"/>
+    <rect x="706" y="372" width="113" height="466" rx="17" fill="#000000"/>
+
+    <polyline
+      points="265,527 429,431 591,369 750,211"
+      fill="none"
+      stroke="#000000"
+      stroke-width="39"
+      stroke-linecap="round"
+      stroke-linejoin="round"/>
+
+    <circle cx="265" cy="527" r="43" fill="#ffffff" stroke="#000000" stroke-width="22"/>
+    <circle cx="429" cy="431" r="43" fill="#ffffff" stroke="#000000" stroke-width="22"/>
+    <circle cx="591" cy="369" r="43" fill="#ffffff" stroke="#000000" stroke-width="22"/>
+    <circle cx="750" cy="211" r="43" fill="#ffffff" stroke="#000000" stroke-width="22"/>
+  </g>
+</svg>

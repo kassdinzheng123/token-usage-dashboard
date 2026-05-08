@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Pi Agent</title>
+  <rect width="64" height="64" rx="10" fill="#111923"/>
+  <g stroke="#243244" stroke-width="1" opacity="0.55">
+    <path d="M8 0v64M24 0v64M40 0v64M56 0v64M0 8h64M0 24h64M0 40h64M0 56h64"/>
+  </g>
+  <path fill="#f6f7f3" d="M18 8h28v14H32v14h14v14H32v14H18V8Zm28 22h14v26H46V30Z"/>
+</svg>

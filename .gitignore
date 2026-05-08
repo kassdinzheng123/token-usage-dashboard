@@ -1,0 +1,44 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local env / secrets
+.env
+.env.*
+*.local
+*.secret
+*.key
+*.pem
+*.p12
+*.mobileprovision
+.direnv/
+
+# Logs and caches
+*.log
+.eslintcache
+*.tsbuildinfo
+
+# Node / generated outputs
+node_modules/
+build/
+dist/
+release/
+index.mjs
+index.mjs.map
+tsconfig.json
+
+# Rust / Swift build outputs
+rust-backend/target/
+macos/TokenUsageNative/.build/
+DerivedData/
+
+# Packaged artifacts
+*.app
+*.dmg
+*.blockmap
+
+# Nested upstream/reference checkout. Keep it local unless it is converted to a
+# submodule or imported deliberately.
+ccusage/
