@@ -4,12 +4,13 @@ use serde_json::Value;
 use std::{
     cmp,
     collections::{BTreeSet, HashMap},
+    sync::Arc,
 };
 use tokio::sync::RwLock;
 
 #[derive(Debug, Default)]
 pub struct UsageCache {
-    data: RwLock<HashMap<String, Vec<Value>>>,
+    data: RwLock<HashMap<String, Arc<Vec<Value>>>>,
     errors: RwLock<HashMap<String, String>>,
     warm: RwLock<WarmStatus>,
 }
@@ -19,12 +20,15 @@ impl UsageCache {
         self.data.read().await.contains_key(key)
     }
 
-    pub async fn get(&self, key: &str) -> Vec<Value> {
+    pub async fn get(&self, key: &str) -> Arc<Vec<Value>> {
         self.data.read().await.get(key).cloned().unwrap_or_default()
     }
 
     pub async fn store_success(&self, key: &str, data: Vec<Value>) {
-        self.data.write().await.insert(key.to_owned(), data);
+        self.data
+            .write()
+            .await
+            .insert(key.to_owned(), Arc::new(data));
         self.errors.write().await.remove(key);
     }
 
@@ -36,7 +40,7 @@ impl UsageCache {
         updates: Vec<Value>,
     ) {
         let mut data = self.data.write().await;
-        let rows = data.entry(key.to_owned()).or_default();
+        let rows = Arc::make_mut(data.entry(key.to_owned()).or_default());
         rows.retain(|row| {
             !row.get(field)
                 .and_then(Value::as_str)

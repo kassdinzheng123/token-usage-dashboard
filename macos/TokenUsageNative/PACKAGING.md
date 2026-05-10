@@ -56,5 +56,5 @@ npm run dist:native-mac:local
 ## Notes
 
 - The app requires macOS 14.0 or later.
-- The app is not sandboxed. Sandboxing would require explicit user-granted file access for `~/.claude`, `~/.codex`, `~/.opencode`, `~/.hermes`, `~/.openclaw`, and related config directories.
+- The app is not sandboxed. Sandboxing would require explicit user-granted file access for `~/.claude`, `~/.codex`, `~/.opencode`, `~/.hermes`, `~/.openclaw`, `~/.factory`, and related config directories.
 - The native package does not include a Node runtime or Node backend files.

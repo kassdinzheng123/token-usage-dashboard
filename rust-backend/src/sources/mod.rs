@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod factory;
 pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
@@ -19,6 +20,7 @@ pub enum LocalSource {
     Hermes,
     OpenClaw,
     Pi,
+    Factory,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -32,6 +34,7 @@ impl TryFrom<&str> for LocalSource {
             "hermes" => Ok(Self::Hermes),
             "openclaw" => Ok(Self::OpenClaw),
             "pi" => Ok(Self::Pi),
+            "factory" => Ok(Self::Factory),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -169,6 +172,9 @@ pub fn load_local_source(
         LocalSource::Pi => {
             return pi::load_source_view(view_name, _refresh).map_err(SourceError::Source);
         }
+        LocalSource::Factory => {
+            return factory::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+        }
         LocalSource::Hermes | LocalSource::OpenClaw => {}
     }
 
@@ -177,9 +183,11 @@ pub fn load_local_source(
     }
 
     let sessions = match source {
-        LocalSource::Claude | LocalSource::Codex | LocalSource::Opencode | LocalSource::Pi => {
-            unreachable!()
-        }
+        LocalSource::Claude
+        | LocalSource::Codex
+        | LocalSource::Opencode
+        | LocalSource::Pi
+        | LocalSource::Factory => unreachable!(),
         LocalSource::Hermes => hermes::load_sessions()?,
         LocalSource::OpenClaw => openclaw::load_sessions()?,
     };

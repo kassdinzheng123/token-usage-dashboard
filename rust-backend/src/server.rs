@@ -23,11 +23,12 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info};
 
 pub type ProviderResult = Result<Vec<Value>, String>;
 pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = ProviderResult> + Send + 'a>>;
+const REFRESH_CONCURRENCY: usize = 4;
 
 pub trait SourceProvider: Send + Sync {
     fn load<'a>(&'a self, view: View, refresh: bool) -> ProviderFuture<'a>;
@@ -98,7 +99,7 @@ impl SourceProvider for LocalSourceProvider {
                     .map_err(|err| err.to_string()),
                 Source::Opencode => sources::opencode::load_daily_for_date(&date, refresh)
                     .map_err(|err| err.to_string()),
-                Source::Hermes | Source::Openclaw | Source::Pi => {
+                Source::Hermes | Source::Openclaw | Source::Pi | Source::Factory => {
                     let rows = sources::load_source_view(&source.to_string(), "daily", refresh)
                         .map_err(|err| err.to_string())?;
                     Ok(rows
@@ -119,7 +120,7 @@ impl SourceProvider for LocalSourceProvider {
 #[derive(Clone)]
 pub struct AppState {
     cache: Arc<UsageCache>,
-    today_cache: Arc<Mutex<HashMap<(Source, String), Vec<Value>>>>,
+    today_cache: Arc<Mutex<HashMap<(Source, String), Arc<Vec<Value>>>>>,
     providers: Arc<HashMap<Source, Arc<dyn SourceProvider>>>,
     refresh_locks: Arc<Mutex<HashMap<&'static str, Arc<Mutex<()>>>>>,
 }
@@ -173,10 +174,16 @@ impl AppState {
             self.cache.begin_warm(ALL_TASKS.len()).await;
         }
 
-        for task in ALL_TASKS {
-            self.refresh_with_lock(task.key, task.source, task.view, true, visible, visible)
-                .await;
-        }
+        self.refresh_tasks_concurrently(
+            ALL_TASKS
+                .into_iter()
+                .map(|task| (task.key, task.source, task.view))
+                .collect(),
+            true,
+            visible,
+            visible,
+        )
+        .await;
 
         if visible {
             self.cache.finish_warm().await;
@@ -187,15 +194,50 @@ impl AppState {
         let daily_tasks = Source::ALL.len();
         self.cache.begin_warm(daily_tasks).await;
 
-        for source in Source::ALL {
-            let Some(key) = task_key(source, View::Daily) else {
-                continue;
-            };
-            self.refresh_with_lock(key, source, View::Daily, false, true, true)
-                .await;
-        }
+        self.refresh_tasks_concurrently(
+            Source::ALL
+                .into_iter()
+                .filter_map(|source| {
+                    task_key(source, View::Daily).map(|key| (key, source, View::Daily))
+                })
+                .collect(),
+            false,
+            true,
+            true,
+        )
+        .await;
 
         self.cache.finish_warm().await;
+    }
+
+    async fn refresh_tasks_concurrently(
+        &self,
+        tasks: Vec<(&'static str, Source, View)>,
+        force: bool,
+        count_progress: bool,
+        update_current: bool,
+    ) {
+        let semaphore = Arc::new(Semaphore::new(REFRESH_CONCURRENCY));
+        let mut handles = Vec::with_capacity(tasks.len());
+
+        for (key, source, view) in tasks {
+            let state = self.clone();
+            let semaphore = Arc::clone(&semaphore);
+            handles.push(tokio::spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
+                state
+                    .refresh_with_lock(key, source, view, force, count_progress, update_current)
+                    .await;
+            }));
+        }
+
+        for handle in handles {
+            if let Err(err) = handle.await {
+                error!(error = %err, "refresh task failed");
+            }
+        }
     }
 
     async fn refresh_single(
@@ -365,7 +407,12 @@ impl AppState {
         }
     }
 
-    async fn today_rows_for_source(&self, source: Source, date: &str, force: bool) -> Vec<Value> {
+    async fn today_rows_for_source(
+        &self,
+        source: Source,
+        date: &str,
+        force: bool,
+    ) -> Arc<Vec<Value>> {
         if let Some(key) = task_key(source, View::Daily) {
             if !force && self.cache.has(key).await {
                 return self.cache.get(key).await;
@@ -383,7 +430,7 @@ impl AppState {
                 .await;
 
             let Some(key) = task_key(source, View::Daily) else {
-                return Vec::new();
+                return Arc::new(Vec::new());
             };
             return self.cache.get(key).await;
         }
@@ -396,7 +443,7 @@ impl AppState {
         }
 
         let Some(today_lock_key) = today_task_key(source) else {
-            return Vec::new();
+            return Arc::new(Vec::new());
         };
         let refresh_lock = self.refresh_lock(today_lock_key).await;
         let _guard = refresh_lock.lock().await;
@@ -414,15 +461,16 @@ impl AppState {
 
         match provider.load_today_daily(date, force).await {
             Ok(data) => {
+                let data = Arc::new(data);
                 self.today_cache
                     .lock()
                     .await
-                    .insert(today_cache_key, data.clone());
+                    .insert(today_cache_key, Arc::clone(&data));
                 data
             }
             Err(message) => {
                 error!(source = %source, error = %message, "failed to load today usage");
-                Vec::new()
+                Arc::new(Vec::new())
             }
         }
     }
@@ -538,12 +586,16 @@ async fn source_view_handler(
     }
 
     let data = state.cache.get(key).await;
-    Json(filter_by_date_range(
-        &data,
-        query.since.as_deref(),
-        query.until.as_deref(),
-    ))
-    .into_response()
+    if query.since.is_none() && query.until.is_none() {
+        Json(data.as_ref()).into_response()
+    } else {
+        Json(filter_by_date_range(
+            &data,
+            query.since.as_deref(),
+            query.until.as_deref(),
+        ))
+        .into_response()
+    }
 }
 
 fn not_found(message: &str) -> Response {
@@ -565,6 +617,7 @@ fn today_task_key(source: Source) -> Option<&'static str> {
         Source::Hermes => Some("hermes:today"),
         Source::Openclaw => Some("openclaw:today"),
         Source::Pi => Some("pi:today"),
+        Source::Factory => Some("factory:today"),
     }
 }
 
@@ -990,7 +1043,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
     use tokio::sync::Notify;
@@ -1107,6 +1160,48 @@ mod tests {
                 self.started.notify_one();
                 self.release.notified().await;
                 Ok(self.data.clone())
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct GateProvider {
+        calls: Arc<AtomicUsize>,
+        open: Arc<AtomicBool>,
+        release: Arc<Notify>,
+    }
+
+    impl GateProvider {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                open: Arc::new(AtomicBool::new(false)),
+                release: Arc::new(Notify::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn open(&self) {
+            self.open.store(true, Ordering::SeqCst);
+            self.release.notify_waiters();
+        }
+    }
+
+    impl SourceProvider for GateProvider {
+        fn load<'a>(&'a self, _view: View, _refresh: bool) -> ProviderFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    let notified = self.release.notified();
+                    if self.open.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
+                Ok(Vec::new())
             })
         }
     }
@@ -1443,6 +1538,61 @@ mod tests {
         assert!(health.keys.contains(&"codex:daily".to_owned()));
         assert!(!health.keys.contains(&"codex:monthly".to_owned()));
         assert!(!health.keys.contains(&"codex:sessions".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn refresh_all_uses_bounded_concurrency() {
+        let provider = GateProvider::new();
+        let state = Source::ALL.into_iter().fold(test_state(), |state, source| {
+            state.with_provider(source, provider.clone())
+        });
+
+        let refresh_state = state.clone();
+        let handle = tokio::spawn(async move {
+            refresh_state.refresh_all(false).await;
+        });
+
+        for _ in 0..100 {
+            if provider.calls() >= REFRESH_CONCURRENCY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(provider.calls(), REFRESH_CONCURRENCY);
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(provider.calls(), REFRESH_CONCURRENCY);
+
+        provider.open();
+        handle.await.unwrap();
+        assert_eq!(provider.calls(), ALL_TASKS.len());
+    }
+
+    #[tokio::test]
+    async fn refresh_startup_uses_bounded_concurrency() {
+        let provider = GateProvider::new();
+        let state = Source::ALL.into_iter().fold(test_state(), |state, source| {
+            state.with_provider(source, provider.clone())
+        });
+
+        let refresh_state = state.clone();
+        let handle = tokio::spawn(async move {
+            refresh_state.refresh_startup().await;
+        });
+
+        for _ in 0..100 {
+            if provider.calls() >= REFRESH_CONCURRENCY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(provider.calls(), REFRESH_CONCURRENCY);
+
+        provider.open();
+        handle.await.unwrap();
+        assert_eq!(provider.calls(), Source::ALL.len());
     }
 
     #[tokio::test]

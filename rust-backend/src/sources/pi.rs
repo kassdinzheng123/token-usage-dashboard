@@ -257,12 +257,16 @@ fn parse_usage_entry(value: &Value, session_id: &str, project_path: &str) -> Opt
     let output_tokens = to_i64(output);
     let cache_creation_tokens = usage.get("cacheWrite").map(to_i64).unwrap_or_default();
     let cache_read_tokens = usage.get("cacheRead").map(to_i64).unwrap_or_default();
-    let model_name = message
+    let provider_name = message
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|provider| !provider.is_empty());
+    let raw_model_name = message
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or("unknown");
+    let model_name = normalize_model_name(provider_name, raw_model_name);
     let explicit_cost = usage
         .get("cost")
         .and_then(|cost| cost.get("total"))
@@ -381,6 +385,15 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Local>> {
         .map(|date_time| date_time.with_timezone(&Local))
 }
 
+fn normalize_model_name(provider_name: Option<&str>, model_name: &str) -> String {
+    if provider_name.is_some_and(|provider| provider.eq_ignore_ascii_case("kiro"))
+        && model_name.eq_ignore_ascii_case("claude-opus-4.7")
+    {
+        return "kiro-claude-opus-4.7".to_string();
+    }
+    model_name.to_owned()
+}
+
 fn extract_session_id(file_path: &Path) -> String {
     let stem = file_path
         .file_stem()
@@ -446,6 +459,29 @@ mod tests {
         assert_eq!(entry.output_tokens, 40);
         assert_eq!(entry.cache_read_tokens, 8);
         assert_eq!(entry.cache_creation_tokens, 12);
+        assert_eq!(entry.total_cost, 0.25);
+    }
+
+    #[test]
+    fn parse_usage_entry_names_kiro_opus_model_like_factory_droid() {
+        let raw = json!({
+            "type": "message",
+            "timestamp": "2026-01-02T03:04:05Z",
+            "message": {
+                "role": "assistant",
+                "provider": "kiro",
+                "model": "claude-opus-4.7",
+                "usage": {
+                    "input": 100,
+                    "output": 40,
+                    "cost": { "total": 0.25 }
+                }
+            }
+        });
+
+        let entry = parse_usage_entry(&raw, "session-1", "project-1").unwrap();
+
+        assert_eq!(entry.model_name, "kiro-claude-opus-4.7");
         assert_eq!(entry.total_cost, 0.25);
     }
 

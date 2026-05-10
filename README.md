@@ -9,7 +9,7 @@ The current native package targets Apple silicon and requires macOS 14.0 or late
 - A SwiftUI macOS app in `macos/TokenUsageNative`.
 - A Rust backend in `rust-backend` using Axum on `127.0.0.1:3456`.
 - Packaging scripts in `scripts` that bundle the Swift app and Rust backend into a `.app` or `.dmg`.
-- Local usage readers for supported sources such as Claude, Codex, OpenCode, Hermes, OpenClaw, and Pi.
+- Local usage readers for supported sources such as Claude, Codex, OpenCode, Hermes, OpenClaw, Pi, and Factory Droid.
 
 The backend reads local tool data from user-owned directories and writes only application cache/log data under `~/Library/Application Support/Token Usage Dashboard`.
 
@@ -64,7 +64,7 @@ GET /api/today
 GET /api/{source}/{view}
 ```
 
-Supported `source` values include `claude`, `codex`, `opencode`, `hermes`, `openclaw`, and `pi`. Supported `view` values include `daily`, `monthly`, `sessions`, and `blocks` where available.
+Supported `source` values include `claude`, `codex`, `opencode`, `hermes`, `openclaw`, `pi`, and `factory`. Supported `view` values include `daily`, `monthly`, `sessions`, and `blocks` where available.
 
 ## Run Backend Tests
 

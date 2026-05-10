@@ -3,7 +3,6 @@ import SwiftUI
 @main
 struct TokenUsageNativeApp: App {
     @StateObject private var store = LiveTokenUsageDashboardStore()
-    @StateObject private var menuBarStore = LiveTokenUsageDashboardStore()
     @StateObject private var currencyController = TokenUsageBillingCurrencyController()
 
     var body: some Scene {
@@ -12,9 +11,9 @@ struct TokenUsageNativeApp: App {
         }
 
         MenuBarExtra {
-            TokenUsageMenuBarExtraView(store: menuBarStore, currencyController: currencyController)
+            TokenUsageMenuBarExtraView(store: store, currencyController: currencyController)
         } label: {
-            TokenUsageMenuBarLabel(store: menuBarStore)
+            TokenUsageMenuBarLabel(store: store)
         }
         .menuBarExtraStyle(.window)
     }

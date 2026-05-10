@@ -388,6 +388,18 @@ fn candidates_for(model: &str) -> Vec<String> {
         add_candidate(&mut candidates, &resolved);
     }
 
+    let custom_stripped = custom_stripped_model(model);
+    let custom_resolved = custom_stripped
+        .as_deref()
+        .map(resolve_alias)
+        .filter(|resolved| Some(resolved.as_str()) != custom_stripped.as_deref());
+    if let Some(stripped) = custom_stripped.as_deref() {
+        add_candidate(&mut candidates, stripped);
+    }
+    if let Some(resolved) = custom_resolved.as_deref() {
+        add_candidate(&mut candidates, resolved);
+    }
+
     if let Some((_, suffix)) = model.rsplit_once('/') {
         add_candidate(&mut candidates, suffix);
         let resolved_suffix = resolve_alias(suffix);
@@ -421,6 +433,12 @@ fn candidates_for(model: &str) -> Vec<String> {
         if resolved != model {
             add_candidate(&mut candidates, &format!("{prefix}{resolved}"));
         }
+        if let Some(stripped) = custom_stripped.as_deref() {
+            add_candidate(&mut candidates, &format!("{prefix}{stripped}"));
+        }
+        if let Some(resolved) = custom_resolved.as_deref() {
+            add_candidate(&mut candidates, &format!("{prefix}{resolved}"));
+        }
         if let Some((_, suffix)) = model.rsplit_once('/') {
             add_candidate(&mut candidates, &format!("{prefix}{suffix}"));
             let resolved_suffix = resolve_alias(suffix);
@@ -431,9 +449,22 @@ fn candidates_for(model: &str) -> Vec<String> {
     }
 
     add_provider_variants(&mut candidates, model);
+    if let Some(stripped) = custom_stripped.as_deref() {
+        add_provider_variants(&mut candidates, stripped);
+    }
     add_fireworks_router_variants(&mut candidates, model);
+    if let Some(stripped) = custom_stripped.as_deref() {
+        add_fireworks_router_variants(&mut candidates, stripped);
+    }
 
     candidates.into_iter().collect()
+}
+
+fn custom_stripped_model(model: &str) -> Option<String> {
+    normalize_key(model)
+        .strip_prefix("custom:")
+        .filter(|stripped| !stripped.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn add_candidate(candidates: &mut HashSet<String>, value: &str) {
@@ -490,6 +521,21 @@ fn add_fireworks_router_variants(candidates: &mut HashSet<String>, model: &str) 
 
 fn resolve_alias(model: &str) -> String {
     let normalized = normalize_key(model);
+    if normalized == "kiro-claude-opus-4.7" {
+        return "claude-opus-4.7".to_string();
+    }
+    if is_kiro_model(&normalized) {
+        return normalized;
+    }
+    if normalized.contains("claude-opus-4.7") {
+        return "claude-opus-4.7".to_string();
+    }
+    if normalized.contains("gpt-5.5") {
+        return "gpt-5.5".to_string();
+    }
+    if normalized.contains("gpt-5.4") {
+        return "gpt-5.4".to_string();
+    }
     match normalized.as_str() {
         "claude-opus-4-6-thinking" => "claude-opus-4-6".to_string(),
         "claude-sonnet-4.5" | "claude-sonnet-4-5" => "claude-sonnet-4-5-20250929".to_string(),
@@ -599,6 +645,15 @@ fn is_free_model(model: &str) -> bool {
         || normalized.contains("/free/")
 }
 
+fn is_kiro_model(model: &str) -> bool {
+    let normalized = normalize_key(model);
+    normalized == "kiro"
+        || normalized.starts_with("kiro-")
+        || normalized.starts_with("kiro/")
+        || normalized.contains("-kiro-")
+        || normalized.contains("/kiro/")
+}
+
 fn nonzero_or(value: f64, fallback: f64) -> f64 {
     if value > 0.0 {
         value
@@ -692,6 +747,26 @@ mod tests {
     }
 
     #[test]
+    fn resolves_custom_prefixed_models() {
+        let codex = candidates_for("custom:gpt-5-codex");
+        assert!(codex.contains(&"gpt-5-codex".to_string()));
+        assert!(codex.contains(&"gpt-5".to_string()));
+        assert!(codex.contains(&"openai/gpt-5".to_string()));
+
+        let factory = candidates_for("custom:OmniMind-GPT-5.5-High-0");
+        assert!(factory.contains(&"gpt-5.5".to_string()));
+        assert!(factory.contains(&"openai/gpt-5.5".to_string()));
+
+        let kiro = candidates_for("custom:pi-mono-kiro-claude-opus-4.7-3");
+        assert!(!kiro.contains(&"claude-opus-4.7".to_string()));
+        assert!(!kiro.contains(&"anthropic/claude-opus-4.7".to_string()));
+
+        let pi_kiro = candidates_for("kiro-claude-opus-4.7");
+        assert!(pi_kiro.contains(&"claude-opus-4.7".to_string()));
+        assert!(pi_kiro.contains(&"anthropic/claude-opus-4.7".to_string()));
+    }
+
+    #[test]
     fn pricing_http_timeout_is_not_too_aggressive() {
         assert!(PRICING_HTTP_TIMEOUT_SECS >= 15);
     }
@@ -721,6 +796,45 @@ mod tests {
         assert_eq!(pricing.input_cost_per_token, 0.000005);
         assert_eq!(pricing.output_cost_per_token, 0.00003);
         assert_eq!(pricing.cache_read_input_token_cost, 0.0000005);
+    }
+
+    #[test]
+    fn finds_litellm_pricing_for_custom_prefixed_model() {
+        let prices = r#"{
+            "gpt-5.5": {
+                "input_cost_per_token": 0.000005,
+                "output_cost_per_token": 0.00003
+            }
+        }"#;
+        let map = parse_pricing_map(prices).expect("pricing parses");
+        let dataset = PricingDataset {
+            primary: map,
+            secondary: HashMap::new(),
+            unresolved_models: HashSet::new(),
+        };
+        let pricing = find_pricing(&dataset, "custom:gpt-5.5").expect("pricing exists");
+
+        assert_eq!(pricing.input_cost_per_token, 0.000005);
+        assert_eq!(pricing.output_cost_per_token, 0.00003);
+    }
+
+    #[test]
+    fn does_not_price_kiro_models_through_broad_aliases() {
+        let prices = r#"{
+            "claude-opus-4-7": {
+                "input_cost_per_token": 0.000005,
+                "output_cost_per_token": 0.000025
+            }
+        }"#;
+        let map = parse_pricing_map(prices).expect("pricing parses");
+        let dataset = PricingDataset {
+            primary: map,
+            secondary: HashMap::new(),
+            unresolved_models: HashSet::new(),
+        };
+
+        assert!(find_pricing(&dataset, "custom:pi-mono-kiro-claude-opus-4.7-3").is_none());
+        assert!(find_pricing(&dataset, "kiro-claude-opus-4.7").is_some());
     }
 
     #[test]

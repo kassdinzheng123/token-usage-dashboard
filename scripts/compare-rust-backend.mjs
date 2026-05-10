@@ -14,7 +14,7 @@ const VALUE_SUMMARY_FIELDS = [
   'cost',
 ];
 
-const SOURCES = ['claude', 'codex', 'opencode', 'hermes', 'openclaw'];
+const SOURCES = ['claude', 'codex', 'opencode', 'hermes', 'openclaw', 'factory'];
 const VIEWS = ['daily', 'monthly', 'sessions', 'blocks'];
 const DEFAULT_ENDPOINTS = [
   'health',

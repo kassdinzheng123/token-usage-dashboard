@@ -10,16 +10,18 @@ pub enum Source {
     Hermes,
     Openclaw,
     Pi,
+    Factory,
 }
 
 impl Source {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
         Self::Hermes,
         Self::Openclaw,
         Self::Pi,
+        Self::Factory,
     ];
 
     pub fn label(self) -> &'static str {
@@ -30,6 +32,7 @@ impl Source {
             Self::Hermes => "Hermes",
             Self::Openclaw => "OpenClaw",
             Self::Pi => "Pi Agent",
+            Self::Factory => "Factory Droid",
         }
     }
 }
@@ -43,6 +46,7 @@ impl fmt::Display for Source {
             Self::Hermes => "hermes",
             Self::Openclaw => "openclaw",
             Self::Pi => "pi",
+            Self::Factory => "factory",
         })
     }
 }
@@ -58,6 +62,7 @@ impl FromStr for Source {
             "hermes" => Ok(Self::Hermes),
             "openclaw" => Ok(Self::Openclaw),
             "pi" => Ok(Self::Pi),
+            "factory" => Ok(Self::Factory),
             _ => Err(ParseProtocolError::new("source", value)),
         }
     }
@@ -146,7 +151,7 @@ impl WarmTask {
     }
 }
 
-pub const ALL_TASKS: [WarmTask; 19] = [
+pub const ALL_TASKS: [WarmTask; 22] = [
     WarmTask {
         key: "claude:daily",
         source: Source::Claude,
@@ -240,6 +245,21 @@ pub const ALL_TASKS: [WarmTask; 19] = [
     WarmTask {
         key: "pi:sessions",
         source: Source::Pi,
+        view: View::Sessions,
+    },
+    WarmTask {
+        key: "factory:daily",
+        source: Source::Factory,
+        view: View::Daily,
+    },
+    WarmTask {
+        key: "factory:monthly",
+        source: Source::Factory,
+        view: View::Monthly,
+    },
+    WarmTask {
+        key: "factory:sessions",
+        source: Source::Factory,
         view: View::Sessions,
     },
 ];

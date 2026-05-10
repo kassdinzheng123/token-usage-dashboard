@@ -1,5 +1,5 @@
 use crate::pricing::{model_cost_usd, TokenUsage};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration, Local, NaiveDate};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -135,17 +135,16 @@ fn load_events_for_date(date: &str) -> Result<Vec<TokenUsageEvent>, String> {
         return Ok(Vec::new());
     };
 
-    let Some((year, month, day)) = date_parts(date) else {
+    let Some(day_dirs) = candidate_day_dirs(&sessions_dir, date) else {
         return Ok(Vec::new());
     };
 
-    let day_dir = sessions_dir.join(year).join(month).join(day);
-    if !day_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
     let mut files = Vec::new();
-    collect_jsonl_files(&day_dir, &mut files)?;
+    for day_dir in day_dirs {
+        if day_dir.is_dir() {
+            collect_jsonl_files(&day_dir, &mut files)?;
+        }
+    }
     files.sort();
 
     let mut events = Vec::new();
@@ -156,6 +155,31 @@ fn load_events_for_date(date: &str) -> Result<Vec<TokenUsageEvent>, String> {
     events.retain(|event| event.date == date);
     events.sort_by_key(|event| event.timestamp_millis);
     Ok(events)
+}
+
+fn candidate_day_dirs(sessions_dir: &Path, date: &str) -> Option<Vec<PathBuf>> {
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let mut dates = vec![date];
+    if let Some(previous) = date.checked_sub_signed(Duration::days(1)) {
+        dates.push(previous);
+    }
+    if let Some(next) = date.checked_add_signed(Duration::days(1)) {
+        dates.push(next);
+    }
+
+    dates.sort();
+    dates.dedup();
+    Some(
+        dates
+            .into_iter()
+            .map(|date| {
+                sessions_dir
+                    .join(date.format("%Y").to_string())
+                    .join(date.format("%m").to_string())
+                    .join(date.format("%d").to_string())
+            })
+            .collect(),
+    )
 }
 
 fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -555,22 +579,6 @@ fn timestamp_parts(timestamp: &str) -> Option<(String, String, i64)> {
     ))
 }
 
-fn date_parts(date: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = date.split('-');
-    let year = parts.next()?;
-    let month = parts.next()?;
-    let day = parts.next()?;
-    if parts.next().is_some()
-        || year.len() != 4
-        || month.len() != 2
-        || day.len() != 2
-        || !date.chars().all(|ch| ch.is_ascii_digit() || ch == '-')
-    {
-        return None;
-    }
-    Some((year, month, day))
-}
-
 fn session_id_for(sessions_dir: &Path, file_path: &Path) -> String {
     let relative = file_path.strip_prefix(sessions_dir).unwrap_or(file_path);
     let without_extension = relative.with_extension("");
@@ -757,6 +765,56 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["modelsUsed"], json!(["gpt-5.5"]));
         assert_eq!(rows[0]["modelBreakdowns"][0]["modelName"], "gpt-5.5");
+    }
+
+    #[test]
+    fn loads_daily_for_date_from_cross_day_session_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let timestamp = "2026-05-09T02:47:18.216Z";
+        let expected_date = timestamp_parts(timestamp).unwrap().0;
+        let previous_date = NaiveDate::parse_from_str(&expected_date, "%Y-%m-%d")
+            .unwrap()
+            .checked_sub_signed(Duration::days(1))
+            .unwrap();
+        fixture.write_session(
+            &format!(
+                "{}/{}/{}/cross-day.jsonl",
+                previous_date.format("%Y"),
+                previous_date.format("%m"),
+                previous_date.format("%d")
+            ),
+            &[
+                json!({
+                    "timestamp": "2026-05-09T02:47:15.183Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.4"
+                    }
+                }),
+                json!({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 120,
+                                "cached_input_tokens": 40,
+                                "output_tokens": 20,
+                                "total_tokens": 140
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let rows = load_daily_for_date(&expected_date, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["date"], expected_date);
+        assert_eq!(rows[0]["modelsUsed"], json!(["gpt-5.4"]));
+        assert_eq!(rows[0]["modelBreakdowns"][0]["modelName"], "gpt-5.4");
     }
 
     #[test]

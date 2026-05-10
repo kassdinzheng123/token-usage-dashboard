@@ -1,8 +1,7 @@
 import Darwin
 import Foundation
 
-@MainActor
-final class LocalServerProcess {
+actor LocalServerProcess {
     enum ServerError: LocalizedError {
         case bundledBackendNotFound
         case failedToStart
@@ -42,7 +41,7 @@ final class LocalServerProcess {
         }
 
         if process == nil || process?.isRunning == false {
-            try start(using: launch)
+            try await start(using: launch)
         }
 
         for _ in 0..<50 {
@@ -55,14 +54,14 @@ final class LocalServerProcess {
         throw ServerError.healthCheckTimedOut
     }
 
-    private func start(using launch: LaunchConfiguration) throws {
+    private func start(using launch: LaunchConfiguration) async throws {
         let process = Process()
         process.executableURL = launch.executableURL
         process.arguments = launch.arguments
         process.currentDirectoryURL = launch.currentDirectoryURL
         process.environment = launch.environment
         try? backendLogFileHandle?.close()
-        backendLogFileHandle = BackendLogStore.shared.makeBackendLogFileHandle()
+        backendLogFileHandle = await BackendLogStore.shared.makeBackendLogFileHandle()
         process.standardOutput = backendLogFileHandle ?? FileHandle.nullDevice
         process.standardError = backendLogFileHandle ?? FileHandle.nullDevice
 

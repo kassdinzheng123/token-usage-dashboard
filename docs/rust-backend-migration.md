@@ -35,6 +35,10 @@ The Rust backend must preserve these routes and return JSON with the same struct
 - `GET /api/openclaw/monthly`
 - `GET /api/openclaw/sessions`
 - `GET /api/openclaw/blocks`
+- `GET /api/factory/daily`
+- `GET /api/factory/monthly`
+- `GET /api/factory/sessions`
+- `GET /api/factory/blocks`
 
 Contract compatibility means:
 

@@ -33,6 +33,7 @@ private let tokenTrendSourceColors: [String: Color] = [
     TokenUsageSource.hermes.label:   colorViolet.primary,
     TokenUsageSource.openclaw.label: colorAmber.primary,
     TokenUsageSource.pi.label:       colorCoral.primary,
+    TokenUsageSource.factory.label:  colorOcean.primary,
 ]
 
 // Model trend chart palette (single-source view): primary shades from each family
@@ -66,6 +67,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case hermes
     case openclaw
     case pi
+    case factory
 
     public var id: String { rawValue }
 
@@ -78,6 +80,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
         case .hermes: "Hermes"
         case .openclaw: "OpenClaw"
         case .pi: "Pi Agent"
+        case .factory: "Factory Droid"
         }
     }
 }
@@ -485,6 +488,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
         return availableModels.filter { model in
             model.localizedCaseInsensitiveContains(searchText)
+                || displayModelName(model).localizedCaseInsensitiveContains(searchText)
         }
     }
 
@@ -644,7 +648,18 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     private var sourcePicker: some View {
         Picker("Source", selection: $store.selectedSource) {
             ForEach(TokenUsageSource.allCases) { source in
-                Label(source.label, systemImage: source.systemImage).tag(source)
+                HStack(spacing: 4) {
+                    if let imageAssetName = source.imageAssetName {
+                        BundledIconImage(imageAssetName: imageAssetName, padding: 1)
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: source.systemImage)
+                            .font(.system(size: 11))
+                            .frame(width: 16, height: 16)
+                    }
+                    Text(source.label)
+                }
+                .tag(source)
             }
         }
         .pickerStyle(.menu)
@@ -848,7 +863,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                                     Toggle(isOn: modelBinding(model)) {
                                         HStack(spacing: 8) {
                                             ProviderIconBadge(modelName: model)
-                                            Text(model)
+                                            Text(displayModelName(model))
                                                 .lineLimit(1)
                                                 .truncationMode(.middle)
                                                 .help(model)
@@ -1779,10 +1794,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    private func histogramBarWidth(for dates: [Date]) -> MarkDimension {
-        let periodCount = max(Set(dates.map { periodKey(for: $0) }).count, 1)
-        let width = store.selectedViewMode == .monthly || periodCount <= 2 ? maximumBarWidth : nil
-        return width.map { .fixed($0) } ?? .automatic
+    private func histogramBarWidth(for _: [Date]) -> MarkDimension {
+        store.selectedViewMode == .monthly ? .fixed(maximumBarWidth) : .automatic
     }
 
     private func periodKey(for date: Date) -> String {
@@ -1883,12 +1896,12 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         let uniqueCount = Set(dates.map { periodKey(for: $0) }).count
         let barCenterX: CGFloat
         let barHalfWidth: CGFloat
-        if let barRange = proxy.positionRange(forX: barDate) {
-            barCenterX = (barRange.lowerBound + barRange.upperBound) / 2
-            let visualHalfWidth = store.selectedViewMode == .monthly || uniqueCount <= 2
-                ? maximumBarWidth / 2
-                : (barRange.upperBound - barRange.lowerBound) / 2
-            barHalfWidth = min(max(visualHalfWidth, 8), 80) + 4
+        if store.selectedViewMode == .monthly,
+           let monthEnd = Calendar.current.date(byAdding: .month, value: 1, to: hitDate),
+           let monthStartX = proxy.position(forX: hitDate),
+           let monthEndX = proxy.position(forX: monthEnd) {
+            barCenterX = (monthStartX + monthEndX) / 2
+            barHalfWidth = maximumBarWidth / 2 + 4
         } else if let barX = proxy.position(forX: barDate) {
             barCenterX = barX
             if uniqueCount <= 1 {
@@ -2258,7 +2271,7 @@ private struct ProviderMetadata {
             return ProviderMetadata(label: "Claude", abbreviation: "CL", color: colorRose.primary, imageAssetName: "anthropic-mark", preservesOriginalImageColor: true)
         }
         if model.contains("gpt") || model.contains("openai") || model.contains("chatgpt") || model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
-            return ProviderMetadata(label: "OpenAI", abbreviation: "AI", color: colorEmerald.primary, imageAssetName: "openai-mark")
+            return ProviderMetadata(label: "OpenAI", abbreviation: "AI", color: colorEmerald.primary, imageAssetName: "openai-mark", preservesOriginalImageColor: true)
         }
         if model.contains("glm") || model.contains("zai") || model.contains("z.ai") {
             return ProviderMetadata(label: "GLM", abbreviation: "GL", color: colorOcean.light, imageAssetName: "zai-mark", preservesOriginalImageColor: true)
@@ -2270,7 +2283,7 @@ private struct ProviderMetadata {
             return ProviderMetadata(label: "Grok", abbreviation: "GK", color: colorSlate.dark, imageAssetName: "grok-mark")
         }
         if model.contains("qwen") || model.contains("qwq") {
-            return ProviderMetadata(label: "Qwen", abbreviation: "QW", color: colorTeal.primary)
+            return ProviderMetadata(label: "Qwen", abbreviation: "QW", color: colorTeal.primary, imageAssetName: "qwen-mark", preservesOriginalImageColor: true)
         }
         if model.contains("mistral") || model.contains("mixtral") || model.contains("codestral") || model.contains("ministral") {
             return ProviderMetadata(label: "Mistral", abbreviation: "MI", color: colorAmber.primary)
@@ -2313,9 +2326,10 @@ private struct ProviderIconBadge: View {
             BundledIconImage(
                 imageAssetName: imageAssetName,
                 tint: metadata.preservesOriginalImageColor ? nil : metadata.color,
-                padding: 3
+                padding: 1
             )
-            .frame(width: 20, height: 20)
+            .frame(width: 22, height: 22)
+            .background(metadata.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         } else {
             Text(metadata.abbreviation)
                 .font(.system(size: 9, weight: .bold, design: .rounded))
@@ -2342,8 +2356,9 @@ struct UsageSourceIconBadge: View {
     @ViewBuilder
     private var sourceIconBadge: some View {
         if let imageAssetName = source.imageAssetName {
-            BundledIconImage(imageAssetName: imageAssetName, padding: 3)
-                .frame(width: 18, height: 18)
+            BundledIconImage(imageAssetName: imageAssetName, padding: 1)
+                .frame(width: 22, height: 22)
+                .background(source.tintColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         } else {
             Image(systemName: source.systemImage)
                 .font(.system(size: 11, weight: .semibold))
@@ -2368,8 +2383,9 @@ private struct TokenUsageSourceLabel: View {
     @ViewBuilder
     private var sourceIconBadge: some View {
         if let imageAssetName = source.imageAssetName {
-            BundledIconImage(imageAssetName: imageAssetName, padding: 3)
-                .frame(width: 18, height: 18)
+            BundledIconImage(imageAssetName: imageAssetName, padding: 1)
+                .frame(width: 22, height: 22)
+                .background(source.tintColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         } else {
             Image(systemName: source.systemImage)
                 .font(.system(size: 11, weight: .semibold))
@@ -2452,11 +2468,7 @@ private struct ModelListLabel: View {
     let models: [String]
 
     private var modelsText: String {
-        models.map(Self.displayModelName).joined(separator: ", ")
-    }
-
-    private static func displayModelName(_ model: String) -> String {
-        model.hasPrefix("[pi] ") ? String(model.dropFirst(5)) : model
+        models.map(displayModelName).joined(separator: ", ")
     }
 
     var body: some View {
@@ -2635,10 +2647,11 @@ private struct TodayModelTokenRowView: View {
     let row: TodayModelTokenRow
 
     var body: some View {
+        let modelLabel = displayModelName(row.modelName)
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 ProviderIconBadge(modelName: row.modelName)
-                Text(row.modelName)
+                Text(modelLabel)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -2710,10 +2723,11 @@ private struct TodayModelRowView: View {
     @ObservedObject var currencyController: TokenUsageBillingCurrencyController
 
     var body: some View {
+        let modelLabel = displayModelName(row.modelName)
         HStack(spacing: 10) {
             HStack(spacing: 8) {
                 ProviderIconBadge(modelName: row.modelName)
-                Text(row.modelName)
+                Text(modelLabel)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(row.modelName)
@@ -2998,12 +3012,13 @@ private struct TokenTrendLegend: View {
     }
 
     private func legendItem(_ entry: TokenTrendLegendEntry, width: CGFloat) -> some View {
-        HStack(spacing: 8) {
+        let label = displayModelName(entry.label)
+        return HStack(spacing: 8) {
             Circle()
                 .fill(entry.color)
                 .frame(width: 9, height: 9)
             LegendBadge(label: entry.label)
-            Text(entry.label)
+            Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -3152,7 +3167,7 @@ private struct ModelCostSectorChart: View {
 
                     if let slice = hoveredSlice, let point = hoveredPoint {
                         ChartTooltipPanel(
-                            title: slice.model,
+                            title: displayModelName(slice.model),
                             rows: [
                                 ("Cost", currencyController.string(fromUSD: slice.cost)),
                                 ("Share", slice.percentText),
@@ -3246,14 +3261,15 @@ private struct ModelCostLegend: View {
     }
 
     private func legendItem(_ slice: ModelCostSlice) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        let modelLabel = displayModelName(slice.model)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Circle()
                 .fill(slice.color)
                 .frame(width: 9, height: 9)
             ProviderIconBadge(modelName: slice.model)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(slice.model) (\(slice.percentText))")
+                Text("\(modelLabel) (\(slice.percentText))")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -3486,6 +3502,16 @@ private extension TokenUsageModelBreakdown {
     }
 }
 
+private func displayModelName(_ modelName: String) -> String {
+    if modelName.localizedCaseInsensitiveContains("kiro-claude-opus-4.7") {
+        return "kiro-claude-opus-4.7"
+    }
+    if modelName.hasPrefix("[pi] ") {
+        return String(modelName.dropFirst(5))
+    }
+    return modelName
+}
+
 private extension Decimal {
     var doubleValue: Double {
         NSDecimalNumber(decimal: self).doubleValue
@@ -3501,6 +3527,7 @@ extension TokenUsageSource {
         case .hermes: .hermes
         case .openclaw: .openclaw
         case .pi: .pi
+        case .factory: .factory
         }
     }
 
@@ -3517,6 +3544,7 @@ extension TokenUsageSource {
         case .hermes: "paperplane"
         case .openclaw: "hammer"
         case .pi: "p.circle"
+        case .factory: "gearshape.2"
         }
     }
 
@@ -3529,6 +3557,7 @@ extension TokenUsageSource {
         case .hermes: "hermes-mark"
         case .openclaw: "openclaw-mark"
         case .pi: "pi-mark"
+        case .factory: "factory-mark"
         }
     }
 }
@@ -3550,6 +3579,7 @@ extension UsageSource {
         case .hermes: "paperplane"
         case .openclaw: "hammer"
         case .pi: "p.circle"
+        case .factory: "gearshape.2"
         }
     }
 
@@ -3561,6 +3591,7 @@ extension UsageSource {
         case .hermes: "hermes-mark"
         case .openclaw: "openclaw-mark"
         case .pi: "pi-mark"
+        case .factory: "factory-mark"
         }
     }
 
@@ -3620,8 +3651,8 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
 
     private static func makePreviewRecords(startDate: Date) -> [TokenUsageRecord] {
         let calendar = Calendar.current
-        let sources: [TokenUsageSource] = [.claude, .codex, .opencode]
-        let models = ["claude-sonnet-4", "gpt-5.2-codex", "qwen3-coder"]
+        let sources: [TokenUsageSource] = [.claude, .codex, .opencode, .factory]
+        let models = ["claude-sonnet-4", "gpt-5.2-codex", "qwen3-coder", "factory-droid"]
 
         return (0..<14).flatMap { dayOffset in
             sources.enumerated().map { sourceIndex, source in
