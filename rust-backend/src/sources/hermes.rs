@@ -92,6 +92,7 @@ pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
             output_tokens,
             cache_creation_tokens,
             cache_read_tokens,
+            total_tokens_override: None,
             total_cost,
         };
 

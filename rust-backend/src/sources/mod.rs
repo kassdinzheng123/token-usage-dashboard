@@ -115,12 +115,18 @@ pub struct LocalSession {
     pub output_tokens: i64,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
+    pub total_tokens_override: Option<i64>,
     pub total_cost: f64,
 }
 
 impl LocalSession {
     pub fn total_tokens(&self) -> i64 {
-        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
+        self.total_tokens_override.unwrap_or_else(|| {
+            self.input_tokens
+                + self.output_tokens
+                + self.cache_creation_tokens
+                + self.cache_read_tokens
+        })
     }
 }
 
@@ -175,7 +181,10 @@ pub fn load_local_source(
         LocalSource::Factory => {
             return factory::load_source_view(view_name, _refresh).map_err(SourceError::Source);
         }
-        LocalSource::Hermes | LocalSource::OpenClaw => {}
+        LocalSource::OpenClaw => {
+            return openclaw::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+        }
+        LocalSource::Hermes => {}
     }
 
     if view == SourceView::Blocks {
@@ -186,10 +195,10 @@ pub fn load_local_source(
         LocalSource::Claude
         | LocalSource::Codex
         | LocalSource::Opencode
+        | LocalSource::OpenClaw
         | LocalSource::Pi
         | LocalSource::Factory => unreachable!(),
         LocalSource::Hermes => hermes::load_sessions()?,
-        LocalSource::OpenClaw => openclaw::load_sessions()?,
     };
 
     Ok(match view {
