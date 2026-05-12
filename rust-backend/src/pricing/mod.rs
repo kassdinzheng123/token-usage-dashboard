@@ -265,15 +265,16 @@ fn pricing_from_litellm(raw: &Value) -> Option<ModelPricing> {
 }
 
 fn find_pricing(dataset: &PricingDataset, model: &str) -> Option<ModelPricing> {
-    for candidate in candidates_for(model) {
-        if let Some(pricing) = dataset.primary.get(&candidate).copied() {
+    let candidates = candidates_for(model);
+    for candidate in &candidates {
+        if let Some(pricing) = dataset.primary.get(candidate).copied() {
             if !pricing_has_no_rates(pricing) {
                 return Some(pricing);
             }
         }
     }
-    for candidate in candidates_for(model) {
-        if let Some(pricing) = dataset.secondary.get(&candidate).copied() {
+    for candidate in &candidates {
+        if let Some(pricing) = dataset.secondary.get(candidate).copied() {
             if !pricing_has_no_rates(pricing) {
                 return Some(pricing);
             }

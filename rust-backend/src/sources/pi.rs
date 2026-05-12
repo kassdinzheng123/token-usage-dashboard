@@ -218,21 +218,38 @@ fn append_entries_from_file(
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        let Some(entry) = parse_usage_entry(&value, &session_id, &project_path) else {
-            continue;
-        };
-
-        let hash = format!(
-            "pi:{}:{}",
-            entry.timestamp.to_rfc3339(),
-            entry.total_tokens()
-        );
-        if seen.insert(hash) {
-            entries.push(entry);
+        for (entry_index, entry) in parse_usage_entries(&value, &session_id, &project_path)
+            .into_iter()
+            .enumerate()
+        {
+            let hash = format!(
+                "pi:{}:{}:{}:{}:{}:{}:{}",
+                project_path,
+                session_id,
+                entry.timestamp.to_rfc3339(),
+                entry.model_name,
+                entry.total_tokens(),
+                entry.total_cost,
+                entry_index
+            );
+            if seen.insert(hash) {
+                entries.push(entry);
+            }
         }
     }
 
     Ok(())
+}
+
+fn parse_usage_entries(value: &Value, session_id: &str, project_path: &str) -> Vec<UsageEntry> {
+    parse_usage_entry(value, session_id, project_path)
+        .into_iter()
+        .chain(parse_subagent_usage_entries(
+            value,
+            session_id,
+            project_path,
+        ))
+        .collect()
 }
 
 fn parse_usage_entry(value: &Value, session_id: &str, project_path: &str) -> Option<UsageEntry> {
@@ -299,6 +316,91 @@ fn parse_usage_entry(value: &Value, session_id: &str, project_path: &str) -> Opt
     };
 
     (entry.total_tokens() > 0 || entry.total_cost > 0.0).then_some(entry)
+}
+
+fn parse_subagent_usage_entries(
+    value: &Value,
+    session_id: &str,
+    project_path: &str,
+) -> Vec<UsageEntry> {
+    let entry_type = value.get("type").and_then(Value::as_str);
+    if entry_type.is_some_and(|entry_type| entry_type != "message") {
+        return Vec::new();
+    }
+
+    let Some(timestamp) = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp)
+    else {
+        return Vec::new();
+    };
+    let Some(message) = value.get("message").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    if message.get("role").and_then(Value::as_str) != Some("toolResult")
+        || message.get("toolName").and_then(Value::as_str) != Some("subagent")
+    {
+        return Vec::new();
+    }
+
+    message
+        .get("details")
+        .and_then(|details| details.get("results"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let result = result.as_object()?;
+            let usage = result.get("usage")?.as_object()?;
+            let input_tokens = usage.get("input").map(to_i64).unwrap_or_default();
+            let output_tokens = usage.get("output").map(to_i64).unwrap_or_default();
+            let cache_creation_tokens = usage.get("cacheWrite").map(to_i64).unwrap_or_default();
+            let cache_read_tokens = usage.get("cacheRead").map(to_i64).unwrap_or_default();
+            let raw_model_name = result
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    result
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .filter(|agent| !agent.is_empty())
+                        .map(|agent| format!("subagent/{agent}"))
+                })
+                .unwrap_or_else(|| "subagent/unknown".to_string());
+            let model_name = normalize_model_name(None, &raw_model_name);
+            let explicit_cost = usage.get("cost").map(num).unwrap_or_default();
+            let total_cost = if explicit_cost > 0.0 {
+                explicit_cost
+            } else {
+                model_cost_usd(
+                    &model_name,
+                    TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    },
+                )
+            };
+
+            let entry = UsageEntry {
+                timestamp,
+                session_id: session_id.to_owned(),
+                project_path: project_path.to_owned(),
+                model_name,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                total_cost,
+            };
+
+            (entry.total_tokens() > 0 || entry.total_cost > 0.0).then_some(entry)
+        })
+        .collect()
 }
 
 fn entries_to_daily(entries: &[UsageEntry]) -> Vec<Value> {
@@ -500,6 +602,87 @@ mod tests {
         });
 
         assert!(parse_usage_entry(&raw, "session-1", "project-1").is_none());
+    }
+
+    #[test]
+    fn parse_usage_entries_accepts_subagent_tool_results() {
+        let raw = json!({
+            "type": "message",
+            "timestamp": "2026-01-02T03:04:05Z",
+            "message": {
+                "role": "toolResult",
+                "toolName": "subagent",
+                "details": {
+                    "mode": "parallel",
+                    "results": [
+                        {
+                            "agent": "explorer",
+                            "model": "anthropic/claude-opus-4.5",
+                            "usage": {
+                                "input": 100,
+                                "output": 40,
+                                "cacheRead": 8,
+                                "cacheWrite": 12,
+                                "cost": 0.25
+                            },
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "usage": {
+                                        "input": 999,
+                                        "output": 999
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "agent": "reviewer",
+                            "usage": {
+                                "input": 5,
+                                "output": 7
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let entries = parse_usage_entries(&raw, "session-1", "project-1");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].model_name, "anthropic/claude-opus-4.5");
+        assert_eq!(entries[0].input_tokens, 100);
+        assert_eq!(entries[0].output_tokens, 40);
+        assert_eq!(entries[0].cache_read_tokens, 8);
+        assert_eq!(entries[0].cache_creation_tokens, 12);
+        assert_eq!(entries[0].total_cost, 0.25);
+        assert_eq!(entries[1].model_name, "subagent/reviewer");
+        assert_eq!(entries[1].input_tokens, 5);
+        assert_eq!(entries[1].output_tokens, 7);
+    }
+
+    #[test]
+    fn parse_usage_entries_rejects_non_subagent_tool_results() {
+        let raw = json!({
+            "type": "message",
+            "timestamp": "2026-01-02T03:04:05Z",
+            "message": {
+                "role": "toolResult",
+                "toolName": "bash",
+                "details": {
+                    "results": [
+                        {
+                            "usage": {
+                                "input": 100,
+                                "output": 40
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert!(parse_usage_entries(&raw, "session-1", "project-1").is_empty());
     }
 
     #[test]

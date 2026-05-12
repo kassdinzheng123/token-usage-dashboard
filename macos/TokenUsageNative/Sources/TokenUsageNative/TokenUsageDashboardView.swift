@@ -650,8 +650,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             ForEach(TokenUsageSource.allCases) { source in
                 HStack(spacing: 4) {
                     if let imageAssetName = source.imageAssetName {
-                        BundledIconImage(imageAssetName: imageAssetName, padding: 1)
-                            .frame(width: 16, height: 16)
+                        BundledIconImage(imageAssetName: imageAssetName, padding: 1, size: 16)
                     } else {
                         Image(systemName: source.systemImage)
                             .font(.system(size: 11))
@@ -2358,7 +2357,7 @@ struct UsageSourceIconBadge: View {
         if let imageAssetName = source.imageAssetName {
             BundledIconImage(imageAssetName: imageAssetName, padding: 1)
                 .frame(width: 22, height: 22)
-                .background(source.tintColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .background(source.iconBadgeBackgroundColor, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         } else {
             Image(systemName: source.systemImage)
                 .font(.system(size: 11, weight: .semibold))
@@ -2385,7 +2384,7 @@ private struct TokenUsageSourceLabel: View {
         if let imageAssetName = source.imageAssetName {
             BundledIconImage(imageAssetName: imageAssetName, padding: 1)
                 .frame(width: 22, height: 22)
-                .background(source.tintColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .background(source.iconBadgeBackgroundColor, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         } else {
             Image(systemName: source.systemImage)
                 .font(.system(size: 11, weight: .semibold))
@@ -2400,9 +2399,16 @@ private struct BundledIconImage: View {
     let imageAssetName: String
     var tint: Color? = nil
     var padding: CGFloat = 0
+    var size: CGFloat = 22
 
     var body: some View {
-        if let image = IconImageLoader.image(named: imageAssetName) {
+        icon
+            .frame(width: size, height: size)
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        if let image = IconImageLoader.image(named: imageAssetName, pointSize: max(1, size - padding * 2)) {
             if let tint {
                 Image(nsImage: image)
                     .resizable()
@@ -2428,15 +2434,18 @@ private struct BundledIconImage: View {
 private enum IconImageLoader {
     private static let imageCache = NSCache<NSString, NSImage>()
 
-    static func image(named name: String) -> NSImage? {
-        if let cachedImage = imageCache.object(forKey: name as NSString) {
+    static func image(named name: String, pointSize: CGFloat) -> NSImage? {
+        let cacheKey = "\(name):\(pointSize)" as NSString
+        if let cachedImage = imageCache.object(forKey: cacheKey) {
             return cachedImage
         }
 
         for bundle in fallbackBundles() {
             if let image = image(named: name, in: bundle) {
-                imageCache.setObject(image, forKey: name as NSString)
-                return image
+                let sizedImage = image.copy() as? NSImage ?? image
+                sizedImage.size = NSSize(width: pointSize, height: pointSize)
+                imageCache.setObject(sizedImage, forKey: cacheKey)
+                return sizedImage
             }
         }
         return nil
@@ -3560,6 +3569,15 @@ extension TokenUsageSource {
         case .factory: "factory-mark"
         }
     }
+
+    var iconBadgeBackgroundColor: Color {
+        switch self {
+        case .codex, .opencode:
+            .clear
+        default:
+            tintColor.opacity(0.12)
+        }
+    }
 }
 
 extension UsageSource {
@@ -3592,6 +3610,15 @@ extension UsageSource {
         case .openclaw: "openclaw-mark"
         case .pi: "pi-mark"
         case .factory: "factory-mark"
+        }
+    }
+
+    var iconBadgeBackgroundColor: Color {
+        switch self {
+        case .codex, .opencode:
+            .clear
+        default:
+            tintColor.opacity(0.12)
         }
     }
 

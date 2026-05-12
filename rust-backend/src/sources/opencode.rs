@@ -196,8 +196,7 @@ fn append_sqlite_messages(
     let Some(db_path) = opencode_db_path(storage) else {
         return false;
     };
-    let Ok(connection) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
+    let Ok(connection) = open_opencode_readonly(&db_path) else {
         return false;
     };
     let Ok(mut statement) = connection.prepare(
@@ -255,8 +254,7 @@ fn append_sqlite_messages_between(
     let Some(db_path) = opencode_db_path(storage) else {
         return false;
     };
-    let Ok(connection) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
+    let Ok(connection) = open_opencode_readonly(&db_path) else {
         return false;
     };
     let Ok(mut statement) = connection.prepare(
@@ -315,8 +313,8 @@ fn append_sqlite_daily_entries(
     let Some(db_path) = opencode_db_path(storage) else {
         return false;
     };
-    let Ok(connection) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
+    try_prepare_opencode_indexes(&db_path);
+    let Ok(connection) = open_opencode_readonly(&db_path) else {
         return false;
     };
 
@@ -465,8 +463,7 @@ fn append_sqlite_sessions(sessions: &mut HashMap<String, SessionMetadata>, stora
     let Some(db_path) = opencode_db_path(storage) else {
         return;
     };
-    let Ok(connection) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
+    let Ok(connection) = open_opencode_readonly(&db_path) else {
         return;
     };
     let Ok(mut statement) = connection.prepare("SELECT id, title FROM session") else {
@@ -831,6 +828,30 @@ fn opencode_db_path(storage: &Path) -> Option<PathBuf> {
         .parent()
         .map(|base| base.join("opencode.db"))
         .filter(|path| path.exists())
+}
+
+fn open_opencode_readonly(db_path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+}
+
+fn try_prepare_opencode_indexes(db_path: &Path) {
+    let Ok(connection) = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+
+    let _ = connection.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_token_usage_message_time_created
+        ON message(time_created)
+        WHERE data IS NOT NULL;
+        "#,
+    );
 }
 
 fn absolute_path(path: PathBuf) -> PathBuf {

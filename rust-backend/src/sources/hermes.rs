@@ -19,8 +19,10 @@ pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
         SELECT id, model, started_at, input_tokens, output_tokens, cache_read_tokens,
                cache_write_tokens, estimated_cost_usd, actual_cost_usd
         FROM sessions
-        WHERE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) +
-              COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) > 0
+        WHERE input_tokens > 0
+           OR output_tokens > 0
+           OR cache_read_tokens > 0
+           OR cache_write_tokens > 0
         "#,
     )?;
 

@@ -24,10 +24,12 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, Semaphore};
+use tower_http::compression::CompressionLayer;
 use tracing::{error, info};
 
 pub type ProviderResult = Result<Vec<Value>, String>;
 pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = ProviderResult> + Send + 'a>>;
+const TODAY_CACHE_MAX_ENTRIES: usize = Source::ALL.len() * 8;
 const REFRESH_CONCURRENCY: usize = 4;
 
 pub trait SourceProvider: Send + Sync {
@@ -462,10 +464,9 @@ impl AppState {
         match provider.load_today_daily(date, force).await {
             Ok(data) => {
                 let data = Arc::new(data);
-                self.today_cache
-                    .lock()
-                    .await
-                    .insert(today_cache_key, Arc::clone(&data));
+                let mut today_cache = self.today_cache.lock().await;
+                today_cache.insert(today_cache_key, Arc::clone(&data));
+                enforce_today_cache_limit(&mut today_cache);
                 data
             }
             Err(message) => {
@@ -482,6 +483,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/refresh", get(refresh_handler))
         .route("/api/today", get(today_handler))
         .route("/api/{source}/{view}", get(source_view_handler))
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
@@ -600,6 +602,15 @@ async fn source_view_handler(
 
 fn not_found(message: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": message }))).into_response()
+}
+
+fn enforce_today_cache_limit(cache: &mut HashMap<(Source, String), Arc<Vec<Value>>>) {
+    while cache.len() > TODAY_CACHE_MAX_ENTRIES {
+        let Some(oldest_key) = cache.keys().min_by_key(|(_, date)| date.as_str()).cloned() else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
 }
 
 fn task_key(source: Source, view: View) -> Option<&'static str> {
@@ -1040,7 +1051,7 @@ mod tests {
     use super::*;
     use axum::{
         body::{to_bytes, Body},
-        http::{Request, StatusCode},
+        http::{header, Request, StatusCode},
     };
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1274,6 +1285,26 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value, json!([]));
+    }
+
+    #[tokio::test]
+    async fn json_responses_support_gzip_compression() {
+        let response = create_app(AppState::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING),
+            Some(&header::HeaderValue::from_static("gzip"))
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "defaultWorkerId": "deepseek-v4-flash",
+  "workers": [
+    {
+      "id": "qwen-local:Qwen3.6-27B",
+      "provider": "qwen-local",
+      "model": "Qwen3.6-27B",
+      "domains": ["simple_fix", "crud", "summarization", "search"],
+      "maxDifficulty": "medium",
+      "maxRisk": "low",
+      "elo": 1400,
+      "advisor": {
+        "enabled": true,
+        "provider": "deepseek-openai",
+        "model": "deepseek-v4-pro",
+        "triggers": ["low_confidence", "repeated_failure", "high_risk"],
+        "maxCallsPerTask": 1,
+        "maxTokens": 3000,
+        "mode": "advise_only"
+      }
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "provider": "deepseek-openai",
+      "model": "deepseek-v4-flash",
+      "domains": ["implementation", "debugging", "documentation", "review"],
+      "maxDifficulty": "hard",
+      "maxRisk": "medium",
+      "elo": 1500,
+      "advisor": {
+        "enabled": true,
+        "provider": "deepseek-openai",
+        "model": "deepseek-v4-pro",
+        "triggers": ["low_confidence", "repeated_failure", "high_risk", "conflicting_requirements"],
+        "maxCallsPerTask": 2,
+        "maxTokens": 4000,
+        "mode": "advise_only"
+      }
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "provider": "deepseek-openai",
+      "model": "deepseek-v4-pro",
+      "domains": ["planning", "architecture", "debugging", "review"],
+      "maxDifficulty": "hard",
+      "maxRisk": "high",
+      "elo": 1600
+    }
+  ]
+}

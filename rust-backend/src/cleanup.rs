@@ -28,12 +28,16 @@ pub fn plan_cleanup() -> Vec<CleanupAction> {
 }
 
 pub fn run_cleanup(mode: CleanupMode) -> Result<Vec<CleanupAction>, String> {
-    let actions = plan_cleanup();
     let Some(home) = home_dir() else {
-        return Ok(actions);
+        return Ok(Vec::new());
     };
 
     let root = home.join(APP_SUPPORT_DIR);
+    run_cleanup_in(&root, mode)
+}
+
+fn run_cleanup_in(root: &Path, mode: CleanupMode) -> Result<Vec<CleanupAction>, String> {
+    let actions = plan_cleanup_in(root);
     for action in &actions {
         if !is_app_owned_path(&action.path, &root) {
             return Err(format!(
@@ -45,7 +49,13 @@ pub fn run_cleanup(mode: CleanupMode) -> Result<Vec<CleanupAction>, String> {
 
     match mode {
         CleanupMode::DryRun => Ok(actions),
-        CleanupMode::Apply => Ok(actions),
+        CleanupMode::Apply => {
+            for action in &actions {
+                fs::remove_file(&action.path)
+                    .map_err(|err| format!("failed to remove {}: {err}", action.path.display()))?;
+            }
+            Ok(actions)
+        }
     }
 }
 
@@ -200,6 +210,19 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn apply_cleanup_removes_planned_files() {
+        let home = temp_home();
+        let root = home.join(APP_SUPPORT_DIR);
+
+        write_file(root.join("cache").join("stale.tmp"));
+        let actions = run_cleanup_in(&root, CleanupMode::Apply).unwrap();
+        assert_eq!(actions.len(), 1);
+
+        assert!(!root.join("cache").join("stale.tmp").exists());
         let _ = fs::remove_dir_all(&home);
     }
 
