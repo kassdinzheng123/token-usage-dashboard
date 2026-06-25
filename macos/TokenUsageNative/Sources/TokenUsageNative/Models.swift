@@ -7,7 +7,8 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
     case hermes
     case openclaw
     case pi
-    case factory
+    case grok
+    case cursor
 
     var id: String { rawValue }
 
@@ -25,8 +26,10 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
             "OpenClaw"
         case .pi:
             "Pi Agent"
-        case .factory:
-            "Factory Droid"
+        case .grok:
+            "Grok CLI"
+        case .cursor:
+            "Cursor"
         }
     }
 }

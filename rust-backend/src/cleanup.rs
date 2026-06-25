@@ -178,7 +178,7 @@ mod tests {
         fs::create_dir_all(root.join(".hermes")).unwrap();
         fs::create_dir_all(root.join(".openclaw")).unwrap();
 
-        write_file(root.join("usage-cache.json.tmp"));
+        write_file(root.join("usage-ledger.sqlite.tmp"));
         write_file(root.join("cache").join("stale.backup"));
         write_file(root.join("tmp").join("session.tmp"));
         write_file(root.join("backup").join("old.bak"));
@@ -191,7 +191,7 @@ mod tests {
         let actions = plan_cleanup_in(&root);
         let paths: Vec<_> = actions.iter().map(|action| action.path.clone()).collect();
 
-        assert!(paths.contains(&root.join("usage-cache.json.tmp")));
+        assert!(paths.contains(&root.join("usage-ledger.sqlite.tmp")));
         assert!(paths.contains(&root.join("cache").join("stale.backup")));
         assert!(paths.contains(&root.join("tmp").join("session.tmp")));
         assert!(paths.contains(&root.join("backup").join("old.bak")));

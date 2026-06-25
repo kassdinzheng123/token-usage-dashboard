@@ -1,0 +1,141 @@
+{
+  "status": "completed",
+  "findings": [
+    {
+      "severity": "high",
+      "type": "hardcoded_url",
+      "file": "ccusage/packages/internal/src/pricing.ts",
+      "line": 3,
+      "value": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+      "snippet": "export const LITELLM_PRICES_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';",
+      "remediation": "Move external pricing URLs to a config file or environment variables (e.g., LITELLM_PRICES_URL, LLM_PRICES_URL). These are production API endpoints hardcoded in source."
+    },
+    {
+      "severity": "high",
+      "type": "hardcoded_url",
+      "file": "ccusage/packages/internal/src/pricing.ts",
+      "line": 4,
+      "value": "https://www.llm-prices.com/current-v1.json",
+      "snippet": "export const LLM_PRICES_URL = 'https://www.llm-prices.com/current-v1.json';",
+      "remediation": "Move external pricing URLs to a config file or environment variables."
+    },
+    {
+      "severity": "medium",
+      "type": "hardcoded_url",
+      "file": "scripts/compare-rust-backend.mjs",
+      "line": 3,
+      "value": "http://127.0.0.1:3456/api",
+      "snippet": "const DEFAULT_OLD_BASE_URL = 'http://127.0.0.1:3456/api';",
+      "remediation": "These defaults are acceptable for a dev comparison script, but should be documented as overridable via env vars (already partially supported via OLD_BASE_URL/NEW_BASE_URL). Consider removing hardcoded port numbers."
+    },
+    {
+      "severity": "medium",
+      "type": "hardcoded_url",
+      "file": "scripts/compare-rust-backend.mjs",
+      "line": 4,
+      "value": "http://127.0.0.1:3457/api",
+      "snippet": "const DEFAULT_NEW_BASE_URL = 'http://127.0.0.1:3457/api';",
+      "remediation": "Same as above - consider documenting these default ports in a config section."
+    },
+    {
+      "severity": "medium",
+      "type": "hardcoded_path",
+      "file": "ccusage/apps/codex/src/_consts.ts",
+      "line": 5,
+      "value": "~/.codex",
+      "snippet": "export const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');",
+      "remediation": "Good that CODEX_HOME env var is supported as override. Consider documenting this in a README or config file."
+    },
+    {
+      "severity": "medium",
+      "type": "hardcoded_path",
+      "file": "index.mjs (server adapters - bundled source)",
+      "line": 42647,
+      "value": "~/.hermes/state.db",
+      "snippet": "const dbPath = path9.join(os3.homedir(), '.hermes', 'state.db');",
+      "remediation": "Hardcoded Hermes state database path. Should support an environment variable override (e.g., HERMES_DB_PATH) or be configurable."
+    },
+    {
+      "severity": "medium",
+      "type": "hardcoded_path",
+      "file": "index.mjs (server adapters - bundled source)",
+      "line": 42684,
+      "value": "~/.openclaw/agents",
+      "snippet": "const agentsDir = path9.join(os3.homedir(), '.openclaw', 'agents');",
+      "remediation": "Hardcoded OpenClaw agents directory path. Should support an environment variable override (e.g., OPENCLAW_AGENTS_DIR) or be configurable."
+    },
+    {
+      "severity": "medium",
+      "type": "hardcoded_path",
+      "file": "index.mjs (server adapters - bundled source)",
+      "line": 43029,
+      "value": "~/Library/Application Support/Token Usage Dashboard/usage-ledger.sqlite",
+      "snippet": "return process.env.TOKEN_USAGE_LEDGER_PATH || path.join(os.homedir(), 'Library', 'Application Support', 'Token Usage Dashboard', 'usage-ledger.sqlite');",
+      "remediation": "Good that TOKEN_USAGE_LEDGER_PATH env var is supported. This macOS-specific path should be documented as configurable."
+    },
+    {
+      "severity": "medium",
+      "type": "env_value",
+      "file": "scripts/build-native-mac.mjs",
+      "line": 8,
+      "value": "appId = 'com.tokenusage.dashboard.native'",
+      "snippet": "const productName = 'Token Usage Dashboard';\nconst version = '1.0.1';\nconst appId = 'com.tokenusage.dashboard.native';\nconst minimumMacOSVersion = '14.0';",
+      "remediation": "Build metadata (version, appId, minimumMacOSVersion) should be read from package.json or a build config file instead of being hardcoded in the build script."
+    },
+    {
+      "severity": "low",
+      "type": "hardcoded_path",
+      "file": "scripts/build-native-mac.mjs",
+      "line": 52,
+      "value": "rust-backend/target/release/token-usage-server",
+      "snippet": "const source = join(repoRoot, 'rust-backend', 'target', 'release', 'token-usage-server');",
+      "remediation": "Build output paths should be derived from Cargo.toml or build config rather than hardcoded. Minor risk as these are build-time paths."
+    },
+    {
+      "severity": "low",
+      "type": "hardcoded_url",
+      "file": "build/renderer/assets/index-ekDp4p-m.js",
+      "line": 770,
+      "value": "const He=\"/api\"",
+      "snippet": "const He=\"/api\"; async function $e(i){const t=await fetch(i);... const o=n.toString(),a=`${He}/${i}/daily${o?\"?\"+o:\"\"}`;... async function Fu(){return $e(`${He}/health`)}",
+      "remediation": "API base path should be configurable via an environment variable or build-time config rather than hardcoded as '/api'. Currently relies on same-origin proxying."
+    },
+    {
+      "severity": "low",
+      "type": "hardcoded_path",
+      "file": "index.mjs (server adapters - bundled source)",
+      "line": 42650,
+      "value": "node_modules/sql.js/dist",
+      "snippet": "const wasmDir = process.env.TOKEN_USAGE_WASM_DIR || path9.join(process.cwd(), 'node_modules', 'sql.js', 'dist');",
+      "remediation": "Good that TOKEN_USAGE_WASM_DIR env var is supported. The fallback to node_modules is reasonable for development but should be noted."
+    },
+    {
+      "severity": "low",
+      "type": "env_value",
+      "file": "ccusage/apps/ccusage/src/_consts.ts",
+      "line": 52,
+      "value": "MCP_DEFAULT_PORT = 8080",
+      "snippet": "export const MCP_DEFAULT_PORT = 8080;",
+      "remediation": "Default MCP port should be documented as overrideable via environment variable. Low severity as it's a configurable default."
+    },
+    {
+      "severity": "low",
+      "type": "env_value",
+      "file": "index.mjs (bundled server source)",
+      "line": 42867,
+      "value": "default port 3456",
+      "snippet": "const port = options.port ?? (Number(process.env.PORT) || 3456);",
+      "remediation": "Default port 3456 is properly configurable via PORT env var. Minor concern - the hardcoded default could conflict with other services."
+    },
+    {
+      "severity": "low",
+      "type": "hardcoded_path",
+      "file": "index.mjs (bundled opencode adapter source)",
+      "line": 31822,
+      "value": ".local/share/opencode",
+      "snippet": "DEFAULT_OPENCODE_PATH = '.local/share/opencode';",
+      "remediation": "Good that OPENCODE_DATA_DIR env var is supported. Default path is a reasonable XDG-compliant fallback."
+    }
+  ],
+  "summary": "Found 15 hardcoded configuration issues across the project. The most critical are the two hardcoded pricing API URLs in pricing.ts (LITELLM_PRICES_URL, LLM_PRICES_URL) which are production external endpoints embedded in source code. Several application data directory paths (~/.codex, ~/.hermes, ~/.openclaw) are hardcoded but most support environment variable overrides. The build script has hardcoded version/appId/metadata that should be sourced from package.json. The renderer API base path ('/api') is hardcoded in the frontend bundle. Overall, the project follows reasonable patterns (env var overrides, platform-appropriate defaults) but would benefit from centralizing configuration into a config module or .env file."
+}

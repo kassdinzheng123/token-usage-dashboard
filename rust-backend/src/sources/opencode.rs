@@ -754,14 +754,12 @@ fn aggregate_entries(
         group.total_tokens += entry.total_tokens();
         group.total_cost += entry.total_cost;
 
-        if !group.models_used.contains(&entry.model_name) {
-            group.models_used.push(entry.model_name.clone());
+        let model_name = super::cluster_model_name(&entry.model_name);
+        if !group.models_used.contains(&model_name) {
+            group.models_used.push(model_name.clone());
         }
 
-        let model = group
-            .model_breakdowns
-            .entry(entry.model_name.clone())
-            .or_default();
+        let model = group.model_breakdowns.entry(model_name).or_default();
         model.input_tokens += entry.input_tokens;
         model.output_tokens += entry.output_tokens;
         model.cache_creation_tokens += entry.cache_creation_tokens;

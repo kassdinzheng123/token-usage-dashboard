@@ -1,0 +1,61 @@
+{
+  "status": "completed",
+  "findings": [
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "plist",
+      "version": "3.1.0",
+      "issue": "CVE-2022-29078: Prototype Pollution vulnerability. The plist package before 3.1.1 is vulnerable to prototype pollution through crafted property list input, allowing attackers to add or modify properties of Object.prototype via malicious .plist files. Affected via 5 dependency paths: direct, @electron/osx-sign, @electron/universal, app-builder-lib, and dmg-license.",
+      "remediation": "Force plist >=3.1.1 via npm overrides or resolutions. Since these are build-time deps (electron-builder toolchain), the risk is limited to build environments processing untrusted plist input."
+    },
+    {
+      "severity": "medium",
+      "type": "abandoned_dependency",
+      "package": "dmg-license",
+      "version": "1.0.11",
+      "issue": "Unmaintained package. Transitively depends on plist ^3.0.4 which resolves to the vulnerable 3.1.0 (CVE-2022-29078). The package has not been updated to use a patched plist version. Used by dmg-builder -> electron-builder for macOS DMG creation.",
+      "remediation": "Override plist to >=3.1.1. Consider pinning dmg-license or switching to a maintained DMG builder alternative if electron-builder doesn't update its dependency range."
+    },
+    {
+      "severity": "medium",
+      "type": "outdated_dependency",
+      "package": "fd-slicer",
+      "version": "1.1.0",
+      "issue": "Dead/unmaintained package last released ~2016 (9+ years stale). No active maintenance, no security fixes possible. Dependency chain: fd-slicer <- yauzl 2.10.0 <- extract-zip 2.0.1 <- electron-builder. While no direct CVE has been assigned, unmaintained packages inherently carry risk as no patches can be issued for future discoveries.",
+      "remediation": "This is a transitive dep through electron-builder -> extract-zip -> yauzl -> fd-slicer. No direct remediation without replacing electron-builder. Risk is low since it's a build-time-only dependency processing trusted archive files."
+    },
+    {
+      "severity": "low",
+      "type": "outdated_dependency",
+      "package": "yauzl",
+      "version": "2.10.0",
+      "issue": "Unmaintained package last released ~2019 (6+ years stale). Used as the ZIP reading backend for extract-zip -> electron-builder. Transitive dependency on abandoned fd-slicer 1.1.0.",
+      "remediation": "No direct action available; controlled by electron-builder's dependency chain. Low risk as build-time only."
+    },
+    {
+      "severity": "low",
+      "type": "deprecated_ecosystem",
+      "package": "got",
+      "version": "11.8.6",
+      "issue": "The got project has a history of prototype pollution issues. While version 11.8.6 is patched for CVE-2021-3749 (fixed in 11.8.5), the ecosystem is in flux (got v12+ changed architecture, and the project has been largely superseded). Dependency chain: got <- @electron/get <- electron / app-builder-lib.",
+      "remediation": "No immediate action needed. Version 11.8.6 is patched for known CVEs. Monitor for new advisories."
+    },
+    {
+      "severity": "low",
+      "type": "supply_chain_risk",
+      "package": "rc",
+      "version": "1.2.8",
+      "issue": "Historical supply chain risk. rc <1.2.9 had a prototype pollution issue (previously reported), though 1.2.8 has partial mitigations. The package loads user config files which can be a trust boundary concern. Dependency chain: rc <- prebuild-install <- better-sqlite3.",
+      "remediation": "Consider overriding to rc >=1.2.10. The exposure is limited since prebuild-install only uses rc during native module download/install at build time."
+    }
+  ],
+  "summary": "Root package.json declares zero dependencies, yet node_modules contains ~330 packages (all marked 'extraneous'). These are build-time dependencies from the electron-builder toolchain. The most critical finding is plist 3.1.0 (CVE-2022-29078, prototype pollution, HIGH severity) pulled in via 5 dependency paths. Two abandoned packages (dmg-license 1.0.11, fd-slicer 1.1.0) and one severely outdated package (yauzl 2.10.0) are in the electron-builder chain, but risk is mitigated because all are build-time-only (no runtime exposure in the shipped Electron app). Recommended immediate action: add an npm 'overrides' field to force plist >=3.1.1 across the dependency tree.",
+  "metadata": {
+    "audit_date": "2026-05-13",
+    "packages_scanned": "~330",
+    "root_package": "token-usage-dashboard@1.0.1",
+    "npm_audit_result": "0 vulnerabilities (because package.json declares no deps, rendering npm audit ineffective)",
+    "dependency_graph_root": "electron-builder@26.8.1 (all node_modules are transitive deps of this build tool)"
+  }
+}

@@ -1,3 +1,4 @@
+use crate::sources;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -10,6 +11,7 @@ use std::{
 const LITELLM_PRICES_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const LLM_PRICES_URL: &str = "https://www.llm-prices.com/current-v1.json";
+const PI_DEV_MODELS_URL: &str = "https://pi.dev/models";
 const MILLION: f64 = 1_000_000.0;
 const PRICING_HTTP_TIMEOUT_SECS: u64 = 15;
 const PRICING_CACHE_FRESH_SECS: u64 = 24 * 60 * 60;
@@ -42,8 +44,17 @@ struct ModelPricing {
     cache_read_input_token_cost_above_128k_tokens: f64,
 }
 
+#[derive(Debug, Clone)]
+struct PiDevModel {
+    provider: String,
+    model_id: String,
+    model_name: String,
+    pricing: ModelPricing,
+}
+
 #[derive(Debug, Default)]
 struct PricingDataset {
+    pidev: Vec<PiDevModel>,
     primary: HashMap<String, ModelPricing>,
     secondary: HashMap<String, ModelPricing>,
     unresolved_models: HashSet<String>,
@@ -71,26 +82,26 @@ pub fn model_cost_usd(model: &str, usage: TokenUsage) -> f64 {
 }
 
 fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
-    match normalize_key(model).as_str() {
-        "mimo-v2.5-pro"
-        | "mimo-v2-5-pro"
-        | "xiaomi/mimo-v2.5-pro"
-        | "xiaomi/mimo-v2-5-pro"
-        | "xiaomi-token-plan-sgp/mimo-v2.5-pro"
-        | "xiaomi-token-plan-sgp/mimo-v2-5-pro"
-        | "xiaomi-token-plan-ams/mimo-v2.5-pro"
-        | "xiaomi-token-plan-ams/mimo-v2-5-pro"
-        | "xiaomi-token-plan-cn/mimo-v2.5-pro"
-        | "xiaomi-token-plan-cn/mimo-v2-5-pro"
-        | "openrouter/xiaomi/mimo-v2.5-pro"
-        | "openrouter/xiaomi/mimo-v2-5-pro" => Some(
-            (usage.input_tokens.max(0) as f64 * 1.0
-                + usage.output_tokens.max(0) as f64 * 3.0
-                + usage.cache_read_tokens.max(0) as f64 * 0.2)
+    let candidates = candidates_for(model);
+    let is_composer = candidates.iter().any(|candidate| {
+        matches!(
+            candidate.as_str(),
+            "composer-2.5-fast"
+                | "composer-2-5-fast"
+                | "grok-composer-2.5-fast"
+                | "grok-composer-2-5-fast"
+        )
+    });
+    if is_composer {
+        return Some(
+            (usage.input_tokens.max(0) as f64 * 3.0
+                + usage.output_tokens.max(0) as f64 * 15.0
+                + usage.cache_creation_tokens.max(0) as f64 * 3.0
+                + usage.cache_read_tokens.max(0) as f64 * 0.08)
                 / MILLION,
-        ),
-        _ => None,
+        );
     }
+    None
 }
 
 pub fn model_breakdown(model: &str, usage: TokenUsage, cost: Option<f64>) -> Value {
@@ -113,6 +124,7 @@ pub fn model_breakdown(model: &str, usage: TokenUsage, cost: Option<f64>) -> Val
 
 fn load_pricing_dataset() -> PricingDataset {
     PricingDataset {
+        pidev: load_cached_pidev_models().unwrap_or_default(),
         primary: load_cached_pricing_map(LITELLM_PRICES_URL).unwrap_or_default(),
         secondary: load_cached_pricing_map(LLM_PRICES_URL).unwrap_or_default(),
         unresolved_models: HashSet::new(),
@@ -264,7 +276,234 @@ fn pricing_from_litellm(raw: &Value) -> Option<ModelPricing> {
     })
 }
 
+fn fetch_pidev_models() -> Result<Vec<PiDevModel>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(PRICING_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let text = client
+        .get(PI_DEV_MODELS_URL)
+        .send()
+        .map_err(|err| err.to_string())?
+        .error_for_status()
+        .map_err(|err| err.to_string())?
+        .text()
+        .map_err(|err| err.to_string())?;
+
+    let models = parse_pidev_models(&text)?;
+    if !models.is_empty() {
+        persist_pricing_map(PI_DEV_MODELS_URL, &text);
+    }
+    Ok(models)
+}
+
+fn load_cached_pidev_models() -> Result<Vec<PiDevModel>, String> {
+    let Some(path) = pricing_cache_path(PI_DEV_MODELS_URL) else {
+        return Ok(Vec::new());
+    };
+    let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    parse_pidev_models(&text)
+}
+
+fn parse_pidev_models(text: &str) -> Result<Vec<PiDevModel>, String> {
+    let mut models = Vec::new();
+    let marker = r#"data-model-row="true""#;
+    let mut search_from = 0;
+    while let Some(offset) = text[search_from..].find(marker) {
+        let row_start = search_from + offset;
+        let row_end = text[row_start..]
+            .find("</tr>")
+            .map(|end| row_start + end)
+            .unwrap_or(text.len());
+        let row = &text[row_start..row_end];
+        search_from = if row_end < text.len() {
+            row_end + "</tr>".len()
+        } else {
+            text.len()
+        };
+
+        let Some(model_id) = extract_attr(row, "data-model-id") else {
+            continue;
+        };
+        let model_name = extract_attr(row, "data-model-name").unwrap_or_default();
+        let Some(provider) = extract_attr(row, "data-model-provider") else {
+            continue;
+        };
+
+        let cells = extract_td_prices(row);
+        if cells.len() < 5 {
+            continue;
+        }
+        let pricing = ModelPricing {
+            input_cost_per_token: clamp_price(cells[1]) / MILLION,
+            output_cost_per_token: clamp_price(cells[2]) / MILLION,
+            cache_read_input_token_cost: clamp_price(cells[3]) / MILLION,
+            cache_creation_input_token_cost: clamp_price(cells[4]) / MILLION,
+            ..ModelPricing::default()
+        };
+        models.push(PiDevModel {
+            provider: normalize_key(&provider),
+            model_id: normalize_key(&model_id),
+            model_name: normalize_key(&model_name),
+            pricing,
+        });
+    }
+    Ok(models)
+}
+
+fn extract_attr(row: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = row.find(&needle)? + needle.len();
+    let rest = &row[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_td_prices(row: &str) -> Vec<f64> {
+    let mut prices = Vec::new();
+    let mut search = 0;
+    while let Some(offset) = row[search..].find("<td") {
+        let tag_start = search + offset;
+        let Some(close) = row[tag_start..].find('>') else {
+            break;
+        };
+        let content_start = tag_start + close + 1;
+        let Some(end) = row[content_start..].find("</td>") else {
+            break;
+        };
+        let content = &row[content_start..content_start + end];
+        if let Some(price) = parse_price_cell(content) {
+            prices.push(price);
+        }
+        search = content_start + end + "</td>".len();
+    }
+    prices
+}
+
+fn parse_price_cell(content: &str) -> Option<f64> {
+    let cleaned: String = content
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    cleaned.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn clamp_price(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn find_pidev_pricing(models: &[PiDevModel], model: &str) -> Option<ModelPricing> {
+    if models.is_empty() {
+        return None;
+    }
+    let candidates = candidates_for(model);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(pricing) = find_pidev_in_provider(models, "openrouter", &candidates) {
+        return Some(pricing);
+    }
+    if let Some(provider) = official_pidev_provider(model) {
+        if let Some(pricing) = find_pidev_in_provider(models, provider, &candidates) {
+            return Some(pricing);
+        }
+    }
+    let all: Vec<&PiDevModel> = models.iter().collect();
+    find_pidev_best(&all, &candidates)
+}
+
+fn find_pidev_in_provider(
+    models: &[PiDevModel],
+    provider: &str,
+    candidates: &[String],
+) -> Option<ModelPricing> {
+    let filtered: Vec<&PiDevModel> = models
+        .iter()
+        .filter(|model| model.provider == provider)
+        .collect();
+    find_pidev_best(&filtered, candidates)
+}
+
+fn find_pidev_best(models: &[&PiDevModel], candidates: &[String]) -> Option<ModelPricing> {
+    let viable: Vec<&PiDevModel> = models
+        .iter()
+        .copied()
+        .filter(|model| {
+            model.pricing.input_cost_per_token > 0.0 || model.pricing.output_cost_per_token > 0.0
+        })
+        .collect();
+    if viable.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(usize, &PiDevModel)> = None;
+    for model in viable.iter().copied() {
+        let Some(score) = score_pidev_match(model, candidates) else {
+            continue;
+        };
+        match best {
+            None => best = Some((score, model)),
+            Some((best_score, _)) if score < best_score => best = Some((score, model)),
+            _ => {}
+        }
+    }
+    best.map(|(_, model)| model.pricing)
+}
+
+fn score_pidev_match(model: &PiDevModel, candidates: &[String]) -> Option<usize> {
+    let id = &model.model_id;
+    let name = &model.model_name;
+
+    if candidates.iter().any(|candidate| candidate == id) {
+        return Some(0);
+    }
+    if !name.is_empty() && candidates.iter().any(|candidate| candidate == name) {
+        return Some(1);
+    }
+
+    let mut best: Option<usize> = None;
+    for candidate in candidates {
+        if id.contains(candidate.as_str()) {
+            let score = 2 + id.len();
+            best = Some(match best {
+                None => score,
+                Some(existing) => existing.min(score),
+            });
+        }
+    }
+    best
+}
+
+fn official_pidev_provider(model: &str) -> Option<&'static str> {
+    let normalized = normalize_key(model);
+    if normalized.contains("deepseek") {
+        Some("deepseek")
+    } else if normalized.contains("claude") {
+        Some("anthropic")
+    } else if normalized.contains("gemini") {
+        Some("google")
+    } else if normalized.contains("gpt") {
+        Some("openai")
+    } else if normalized.contains("glm") || normalized.contains("ark-code") {
+        Some("zai")
+    } else if normalized.contains("grok") {
+        Some("xai")
+    } else if normalized.contains("mimo") {
+        Some("xiaomi")
+    } else {
+        None
+    }
+}
+
 fn find_pricing(dataset: &PricingDataset, model: &str) -> Option<ModelPricing> {
+    if let Some(pricing) = find_pidev_pricing(&dataset.pidev, model) {
+        return Some(pricing);
+    }
     let candidates = candidates_for(model);
     for candidate in &candidates {
         if let Some(pricing) = dataset.primary.get(candidate).copied() {
@@ -330,6 +569,7 @@ fn refresh_pricing_for_model(model: &str) {
         return;
     }
 
+    let pidev = fetch_pidev_models().ok();
     let primary = fetch_pricing_map(LITELLM_PRICES_URL).ok();
     let secondary = fetch_pricing_map(LLM_PRICES_URL).ok();
 
@@ -337,6 +577,9 @@ fn refresh_pricing_for_model(model: &str) {
         return;
     };
 
+    if let Some(pidev) = pidev.filter(|models| !models.is_empty()) {
+        dataset.pidev = pidev;
+    }
     if let Some(primary) = primary.filter(|map| !map.is_empty()) {
         dataset.primary = primary;
     }
@@ -361,13 +604,14 @@ fn pricing_cache_path(url: &str) -> Option<PathBuf> {
     let file_name = match url {
         LITELLM_PRICES_URL => "litellm-model-prices.json",
         LLM_PRICES_URL => "llm-prices-current-v1.json",
+        PI_DEV_MODELS_URL => "pidev-models.html",
         _ => return None,
     };
     Some(base.join(file_name))
 }
 
 fn pricing_cache_is_fresh() -> bool {
-    [LITELLM_PRICES_URL, LLM_PRICES_URL].into_iter().any(|url| {
+    [LITELLM_PRICES_URL, LLM_PRICES_URL, PI_DEV_MODELS_URL].into_iter().any(|url| {
         let Some(path) = pricing_cache_path(url) else {
             return false;
         };
@@ -458,7 +702,9 @@ fn candidates_for(model: &str) -> Vec<String> {
         add_fireworks_router_variants(&mut candidates, stripped);
     }
 
-    candidates.into_iter().collect()
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort();
+    candidates
 }
 
 fn custom_stripped_model(model: &str) -> Option<String> {
@@ -522,29 +768,50 @@ fn add_fireworks_router_variants(candidates: &mut HashSet<String>, model: &str) 
 
 fn resolve_alias(model: &str) -> String {
     let normalized = normalize_key(model);
-    if normalized == "kiro-claude-opus-4.7" {
-        return "claude-opus-4.7".to_string();
+    if normalized == "kiro-claude-opus-4.7" || normalized == "kiro-claude-opus-4-7" {
+        return "claude-opus-4-7".to_string();
     }
     if is_kiro_model(&normalized) {
-        return normalized;
+        return sources::cluster_model_name(&normalized);
     }
-    if normalized.contains("claude-opus-4.7") {
-        return "claude-opus-4.7".to_string();
+    if normalized.contains("claude-opus-4.7") || normalized.contains("claude-opus-4-7") {
+        return "claude-opus-4-7".to_string();
     }
-    if normalized.contains("gpt-5.5") {
+    if normalized.contains("ark-code-latest") || normalized == "ark-code" {
+        return "glm-5.2".to_string();
+    }
+    if normalized.contains("glm-5.2") || normalized.contains("glm-5-2") {
+        return "glm-5.2".to_string();
+    }
+    if normalized.contains("step-3.7-flash") {
+        return "step-3.7-flash".to_string();
+    }
+    if normalized.contains("composer-2.5-fast") {
+        return "composer-2.5-fast".to_string();
+    }
+    if normalized.contains("gpt-5.5")
+        && !normalized.contains("gpt-5.5-mini")
+        && !normalized.contains("gpt-5.5-nano")
+        && !normalized.contains("gpt-5.5-pro")
+    {
         return "gpt-5.5".to_string();
     }
-    if normalized.contains("gpt-5.4") {
+    if normalized.contains("gpt-5.4")
+        && !normalized.contains("gpt-5.4-mini")
+        && !normalized.contains("gpt-5.4-nano")
+        && !normalized.contains("gpt-5.4-pro")
+    {
         return "gpt-5.4".to_string();
     }
     match normalized.as_str() {
         "claude-opus-4-6-thinking" => "claude-opus-4-6".to_string(),
         "claude-sonnet-4.5" | "claude-sonnet-4-5" => "claude-sonnet-4-5-20250929".to_string(),
         "claude-haiku-4.5" | "claude-haiku-4-5" => "claude-haiku-4-5-20251001".to_string(),
+        "claude-opus-4.8" | "claude-opus-4-8" => "claude-opus-4-8".to_string(),
         "gpt-5-codex" => "gpt-5".to_string(),
         "gpt-5.3-codex-spark" => "gpt-5.3-codex".to_string(),
         "gpt-5.3-codex" => "gpt-5.2-codex".to_string(),
-        other => other.to_string(),
+        _ => sources::cluster_model_name(&normalized),
     }
 }
 
@@ -712,12 +979,13 @@ mod tests {
     }
 
     #[test]
-    fn calculates_builtin_mimo_v25_pro_cost() {
-        let usage = usage(6_200, 33, 100, 50);
-        let cost = model_cost_usd("mimo-v2.5-pro", usage);
-        let expected = (6_200.0 * 1.0 + 33.0 * 3.0 + 50.0 * 0.2) / MILLION;
+    fn calculates_builtin_grok_composer_25_fast_cost() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        let cost = model_cost_usd("grok-composer-2.5-fast", usage);
+        let expected = (1_250_000.0 * 3.0 + 1_000_000.0 * 15.0 + 500_000.0 * 0.08) / MILLION;
 
         assert!((cost - expected).abs() < 1e-12);
+        assert_eq!(model_cost_usd("composer-2.5-fast", usage), cost);
     }
 
     #[test]
@@ -748,6 +1016,39 @@ mod tests {
     }
 
     #[test]
+    fn keeps_mini_models_from_resolving_to_full_model_pricing() {
+        let candidates = candidates_for("gpt-5.4-mini");
+        assert!(candidates.contains(&"gpt-5.4-mini".to_string()));
+        assert!(candidates.contains(&"openai/gpt-5.4-mini".to_string()));
+        assert!(!candidates.contains(&"gpt-5.4".to_string()));
+        assert!(!candidates.contains(&"openai/gpt-5.4".to_string()));
+
+        let prices = r#"{
+            "gpt-5.4": {
+                "input_cost_per_token": 0.0000025,
+                "output_cost_per_token": 0.000015,
+                "cache_read_input_token_cost": 0.00000025
+            },
+            "gpt-5.4-mini": {
+                "input_cost_per_token": 0.00000075,
+                "output_cost_per_token": 0.0000045,
+                "cache_read_input_token_cost": 0.000000075
+            }
+        }"#;
+        let dataset = PricingDataset {
+            pidev: Vec::new(),
+            primary: parse_pricing_map(prices).expect("pricing parses"),
+            secondary: HashMap::new(),
+            unresolved_models: HashSet::new(),
+        };
+        let pricing = find_pricing(&dataset, "gpt-5.4-mini").expect("pricing exists");
+
+        assert_eq!(pricing.input_cost_per_token, 0.00000075);
+        assert_eq!(pricing.output_cost_per_token, 0.0000045);
+        assert_eq!(pricing.cache_read_input_token_cost, 0.000000075);
+    }
+
+    #[test]
     fn resolves_custom_prefixed_models() {
         let codex = candidates_for("custom:gpt-5-codex");
         assert!(codex.contains(&"gpt-5-codex".to_string()));
@@ -759,12 +1060,30 @@ mod tests {
         assert!(factory.contains(&"openai/gpt-5.5".to_string()));
 
         let kiro = candidates_for("custom:pi-mono-kiro-claude-opus-4.7-3");
-        assert!(!kiro.contains(&"claude-opus-4.7".to_string()));
-        assert!(!kiro.contains(&"anthropic/claude-opus-4.7".to_string()));
+        assert!(!kiro.contains(&"claude-opus-4-7".to_string()));
+        assert!(!kiro.contains(&"anthropic/claude-opus-4-7".to_string()));
 
         let pi_kiro = candidates_for("kiro-claude-opus-4.7");
-        assert!(pi_kiro.contains(&"claude-opus-4.7".to_string()));
-        assert!(pi_kiro.contains(&"anthropic/claude-opus-4.7".to_string()));
+        assert!(pi_kiro.contains(&"claude-opus-4-7".to_string()));
+        assert!(pi_kiro.contains(&"anthropic/claude-opus-4-7".to_string()));
+    }
+
+    #[test]
+    fn resolves_ark_code_latest_to_glm_52() {
+        let candidates = candidates_for("CPA/ark-code-latest");
+        assert!(candidates.contains(&"glm-5.2".to_string()));
+        assert_eq!(official_pidev_provider("CPA/ark-code-latest"), Some("zai"));
+    }
+
+    #[test]
+    fn resolves_glm_52_variants_to_glm_52() {
+        for model in ["glm-5.2-max", "glm-5.2", "z-ai/glm-5.2-preview", "glm-5-2-max"] {
+            let candidates = candidates_for(model);
+            assert!(
+                candidates.contains(&"glm-5.2".to_string()),
+                "expected glm-5.2 candidate for {model}"
+            );
+        }
     }
 
     #[test]
@@ -788,6 +1107,7 @@ mod tests {
         }"#;
         let map = parse_pricing_map(prices).expect("pricing parses");
         let dataset = PricingDataset {
+            pidev: Vec::new(),
             primary: map,
             secondary: HashMap::new(),
             unresolved_models: HashSet::new(),
@@ -809,6 +1129,7 @@ mod tests {
         }"#;
         let map = parse_pricing_map(prices).expect("pricing parses");
         let dataset = PricingDataset {
+            pidev: Vec::new(),
             primary: map,
             secondary: HashMap::new(),
             unresolved_models: HashSet::new(),
@@ -829,6 +1150,7 @@ mod tests {
         }"#;
         let map = parse_pricing_map(prices).expect("pricing parses");
         let dataset = PricingDataset {
+            pidev: Vec::new(),
             primary: map,
             secondary: HashMap::new(),
             unresolved_models: HashSet::new(),
@@ -852,6 +1174,7 @@ mod tests {
         }"#;
         let map = parse_pricing_map(prices).expect("pricing parses");
         let dataset = PricingDataset {
+            pidev: Vec::new(),
             primary: HashMap::new(),
             secondary: map,
             unresolved_models: HashSet::new(),
@@ -916,5 +1239,134 @@ mod tests {
         let computed = model_breakdown("openrouter/free", usage, None);
         assert_eq!(computed["modelName"], "openrouter/free");
         assert!(computed["cost"].as_f64().unwrap_or_default() >= 0.0);
+    }
+
+    const PIDEV_HTML_SAMPLE: &str = r#"
+<table>
+<tbody>
+<tr class="models-provider-group-row" data-model-group="true" data-model-group-provider="openrouter"></tr>
+<tr data-model-row="true" data-model-name="openai gpt-5.5" data-model-id="openai/gpt-5.5" data-model-provider="openrouter"><th class="models-model-col" scope="row"><a href="/models/openrouter/openai-gpt-5-5" class="models-model-link" data-model-link="true" data-model-path="/models/openrouter/openai-gpt-5-5">OpenAI: GPT-5.5</a><code>openai/gpt-5.5</code></th><td class="data-table-col-num" data-label="Context">1,050,000</td><td class="data-table-col-num" data-label="Input /M">$5</td><td class="data-table-col-num" data-label="Output /M">$30</td><td class="data-table-col-num" data-label="Cache read /M">$0.5</td><td class="data-table-col-num" data-label="Cache write /M">$0</td></tr>
+<tr data-model-row="true" data-model-name="anthropic claude opus 4.6" data-model-id="anthropic/claude-opus-4.6" data-model-provider="openrouter"><th><a href="/models/openrouter/anthropic-claude-opus-4-6">Anthropic: Claude Opus 4.6</a><code>anthropic/claude-opus-4.6</code></th><td>1,000,000</td><td>$5</td><td>$25</td><td>$0.5</td><td>$6.25</td></tr>
+<tr data-model-row="true" data-model-name="stepfun step 3.7 flash" data-model-id="stepfun/step-3.7-flash" data-model-provider="openrouter"><th><a href="/models/openrouter/stepfun-step-3-7-flash">StepFun: Step 3.7 Flash</a><code>stepfun/step-3.7-flash</code></th><td>256,000</td><td>$0.2</td><td>$1.15</td><td>$0.04</td><td>$0</td></tr>
+<tr data-model-row="true" data-model-name="xiaomi mimo v2.5 pro" data-model-id="xiaomi/mimo-v2.5-pro" data-model-provider="openrouter"><th><a href="/models/openrouter/xiaomi-mimo-v2-5-pro">Xiaomi: MiMo-V2.5-Pro</a><code>xiaomi/mimo-v2.5-pro</code></th><td>1,048,576</td><td>$0.435</td><td>$0.87</td><td>$0.0036</td><td>$0</td></tr>
+</tbody>
+<tbody>
+<tr class="models-provider-group-row" data-model-group="true" data-model-group-provider="anthropic"></tr>
+<tr data-model-row="true" data-model-name="claude opus 4.6" data-model-id="claude-opus-4-6" data-model-provider="anthropic"><th><a href="/models/anthropic/claude-opus-4-6">Claude Opus 4.6</a><code>claude-opus-4-6</code></th><td>1,000,000</td><td>$5</td><td>$25</td><td>$0.5</td><td>$6.25</td></tr>
+</tbody>
+<tbody>
+<tr class="models-provider-group-row" data-model-group="true" data-model-group-provider="xai"></tr>
+<tr data-model-row="true" data-model-name="grok build 0.1" data-model-id="grok-build-0.1" data-model-provider="xai"><th><a href="/models/xai/grok-build-0-1">Grok Build 0.1</a><code>grok-build-0.1</code></th><td>256,000</td><td>$1</td><td>$2</td><td>$0.2</td><td>$0</td></tr>
+</tbody>
+<tbody>
+<tr class="models-provider-group-row" data-model-group="true" data-model-group-provider="openrouter"></tr>
+<tr data-model-row="true" data-model-name="openai gpt-5.5" data-model-id="gpt-5.5" data-model-provider="openrouter"><th><a href="/models/openrouter/gpt-5-5">OpenAI: GPT-5.5</a><code>gpt-5.5</code></th><td>1,050,000</td><td>$0</td><td>$0</td><td>$0</td><td>$0</td></tr>
+</tbody>
+</table>
+"#;
+
+    #[test]
+    fn parses_pidev_html_rows_into_pricing_entries() {
+        let models = parse_pidev_models(PIDEV_HTML_SAMPLE).expect("parses");
+
+        let gpt55 = models
+            .iter()
+            .find(|model| model.model_id == "openai/gpt-5.5")
+            .expect("openai/gpt-5.5 present");
+        assert_eq!(gpt55.provider, "openrouter");
+        assert_eq!(gpt55.pricing.input_cost_per_token, 5.0 / MILLION);
+        assert_eq!(gpt55.pricing.output_cost_per_token, 30.0 / MILLION);
+        assert_eq!(gpt55.pricing.cache_read_input_token_cost, 0.5 / MILLION);
+        assert_eq!(gpt55.pricing.cache_creation_input_token_cost, 0.0);
+
+        assert!(models.iter().any(|model| model.model_id == "claude-opus-4-6"));
+    }
+
+    #[test]
+    fn pidev_prefers_openrouter_then_official_provider_then_any() {
+        let models = parse_pidev_models(PIDEV_HTML_SAMPLE).expect("parses");
+
+        // gpt-5.5 -> openrouter provider has a non-zero priced entry.
+        let pricing = find_pidev_pricing(&models, "gpt-5.5").expect("found");
+        assert_eq!(pricing.input_cost_per_token, 5.0 / MILLION);
+        assert_eq!(pricing.output_cost_per_token, 30.0 / MILLION);
+
+        // claude-opus-4.6 -> only anthropic provider exposes it here.
+        let pricing = find_pidev_pricing(&models, "claude-opus-4.6").expect("found");
+        assert_eq!(pricing.input_cost_per_token, 5.0 / MILLION);
+        assert_eq!(pricing.output_cost_per_token, 25.0 / MILLION);
+
+        // grok-build-0.1 -> only xai provider exposes it.
+        let pricing = find_pidev_pricing(&models, "grok-build-0.1").expect("found");
+        assert_eq!(pricing.input_cost_per_token, 1.0 / MILLION);
+    }
+
+    #[test]
+    fn pidev_skips_zero_input_output_entries() {
+        let models = parse_pidev_models(PIDEV_HTML_SAMPLE).expect("parses");
+
+        // The bare `gpt-5.5` id row under openrouter is all-zero; the
+        // `openai/gpt-5.5` row should win instead.
+        let pricing = find_pidev_pricing(&models, "gpt-5.5").expect("found");
+        assert_eq!(pricing.input_cost_per_token, 5.0 / MILLION);
+    }
+
+    #[test]
+    fn pidev_matches_step_and_mimo_via_openrouter() {
+        let models = parse_pidev_models(PIDEV_HTML_SAMPLE).expect("parses");
+
+        let step = find_pidev_pricing(&models, "step-3.7-flash").expect("found");
+        assert_eq!(step.input_cost_per_token, 0.2 / MILLION);
+        assert_eq!(step.output_cost_per_token, 1.15 / MILLION);
+
+        let mimo = find_pidev_pricing(&models, "mimo-v2.5-pro").expect("found");
+        assert_eq!(mimo.input_cost_per_token, 0.435 / MILLION);
+        assert_eq!(mimo.output_cost_per_token, 0.87 / MILLION);
+    }
+
+    #[test]
+    fn builtin_composer_pricing_still_applies_without_pidev_entry() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        let cost = model_cost_usd("composer-2.5-fast", usage);
+        let expected = (1_250_000.0 * 3.0 + 1_000_000.0 * 15.0 + 500_000.0 * 0.08) / MILLION;
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ark_code_latest_maps_to_glm_52_for_pricing_and_provider() {
+        // Provider rule: ark-code routes to the zai official provider, and
+        // resolve_alias maps it to glm-5.2 so pi.dev lookup works end-to-end.
+        assert_eq!(official_pidev_provider("ark-code-latest"), Some("zai"));
+        assert!(candidates_for("CPA/ark-code-latest").contains(&"glm-5.2".to_string()));
+
+        let models = vec![
+            PiDevModel {
+                provider: "zai".to_string(),
+                model_id: "glm-5.2".to_string(),
+                model_name: "glm 5.2".to_string(),
+                pricing: ModelPricing {
+                    input_cost_per_token: 1.4 / MILLION,
+                    output_cost_per_token: 4.4 / MILLION,
+                    cache_read_input_token_cost: 0.26 / MILLION,
+                    ..ModelPricing::default()
+                },
+            },
+            PiDevModel {
+                provider: "openrouter".to_string(),
+                model_id: "z-ai/glm-5.2".to_string(),
+                model_name: "glm 5.2".to_string(),
+                pricing: ModelPricing {
+                    input_cost_per_token: 0.0,
+                    output_cost_per_token: 0.0,
+                    ..ModelPricing::default()
+                },
+            },
+        ];
+
+        // openrouter entry is all-zero and skipped, so the zai official entry wins.
+        let pricing = find_pidev_pricing(&models, "CPA/ark-code-latest").expect("found");
+        assert_eq!(pricing.input_cost_per_token, 1.4 / MILLION);
+        assert_eq!(pricing.output_cost_per_token, 4.4 / MILLION);
     }
 }

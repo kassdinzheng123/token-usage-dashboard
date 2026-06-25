@@ -1,0 +1,110 @@
+{
+  "status": "completed",
+  "findings": [
+    {
+      "severity": "critical",
+      "type": "vulnerable_dependency",
+      "package": "happy-dom",
+      "version": "16.8.1",
+      "issue": "VM Context Escape can lead to Remote Code Execution (RCE). Allows attacker-controlled code to escape the VM sandbox. GHSA-37j7-fg3j-429f.",
+      "remediation": "Upgrade vitest to pull in happy-dom >=20.0.0, or switch to jsdom. This is a dev-only dependency (testing), but RCE in test harness is still critical."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "hono",
+      "version": "4.9.7",
+      "issue": "Multiple vulnerabilities: (1) Improper Authorization bypass (GHSA-m732-5p4w-x69g, <4.10.2), (2) JWT algorithm confusion / token forgery (GHSA-3vhc-576x-3qv4, GHSA-f67f-6cw9-8mq4, <4.11.4), (3) Path traversal via double-slash (GHSA-wmmm-f939-6g9c, <4.12.12), (4) IPv4-mapped IPv6 IP restriction bypass CVE-2026-39409 (GHSA-xpcf-pg52-r92g, <4.12.12), (5) bodyLimit bypass for chunked requests CVE-2026-44456 (GHSA-9vqf-7f2p-gf9v, <4.12.16), (6) JSX tag name HTML injection CVE-2026-44455 (GHSA-69xw-7hcm-h432, <4.12.16), (7) JSX attribute name HTML injection (GHSA-458j-xx4x-4375, <4.12.14), (8) CSS declaration injection via style objects CVE-2026-44458 (GHSA-qp7p-654g-cw7p, <4.12.18), (9) Cache middleware cross-user data leakage CVE-2026-44457 (GHSA-p77w-8qqv-26rm, <4.12.18), (10) JWT NumericDate improper validation CVE-2026-44459 (GHSA-hm8q-7f3q-5f36, <4.12.18).",
+      "remediation": "Update catalog runtime hono from ^4.9.2 to >=4.12.18 to fix all issues."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "@hono/node-server",
+      "version": "1.19.7",
+      "issue": "Middleware bypass via repeated slashes in serveStatic. Allows access to protected static files by using // in path. CVE-2026-39406 (GHSA-92pp-h63x-v22m).",
+      "remediation": "Update catalog runtime @hono/node-server from ^1.19.7 to >=1.19.13."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "valibot",
+      "version": "1.1.0",
+      "issue": "ReDoS vulnerability in EMOJI_REGEX. Crafted emoji input can cause catastrophic backtracking, leading to denial of service. GHSA-vqpr-j7v3-hqw9.",
+      "remediation": "Update catalog runtime valibot from ^1.1.0 to >=1.2.0."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "@modelcontextprotocol/sdk",
+      "version": "1.24.3",
+      "issue": "ReDoS vulnerability in Anthropic's MCP TypeScript SDK. Crafted input can cause catastrophic backtracking and denial of service. GHSA-8r9q-7v3j-jr4g.",
+      "remediation": "Update catalog runtime @modelcontextprotocol/sdk from ^1.24.3 to >=1.25.2."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "wrangler",
+      "version": "4.37.1",
+      "issue": "OS Command Injection in `wrangler pages deploy`. Allows arbitrary command execution during deployment. GHSA-36p8-mvp6-cv38. Dev dependency in docs workspace.",
+      "remediation": "Update catalog docs wrangler from ^4.32.0 to >=4.59.1."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "fast-uri",
+      "version": "3.1.0",
+      "issue": "Two CVEs: (1) Path traversal via percent-encoded dot segments — normalizes %2E%2E as directory traversal (CVE-2026-6321, GHSA-q3j6-qgpj-74h6), (2) Host confusion via percent-encoded authority delimiters — %40 in hostname rewrites authority (CVE-2026-6322, GHSA-v39h-62p7-jpjc). Transitive dependency via @modelcontextprotocol/sdk > ajv.",
+      "remediation": "Upgrade to >=3.1.2. Indirect fix via upgrading @modelcontextprotocol/sdk or ajv."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "flatted",
+      "version": "3.3.3",
+      "issue": "Unbounded recursion DoS in parse() — crafted JSON with deeply nested circular references causes stack overflow crash. CVE-2026-32141 (GHSA-25h7-pfq9-p65f). Transitive via eslint > file-entry-cache > flat-cache.",
+      "remediation": "Indirect fix via upgrading eslint (catalog lint: ^9.33.0). Ensure flatted >=3.4.0 is resolved."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_dependency",
+      "package": "undici",
+      "version": "7.14.0",
+      "issue": "Malicious WebSocket 64-bit length overflows parser and crashes client process. CVE-2026-1528 (GHSA-f269-vfmq-vjvj). Transitive via wrangler > miniflare. Also undici 6.22.0 (via pkg-pr-new) is affected.",
+      "remediation": "Upgrade to >=7.24.0. Fix via upgrading wrangler or as transitive resolution."
+    },
+    {
+      "severity": "medium",
+      "type": "vulnerable_dependency",
+      "package": "postcss",
+      "version": "8.5.8",
+      "issue": "XSS via unescaped </style> in CSS stringify output. When user-submitted CSS is parsed and re-embedded in HTML <style> tags, </style> in values breaks out of the style context. CVE-2026-41305 (GHSA-qx2v-qp2m-jg93). Transitive via vitest > vite and eslint config > vue compiler.",
+      "remediation": "Indirect fix via upgrading vitest or eslint-config to resolve postcss >=8.5.10."
+    },
+    {
+      "severity": "medium",
+      "type": "vulnerable_dependency",
+      "package": "ip-address",
+      "version": "10.1.0",
+      "issue": "XSS in Address6 HTML-emitting methods (group, link, spanAll). Unescaped attacker-controlled content in IPv6 zone ID or error messages. CVE-2026-42338 (GHSA-v2v4-37r5-5v8g). Deeply transitive via byethrow-docs > sqlite3 > node-gyp > make-fetch-happen > socks-proxy-agent > socks. Low practical impact — HTML methods are rarely used.",
+      "remediation": "Indirect fix via upgrading sqlite3/node-gyp chain. Upgrade ip-address to >=10.1.1."
+    },
+    {
+      "severity": "low",
+      "type": "outdated",
+      "package": "better-sqlite3",
+      "version": "11.10.0",
+      "issue": "Pinned with ^11.9.1 in apps/opencode package.json directly (not via catalog). This is the only non-catalog dependency pin in the workspace. No known CVEs at 11.10.0, but inconsistency with catalog pattern is a maintenance risk.",
+      "remediation": "Move to catalog:runtime for consistency, or keep pinned if intentional."
+    },
+    {
+      "severity": "low",
+      "type": "outdated",
+      "package": "cli-table3",
+      "version": "0.6.5",
+      "issue": "Package has been unmaintained for years. Known to pull in markdown-table > string-width with prototype pollution risk in older versions. No active CVEs at 0.6.5, but the ecosystem risk remains. Used in packages/terminal.",
+      "remediation": "Consider migrating to cli-table3 successor or alternative (e.g., '@hono/cli-table' or similar). Monitor for future advisories."
+    }
+  ],
+  "summary": "Security audit of ccusage workspace (9 packages: 7 apps, 2 internal packages, 1 docs) completed via pnpm audit and lockfile analysis. Found 1 critical, 7 high, 2 medium, and 2 low findings across 1101 total dependencies. Key actionable items: (1) Upgrade hono from ^4.9.2 to >=4.12.18 in catalog to fix 10 CVEs in the MCP server app, (2) Upgrade valibot from ^1.1.0 to >=1.2.0 to fix ReDoS, (3) Upgrade @modelcontextprotocol/sdk from ^1.24.3 to >=1.25.2 to fix ReDoS and transitive fast-uri path traversal, (4) Upgrade @hono/node-server from ^1.19.7 to >=1.19.13 to fix middleware bypass, (5) Upgrade wrangler from ^4.32.0 to >=4.59.1 to fix OS command injection. The workspace uses pnpm catalog mode (good) with strict security settings (strictDepBuilds, blockExoticSubdeps, trustPolicy: no-downgrade — all good practices). Most vulnerabilities are in the apps/mcp package (Hono-based MCP server) which faces network exposure. The critical happy-dom RCE is dev-only (vitest). No vulnerabilities in production runtime for CLI tools (amp, ccusage, codex, opencode, pi) beyond the catalog-shared transitive deps."
+}

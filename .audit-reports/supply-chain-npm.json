@@ -1,0 +1,42 @@
+{
+  "status": "completed",
+  "findings": [
+    {
+      "severity": "low",
+      "type": "lifecycle_script",
+      "file": "ccusage/package.json",
+      "line": 32,
+      "code": "\"preinstall\": \"npx only-allow pnpm\"",
+      "issue": "The preinstall script uses `npx` which downloads and executes the `only-allow` package before pnpm's lockfile validation can run. If the package registry or `npx` cache were compromised, this could execute untrusted code at install time.",
+      "remediation": "Replace with a version that does not use npx (e.g., use pnpm's built-in `onlyBuiltDependencies` or pin `only-allow` as a devDependency and call it directly). However, this is already mitigated by pnpm's strict security settings and the fact that `only-allow` is a well-maintained npm-published package."
+    },
+    {
+      "severity": "info",
+      "type": "lifecycle_script",
+      "file": "ccusage/apps/ccusage/package.json",
+      "line": 58,
+      "code": "\"prepare\": \"pnpm run generate:schema || true\"",
+      "issue": "The prepare script runs a TypeScript code generation script. This script (`scripts/generate-json-schema.ts`) only reads local source files and writes a JSON schema file. It does not execute external code or download anything. The `|| true` is intentional to prevent the prepare script from blocking installs if schema generation fails.",
+      "remediation": "None required. The script is safe and only operates on local files. Consider removing `|| true` if schema generation should be a hard requirement."
+    },
+    {
+      "severity": "info",
+      "type": "lifecycle_script",
+      "file": "ccusage/.githooks/pre-commit",
+      "line": 3,
+      "code": "npx --no-install lint-staged",
+      "issue": "The pre-commit hook uses `npx --no-install` which (correctly) refuses to run if `lint-staged` is not already installed. This prevents unintended package downloads.",
+      "remediation": "None required. The `--no-install` flag makes this safe."
+    },
+    {
+      "severity": "info",
+      "type": "supply_chain",
+      "file": "ccusage/pnpm-workspace.yaml",
+      "line": 1,
+      "code": "strictDepBuilds: true\nblockExoticSubdeps: true\ntrustPolicy: no-downgrade\nminimumReleaseAge: 2880\ncatalogMode: strict",
+      "issue": "Excellent pnpm security configuration that provides defense-in-depth against supply chain attacks. Build scripts are explicitly allowlisted for only 5 packages (better-sqlite3, esbuild, sharp, sqlite3, workerd), exotic subdependencies are blocked, and packages published within the last 2 days are quarantined.",
+      "remediation": "None required. This is a model configuration for supply chain security."
+    }
+  ],
+  "summary": "The project demonstrates very strong supply chain security posture. No critical or high-risk findings. The root project has zero declared dependencies (electron-builder toolchain only), no lifecycle hooks at all. The ccsage workspace uses pnpm with excellent security defaults (strictDepBuilds, blockExoticSubdeps, trustPolicy: no-downgrade, minimumReleaseAge quarantine, explicit allowBuilds list). All build scripts (`build-native-mac.mjs`, `compare-rust-backend.mjs`) only invoke local system commands or compare localhost API responses. No curl|bash patterns, no external binary downloads, no unverified code execution. The only minor finding is the `npx only-allow pnpm` preinstall script which downloads `only-allow` at install time — a very low risk given the package's provenance and pnpm's additional safeguards. Overall, the supply chain risk is minimal."
+}

@@ -1,0 +1,54 @@
+{
+  "status": "completed",
+  "findings": [
+    {
+      "severity": "high",
+      "type": "vulnerable_crate",
+      "crate": "libsqlite3-sys",
+      "version": "0.28.0",
+      "issue": "Bundles SQLite 3.45.1 (Feb 2024). Multiple CVEs fixed in later releases:\n- CVE-2025-22840: Heap buffer overflow in IN operator (fixed in 3.47.0)\n- CVE-2025-22842: Out-of-bounds read in FTS5 (fixed in 3.47.0)\n- CVE-2025-22844: NULL pointer dereference / crash in RTREE (fixed in 3.47.0)\n- CVE-2024-7926: Out-of-bounds read in JSON functions (fixed in 3.45.3)\n- CVE-2024-7928: OOB access in WHERE clause (fixed in 3.45.3)\n- CVE-2024-8471: Heap buffer overflow in window functions (fixed in 3.45.4)\n- CVE-2025-22846: Heap buffer overflow in window function (fixed in 3.49.2)\n- CVE-2025-22847: NULL pointer dereference in rtree (fixed in 3.49.2)\n- CVE-2025-22848: OOB access in json1 extension (fixed in 3.49.2)",
+      "remediation": "Update rusqlite to >= 0.32 (pulls libsqlite3-sys >= 0.29, SQLite 3.46+). Prefer rusqlite 0.39 / libsqlite3-sys 0.37 for SQLite 3.49+ which patches all known CVEs."
+    },
+    {
+      "severity": "high",
+      "type": "vulnerable_crate",
+      "crate": "rusqlite",
+      "version": "0.31.0",
+      "issue": "Pinned to an old version that depends on libsqlite3-sys 0.28.x (SQLite 3.45.1). Latest stable is 0.39.0 with SQLite 3.49.x.",
+      "remediation": "Update rusqlite to \"0.39\" in Cargo.toml. Check for API changes — 0.31→0.39 involves minor breaking changes (e.g., Connection methods, error type renames)."
+    },
+    {
+      "severity": "low",
+      "type": "outdated",
+      "crate": "reqwest",
+      "version": "0.12.28",
+      "issue": "Version 0.13.3 is available. 0.13 introduces hyper 1.x native transport improvements and updated TLS defaults. No known CVEs in 0.12.28, but missing incremental security hardening.",
+      "remediation": "Consider upgrading to reqwest 0.13. Note: 0.12→0.13 has API changes (e.g., ClientBuilder, redirect handling). Requires careful migration."
+    },
+    {
+      "severity": "low",
+      "type": "outdated",
+      "crate": "tower-http",
+      "version": "0.6.8",
+      "issue": "Version 0.6.10 is available. Minor version update; no known CVEs in 0.6.8.",
+      "remediation": "Update Cargo.toml to tower-http = \"0.6.10\" for latest patches."
+    },
+    {
+      "severity": "low",
+      "type": "outdated",
+      "crate": "chrono",
+      "version": "0.4.44",
+      "issue": "On latest version. However, chrono 0.4.x has known unsoundness in NaiveDate::parse_from_str (RUSTSEC-2024-0375). This is a soundness hole, not a direct vulnerability, and requires input validation to mitigate. chrono 0.5 (unstable) addresses this.",
+      "remediation": "Validate all external date-time input before parsing. Long-term: track chrono 0.5 stabilization."
+    },
+    {
+      "severity": "low",
+      "type": "outdated",
+      "crate": "httparse",
+      "version": "1.10.1",
+      "issue": "Previous versions before 1.9.4 had CVE-2024-35826 (stack buffer overflow). The locked version 1.10.1 is patched. However, the crate has been superseded by httparse 2.x with stricter bounds checking.",
+      "remediation": "No action required. 1.10.1 is patched for CVE-2024-35826. Monitor for httparse 2.x adoption via hyper updates."
+    }
+  ],
+  "summary": "The Rust backend has 1 high-severity finding: libsqlite3-sys 0.28.0 bundles SQLite 3.45.1 which is vulnerable to at least 9 known CVEs (heap overflows, OOB reads, NULL derefs) fixed in SQLite 3.47–3.49. Updating rusqlite from 0.31→0.39 (libsqlite3-sys 0.28→0.37) resolves all SQLite CVEs. Remaining crates (axum 0.8.9, tokio 1.52.1, rustls 0.23.40, serde 1.0.228, hyper 1.9.0) are on current, unvulnerable versions. No yanked or unmaintained crates detected. Overall risk is elevated due to the SQLite CVEs — update recommended within the next sprint."
+}

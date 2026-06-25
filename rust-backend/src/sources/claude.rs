@@ -73,7 +73,7 @@ impl Aggregate {
         }
 
         self.by_model
-            .entry(entry.model.clone())
+            .entry(super::cluster_model_name(&entry.model))
             .or_default()
             .add_entry(entry);
     }
@@ -440,8 +440,10 @@ fn dedupe_key(value: &Value) -> Option<String> {
         .get("message")
         .and_then(|message| string_field(message, &["id"]))
         .or_else(|| string_field(value, &["messageId", "message_id"]))?;
-    let request_id = string_field(value, &["requestId", "request_id"])?;
-    Some(format!("{message_id}:{request_id}"))
+    if let Some(request_id) = string_field(value, &["requestId", "request_id"]) {
+        return Some(format!("{message_id}:{request_id}"));
+    }
+    Some(message_id)
 }
 
 fn extract_model(value: &Value) -> Option<String> {
@@ -802,6 +804,82 @@ not-json
         assert_eq!(blocks[0]["inputTokens"], 120);
         assert_eq!(blocks[0]["outputTokens"], 50);
         assert_eq!(blocks[1]["inputTokens"], 30);
+    }
+
+    #[test]
+    fn deduplicates_cross_file_by_message_id_when_request_id_is_missing() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let fixture = TestFixture::new();
+        let projects_dir = fixture.path.join("claude").join(PROJECTS_DIR).join("proj");
+        let subagents_dir = projects_dir.join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+
+        // Same API call logged in two agent files (simulates parallel sub-agents)
+        let event = |msg_id: &str| -> String {
+            format!(
+                r#"{{"timestamp":"2026-05-26T12:00:00Z","sessionId":"s1","message":{{"id":"{msg_id}","model":"deepseek-v4-flash","usage":{{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":50000}}}}}}"#
+            )
+        };
+
+        fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            format!("{}\n", event("m1")),
+        )
+        .unwrap();
+        fs::write(
+            subagents_dir.join("agent-b.jsonl"),
+            format!("{}\n", event("m1")),
+        )
+        .unwrap();
+        // Different API call in agent-a
+        fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            format!("{}\n{}\n", event("m1"), event("m2")),
+        )
+        .unwrap();
+        fs::write(
+            subagents_dir.join("agent-b.jsonl"),
+            format!("{}\n{}\n", event("m1"), event("m3")),
+        )
+        .unwrap();
+
+        let previous = std::env::var_os(CLAUDE_CONFIG_DIR);
+        std::env::set_var(CLAUDE_CONFIG_DIR, fixture.path.join("claude"));
+        let daily = load_source_view("daily", false).unwrap();
+        restore_env(previous);
+
+        assert_eq!(daily.len(), 1);
+        // m1 appears in both files but only counts once; m2 and m3 count once each
+        assert_eq!(daily[0]["totalTokens"], json!(3 * (1000 + 200 + 50000)));
+    }
+
+    #[test]
+    fn deduplicates_by_message_id_and_request_id_when_both_present() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let fixture = TestFixture::new();
+        let projects_dir = fixture.path.join("claude").join(PROJECTS_DIR).join("proj");
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        // Same message_id but different request_id → different API calls, both counted
+        fs::write(
+            projects_dir.join("session.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-05-26T12:00:00Z","sessionId":"s1","requestId":"r1","message":{"id":"m1","model":"deepseek-v4-flash","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-05-26T12:01:00Z","sessionId":"s1","requestId":"r2","message":{"id":"m1","model":"deepseek-v4-flash","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let previous = std::env::var_os(CLAUDE_CONFIG_DIR);
+        std::env::set_var(CLAUDE_CONFIG_DIR, fixture.path.join("claude"));
+        let daily = load_source_view("daily", false).unwrap();
+        restore_env(previous);
+
+        assert_eq!(daily.len(), 1);
+        // Both events counted because request_id differs
+        assert_eq!(daily[0]["totalTokens"], json!(2 * (100 + 10)));
     }
 
     fn restore_env(previous: Option<std::ffi::OsString>) {

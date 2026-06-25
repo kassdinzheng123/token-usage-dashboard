@@ -10,18 +10,20 @@ pub enum Source {
     Hermes,
     Openclaw,
     Pi,
-    Factory,
+    Grok,
+    Cursor,
 }
 
 impl Source {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
         Self::Hermes,
         Self::Openclaw,
         Self::Pi,
-        Self::Factory,
+        Self::Grok,
+        Self::Cursor,
     ];
 
     pub fn label(self) -> &'static str {
@@ -32,7 +34,8 @@ impl Source {
             Self::Hermes => "Hermes",
             Self::Openclaw => "OpenClaw",
             Self::Pi => "Pi Agent",
-            Self::Factory => "Factory Droid",
+            Self::Grok => "Grok CLI",
+            Self::Cursor => "Cursor",
         }
     }
 }
@@ -46,7 +49,8 @@ impl fmt::Display for Source {
             Self::Hermes => "hermes",
             Self::Openclaw => "openclaw",
             Self::Pi => "pi",
-            Self::Factory => "factory",
+            Self::Grok => "grok",
+            Self::Cursor => "cursor",
         })
     }
 }
@@ -61,8 +65,9 @@ impl FromStr for Source {
             "opencode" => Ok(Self::Opencode),
             "hermes" => Ok(Self::Hermes),
             "openclaw" => Ok(Self::Openclaw),
-            "pi" => Ok(Self::Pi),
-            "factory" => Ok(Self::Factory),
+            "pi" | "oh-my-pi" | "ohmypi" | "omp" => Ok(Self::Pi),
+            "grok" => Ok(Self::Grok),
+            "cursor" | "cursorpp" => Ok(Self::Cursor),
             _ => Err(ParseProtocolError::new("source", value)),
         }
     }
@@ -151,7 +156,7 @@ impl WarmTask {
     }
 }
 
-pub const ALL_TASKS: [WarmTask; 22] = [
+pub const ALL_TASKS: [WarmTask; 25] = [
     WarmTask {
         key: "claude:daily",
         source: Source::Claude,
@@ -248,18 +253,33 @@ pub const ALL_TASKS: [WarmTask; 22] = [
         view: View::Sessions,
     },
     WarmTask {
-        key: "factory:daily",
-        source: Source::Factory,
+        key: "grok:daily",
+        source: Source::Grok,
         view: View::Daily,
     },
     WarmTask {
-        key: "factory:monthly",
-        source: Source::Factory,
+        key: "grok:monthly",
+        source: Source::Grok,
         view: View::Monthly,
     },
     WarmTask {
-        key: "factory:sessions",
-        source: Source::Factory,
+        key: "grok:sessions",
+        source: Source::Grok,
+        view: View::Sessions,
+    },
+    WarmTask {
+        key: "cursor:daily",
+        source: Source::Cursor,
+        view: View::Daily,
+    },
+    WarmTask {
+        key: "cursor:monthly",
+        source: Source::Cursor,
+        view: View::Monthly,
+    },
+    WarmTask {
+        key: "cursor:sessions",
+        source: Source::Cursor,
         view: View::Sessions,
     },
 ];
@@ -345,4 +365,17 @@ pub struct TodayModelRow {
     pub cache_read_tokens: i64,
     pub total_tokens: i64,
     pub total_cost: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Source;
+    use std::str::FromStr;
+
+    #[test]
+    fn oh_my_pi_aliases_parse_as_pi() {
+        assert_eq!(Source::from_str("oh-my-pi").unwrap(), Source::Pi);
+        assert_eq!(Source::from_str("ohmypi").unwrap(), Source::Pi);
+        assert_eq!(Source::from_str("omp").unwrap(), Source::Pi);
+    }
 }

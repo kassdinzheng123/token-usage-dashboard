@@ -1,51 +1,322 @@
 {
   "version": 1,
-  "defaultWorkerId": "deepseek-v4-flash",
+  "routingMode": "adaptive_pareto",
+  "stateDir": ".omnirouter",
+  "scoreCalibration": {
+    "mode": "local_baseline",
+    "floor": 0.66,
+    "lowerFloor": 0.33,
+    "minSpread": 0.01,
+    "baselineWorkerId": "deepseek-openai:deepseek-v4-flash"
+  },
+  "exploration": {
+    "epsilon": 0.08,
+    "strategy": "ucb",
+    "thompsonRate": 0.03,
+    "shadowRate": 0.02,
+    "minCandidates": 2,
+    "ucbCoefficient": 0.08,
+    "ucbCostPenalty": 0.12,
+    "ucbMinBonus": 0.05,
+    "ucbMaxSamples": 32
+  },
+  "learning": {
+    "enabled": true,
+    "confidenceStrength": 1.5,
+    "minSamplesBeforeAdaptive": 12,
+    "sigmoidK": 12
+  },
+  "adaptivePareto": {
+    "lcbZ": 0.35,
+    "qualityMu": 0.13,
+    "qualityTau": 0.15,
+    "costWeight": 0.8,
+    "fallbackCostWeight": 1.1,
+    "qualificationSlack": 0.12,
+    "qualityTolerance": 0.15,
+    "fallbackQualityTolerance": 0.15,
+    "requiredScores": {
+      "low": 0,
+      "medium": 0.45,
+      "high": 0.6
+    },
+    "latencyWeight": 0.000001,
+    "defaultInputTokens": 2000,
+    "defaultOutputTokens": 1000
+  },
+  "budget": {
+    "targetSpendRatio": 1,
+    "actualSpendRatio": 1,
+    "pacingRate": 0.25,
+    "minCostWeight": 1,
+    "maxCostWeight": 4,
+    "overrunAction": "prefer_cheaper_frontier"
+  },
+  "scoring": {
+    "wElo": 0.55,
+    "wBeta": 0.35,
+    "wCost": 0.1,
+    "wStrength": 0.2,
+    "eloScale": 400,
+    "betaQuantileZ": -0.5,
+    "wCapability": 0.2
+  },
+  "elo": {
+    "kBase": 24,
+    "kMin": 6,
+    "kMax": 40
+  },
+  "beta": {
+    "alpha0": 1,
+    "beta0": 1
+  },
+  "routes": [],
+  "defaultWorkerId": "qwen-local:Qwen3.6-27B",
   "workers": [
+    {
+      "id": "aa:qwen3-6-27b",
+      "provider": "alibaba",
+      "model": "qwen3-6-27b",
+      "subagentAgent": "worker",
+      "enabled": false,
+      "domains": [
+        "implementation",
+        "debugging",
+        "reasoning",
+        "planning",
+        "review",
+        "summarization",
+        "explore",
+        "qa"
+      ],
+      "costTier": "standard",
+      "inputPrice": 0.6,
+      "outputPrice": 3.6,
+      "ttftMs": 1566,
+      "outputTokensPerSecond": 64.332,
+      "priorSource": "AA-full",
+      "priorStrength": 50,
+      "scoreDimensions": {
+        "coding": 0.811,
+        "knowledge": 0.872,
+        "instruction": 0.883,
+        "reasoning": 0.896,
+        "planning": 0.896,
+        "review": 0.892,
+        "debugging": 0.858,
+        "tool_use": 0.885,
+        "summarization": 0.902,
+        "search": 0.877
+      },
+      "scoreUncertainty": {
+        "coding": 0.05,
+        "math": 0.18,
+        "knowledge": 0.05,
+        "instruction": 0.05,
+        "reasoning": 0.05,
+        "search": 0.05,
+        "tool_use": 0.05,
+        "summarization": 0.05,
+        "review": 0.05,
+        "planning": 0.05,
+        "debugging": 0.05
+      },
+      "maxDifficulty": "high",
+      "maxRisk": "medium",
+      "elo": 1500
+    },
+    {
+      "id": "aa:deepseek-v4-flash",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "subagentAgent": "worker",
+      "enabled": false,
+      "domains": [
+        "implementation",
+        "debugging",
+        "reasoning",
+        "planning",
+        "review",
+        "summarization",
+        "explore",
+        "qa"
+      ],
+      "costTier": "cheap",
+      "inputPrice": 0.14,
+      "outputPrice": 0.28,
+      "ttftMs": 820,
+      "outputTokensPerSecond": 70.843,
+      "priorSource": "AA-full",
+      "priorStrength": 50,
+      "scoreDimensions": {
+        "coding": 0.894,
+        "knowledge": 0.962,
+        "instruction": 0.906,
+        "reasoning": 0.945,
+        "planning": 0.945,
+        "review": 0.932,
+        "debugging": 0.894,
+        "tool_use": 0.904,
+        "summarization": 0.917,
+        "search": 0.934
+      },
+      "scoreUncertainty": {
+        "coding": 0.05,
+        "math": 0.18,
+        "knowledge": 0.05,
+        "instruction": 0.05,
+        "reasoning": 0.05,
+        "search": 0.05,
+        "tool_use": 0.05,
+        "summarization": 0.05,
+        "review": 0.05,
+        "planning": 0.05,
+        "debugging": 0.05
+      },
+      "maxDifficulty": "high",
+      "maxRisk": "medium",
+      "elo": 1500
+    },
+    {
+      "id": "aa:deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "subagentAgent": "worker",
+      "enabled": false,
+      "domains": [
+        "implementation",
+        "debugging",
+        "reasoning",
+        "planning",
+        "review",
+        "summarization",
+        "explore",
+        "qa"
+      ],
+      "costTier": "premium",
+      "inputPrice": 1.74,
+      "outputPrice": 3.48,
+      "ttftMs": 1162,
+      "outputTokensPerSecond": 30.595,
+      "priorSource": "AA-full",
+      "priorStrength": 50,
+      "scoreDimensions": {
+        "coding": 0.961,
+        "knowledge": 0.969,
+        "instruction": 0.932,
+        "reasoning": 0.97,
+        "planning": 0.97,
+        "review": 0.957,
+        "debugging": 0.963,
+        "tool_use": 0.954,
+        "summarization": 0.951,
+        "search": 0.95
+      },
+      "scoreUncertainty": {
+        "coding": 0.05,
+        "math": 0.18,
+        "knowledge": 0.05,
+        "instruction": 0.05,
+        "reasoning": 0.05,
+        "search": 0.05,
+        "tool_use": 0.05,
+        "summarization": 0.05,
+        "review": 0.05,
+        "planning": 0.05,
+        "debugging": 0.05
+      },
+      "maxDifficulty": "high",
+      "maxRisk": "medium",
+      "elo": 1500
+    },
     {
       "id": "qwen-local:Qwen3.6-27B",
       "provider": "qwen-local",
       "model": "Qwen3.6-27B",
-      "domains": ["simple_fix", "crud", "summarization", "search"],
+      "subagentAgent": "qwen-local:Qwen3.6-27B",
+      "domains": [
+        "explore",
+        "summarization",
+        "search",
+        "qa",
+        "implementation"
+      ],
+      "scoreDimensions": {
+        "coding": 0.811,
+        "knowledge": 0.872,
+        "instruction": 0.883,
+        "reasoning": 0.896,
+        "planning": 0.896,
+        "review": 0.892,
+        "debugging": 0.858,
+        "tool_use": 0.885,
+        "summarization": 0.902,
+        "search": 0.877
+      },
+      "costTier": "free",
       "maxDifficulty": "medium",
       "maxRisk": "low",
-      "elo": 1400,
-      "advisor": {
-        "enabled": true,
-        "provider": "deepseek-openai",
-        "model": "deepseek-v4-pro",
-        "triggers": ["low_confidence", "repeated_failure", "high_risk"],
-        "maxCallsPerTask": 1,
-        "maxTokens": 3000,
-        "mode": "advise_only"
-      }
+      "enabled": true
     },
     {
-      "id": "deepseek-v4-flash",
+      "id": "deepseek-openai:deepseek-v4-flash",
       "provider": "deepseek-openai",
       "model": "deepseek-v4-flash",
-      "domains": ["implementation", "debugging", "documentation", "review"],
-      "maxDifficulty": "hard",
+      "subagentAgent": "deepseek-openai:deepseek-v4-flash",
+      "domains": [
+        "implementation",
+        "debugging",
+        "reasoning",
+        "planning",
+        "review",
+        "summarization",
+        "explore",
+        "qa"
+      ],
+      "scoreDimensions": {
+        "coding": 0.894,
+        "knowledge": 0.962,
+        "instruction": 0.906,
+        "reasoning": 0.945,
+        "planning": 0.945,
+        "review": 0.932,
+        "debugging": 0.894,
+        "tool_use": 0.904,
+        "summarization": 0.917,
+        "search": 0.877
+      },
+      "costTier": "cheap",
+      "maxDifficulty": "high",
       "maxRisk": "medium",
-      "elo": 1500,
-      "advisor": {
-        "enabled": true,
-        "provider": "deepseek-openai",
-        "model": "deepseek-v4-pro",
-        "triggers": ["low_confidence", "repeated_failure", "high_risk", "conflicting_requirements"],
-        "maxCallsPerTask": 2,
-        "maxTokens": 4000,
-        "mode": "advise_only"
-      }
+      "enabled": true
     },
     {
-      "id": "deepseek-v4-pro",
+      "id": "deepseek-openai:deepseek-v4-pro",
       "provider": "deepseek-openai",
       "model": "deepseek-v4-pro",
-      "domains": ["planning", "architecture", "debugging", "review"],
-      "maxDifficulty": "hard",
-      "maxRisk": "high",
-      "elo": 1600
+      "subagentAgent": "deepseek-openai:deepseek-v4-pro",
+      "domains": [
+        "debugging",
+        "reasoning",
+        "planning",
+        "review"
+      ],
+      "scoreDimensions": {
+        "coding": 0.961,
+        "knowledge": 0.969,
+        "instruction": 0.932,
+        "reasoning": 0.97,
+        "planning": 0.97,
+        "review": 0.957,
+        "debugging": 0.963,
+        "tool_use": 0.954,
+        "summarization": 0.951,
+        "search": 0.95
+      },
+      "costTier": "premium",
+      "maxDifficulty": "high",
+      "maxRisk": "medium",
+      "enabled": true
     }
   ]
 }

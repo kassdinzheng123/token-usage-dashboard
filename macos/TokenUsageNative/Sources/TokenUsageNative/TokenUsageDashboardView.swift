@@ -33,7 +33,8 @@ private let tokenTrendSourceColors: [String: Color] = [
     TokenUsageSource.hermes.label:   colorViolet.primary,
     TokenUsageSource.openclaw.label: colorAmber.primary,
     TokenUsageSource.pi.label:       colorCoral.primary,
-    TokenUsageSource.factory.label:  colorOcean.primary,
+    TokenUsageSource.grok.label:     colorSlate.primary,
+    TokenUsageSource.cursor.label: colorSlate.primary,
 ]
 
 // Model trend chart palette (single-source view): primary shades from each family
@@ -67,7 +68,8 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case hermes
     case openclaw
     case pi
-    case factory
+    case grok
+    case cursor
 
     public var id: String { rawValue }
 
@@ -80,7 +82,8 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
         case .hermes: "Hermes"
         case .openclaw: "OpenClaw"
         case .pi: "Pi Agent"
-        case .factory: "Factory Droid"
+        case .grok: "Grok CLI"
+        case .cursor: "Cursor"
         }
     }
 }
@@ -210,10 +213,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @ObservedObject private var store: Store
     @ObservedObject private var currencyController: TokenUsageBillingCurrencyController
     @StateObject private var backendLogs = BackendLogStore.shared
-    @State private var hoveredTokenTrendRow: TokenTrendRow?
-    @State private var hoveredTokenTrendPoint: CGPoint?
-    @State private var hoveredCompositionRow: TokenCompositionRow?
-    @State private var hoveredCompositionPoint: CGPoint?
     @State private var modelSearchText = ""
     @State private var isModelFilterExpanded = false
     @State private var tokenTrendLegendPage = 0
@@ -221,6 +220,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var todayModelPage = 0
     @State private var isViewModeTransitioning = false
     @State private var viewModeTransitionGeneration = 0
+    @State private var viewModeTransitionTask: Task<Void, Never>?
+    @State private var dateRangeRefreshSuppressionGeneration = 0
     @State private var isLogViewerPresented = false
     @State private var selectedSection: TokenUsageDashboardSection = .today
     @State private var dashboardData: TokenUsageDashboardData
@@ -277,16 +278,26 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             Task { await store.refresh() }
         }
         .onChange(of: store.selectedViewMode) {
+            dateRangeRefreshSuppressionGeneration += 1
+            let suppressionGeneration = dateRangeRefreshSuppressionGeneration
             store.updateDateRangeForViewMode()
             updateDashboardData()
             refreshForViewModeChange()
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                if dateRangeRefreshSuppressionGeneration == suppressionGeneration {
+                    dateRangeRefreshSuppressionGeneration = 0
+                }
+            }
         }
         .onChange(of: store.startDate) {
             updateDashboardData()
+            guard dateRangeRefreshSuppressionGeneration == 0 else { return }
             Task { await store.refresh() }
         }
         .onChange(of: store.endDate) {
             updateDashboardData()
+            guard dateRangeRefreshSuppressionGeneration == 0 else { return }
             Task { await store.refresh() }
         }
         .onChange(of: store.selectedModels) {
@@ -296,14 +307,18 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .onChange(of: tokenTrendColorDomain) {
             tokenTrendLegendPage = 0
         }
-        .onChange(of: modelCostSlices.map(\.id)) {
-            modelCostLegendPage = 0
-        }
-        .onChange(of: todaySummary.modelRows.map(\.dashboardID)) {
+        .onChange(of: todaySummary.modelRows.count) {
             todayModelPage = 0
         }
         .onChange(of: currencyController.selectedCurrency) {
             Task { await currencyController.refreshExchangeRateIfNeeded() }
+        }
+        .onDisappear {
+            viewModeTransitionTask?.cancel()
+            viewModeTransitionTask = nil
+            isViewModeTransitioning = false
+            isLogViewerPresented = false
+            backendLogs.stopTailing()
         }
     }
 
@@ -321,18 +336,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     private func updateDashboardData() {
         dashboardData = Self.makeDashboardData(from: store)
         clearChartInteractionState()
+        modelCostLegendPage = 0
     }
 
     private func clearChartInteractionState() {
-        hoveredTokenTrendRow = nil
-        hoveredTokenTrendPoint = nil
-        hoveredCompositionRow = nil
-        hoveredCompositionPoint = nil
     }
 
     private var dashboardContent: some View {
         ScrollView(.vertical, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 20) {
+            LazyVStack(alignment: .leading, spacing: 20) {
                 header
                 sectionSwitcher
 
@@ -452,8 +464,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         let generation = viewModeTransitionGeneration
 
         clearChartInteractionState()
+        viewModeTransitionTask?.cancel()
 
-        Task { @MainActor in
+        viewModeTransitionTask = Task { @MainActor in
             withAnimation(.easeInOut(duration: 0.16)) {
                 isViewModeTransitioning = true
             }
@@ -462,11 +475,12 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             await store.refresh()
             await delay
 
-            guard generation == viewModeTransitionGeneration else { return }
+            guard !Task.isCancelled, generation == viewModeTransitionGeneration else { return }
 
             withAnimation(.easeInOut(duration: 0.16)) {
                 isViewModeTransitioning = false
             }
+            viewModeTransitionTask = nil
         }
     }
 
@@ -1002,7 +1016,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     TodaySourceRowView(
                         row: row,
                         maxTokens: summary.maxSourceTokens,
-                        currencyController: currencyController
+                        costText: currencyController.string(fromUSD: row.totalCostDecimal)
                     )
                     .frame(height: todaySourceRowHeight)
                 }
@@ -1060,7 +1074,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 .foregroundStyle(.secondary)
 
                 ForEach(visibleTodayModelRows(for: summary), id: \.dashboardID) { row in
-                    TodayModelRowView(row: row, currencyController: currencyController)
+                    TodayModelRowView(row: row, costText: currencyController.string(fromUSD: row.totalCostDecimal))
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 260, alignment: .topLeading)
@@ -1113,74 +1127,21 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var tokenTrendChart: some View {
         VStack(alignment: .leading, spacing: 10) {
-            let rows = tokenTrendRows
-            let barWidth = histogramBarWidth(for: rows.map(\.date))
-
-            Chart {
-                ForEach(rows) { row in
-                    BarMark(
-                        x: .value(dateColumnTitle, row.date, unit: store.selectedViewMode == .monthly ? .month : .day),
-                        y: .value("Tokens", row.tokens),
-                        width: barWidth
-                    )
-                    .foregroundStyle(by: .value(tokenTrendSeriesLabel, row.series))
-                }
-            }
-            .chartForegroundStyleScale(domain: tokenTrendColorDomain, range: tokenTrendColorRange)
-            .chartLegend(.hidden)
-            .chartXAxis {
-                xAxisMarks
-            }
-            .chartXScale(domain: chartXScaleDomain)
-            .chartOverlay { proxy in
-                GeometryReader { geometry in
-                    ZStack(alignment: .topLeading) {
-                        Rectangle()
-                            .fill(.clear)
-                            .contentShape(Rectangle())
-                            .onContinuousHover { phase in
-                                switch phase {
-                                case .active(let point):
-                                    hoveredTokenTrendRow = tokenTrendRow(at: point, proxy: proxy, geometry: geometry)
-                                    hoveredTokenTrendPoint = hoveredTokenTrendRow == nil ? nil : point
-                                case .ended:
-                                    hoveredTokenTrendRow = nil
-                                    hoveredTokenTrendPoint = nil
-                                }
-                            }
-
-                        if let row = hoveredTokenTrendRow, let point = hoveredTokenTrendPoint {
-                            ChartTooltipPanel(
-                                title: row.series,
-                                rows: [
-                                    (dateColumnTitle, tooltipDateText(for: row.date)),
-                                    ("Tokens", row.tokens.tokenText),
-                                ]
-                            )
-                            .position(tooltipPosition(for: point, in: geometry.size))
-                            .zIndex(1)
-                        }
-                    }
-                    .allowsHitTesting(true)
-                    .animation(nil, value: hoveredTokenTrendRow?.id)
-                }
-            }
-            .transaction { transaction in
-                transaction.animation = nil
-            }
-            .chartYAxis {
-                AxisMarks { value in
-                    AxisGridLine()
-                    AxisTick()
-                    AxisValueLabel {
-                        if let tokens = value.as(Double.self) {
-                            Text(tokens.tokenAxisText)
-                        }
-                    }
-                }
-            }
-            .chartYAxisLabel("Tokens")
-            .frame(height: 220)
+            TokenTrendChartView(
+                rows: tokenTrendRows,
+                colorDomain: tokenTrendColorDomain,
+                colorRange: tokenTrendColorRange,
+                seriesLabel: tokenTrendSeriesLabel,
+                viewMode: store.selectedViewMode,
+                dateColumnTitle: dateColumnTitle,
+                monthlyXAxisValues: monthlyXAxisValues,
+                dailyXAxisValues: dailyXAxisValues,
+                chartXScaleDomain: chartXScaleDomain,
+                tooltipDateText: tooltipDateText(for:),
+                monthAxisLabel: monthAxisLabel(for:),
+                monthSeparatorLabel: monthSeparatorLabel(for:),
+                isFirstDayOfMonth: isFirstDayOfMonth(_:)
+            )
 
             TokenTrendLegend(
                 entries: visibleTokenTrendLegendEntries,
@@ -1198,102 +1159,21 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var compositionChart: some View {
-        let barWidth = histogramBarWidth(for: compositionRows.map(\.date))
-        let inputRows = compositionRows.filter { $0.kind == .input }
-        let cacheReadRows = compositionRows.filter { $0.kind == .cacheRead }
-        let outputRows = compositionRows.filter { $0.kind == .output }
-
-        return Chart {
-            ForEach(outputRows) { row in
-                BarMark(
-                    x: .value("Date", row.date, unit: store.selectedViewMode == .monthly ? .month : .day),
-                    y: .value("Tokens", row.tokens),
-                    width: barWidth
-                )
-                .foregroundStyle(colorRose.primary)
-            }
-            ForEach(inputRows) { row in
-                BarMark(
-                    x: .value("Date", row.date, unit: store.selectedViewMode == .monthly ? .month : .day),
-                    y: .value("Tokens", row.tokens),
-                    width: barWidth
-                )
-                .foregroundStyle(colorOcean.primary)
-            }
-            ForEach(cacheReadRows) { row in
-                BarMark(
-                    x: .value("Date", row.date, unit: store.selectedViewMode == .monthly ? .month : .day),
-                    y: .value("Tokens", row.tokens),
-                    width: barWidth
-                )
-                .foregroundStyle(colorOcean.light)
-            }
-        }
-        .chartLegend(position: .bottom, alignment: .center)
-        .chartXAxis {
-            xAxisMarks
-        }
-        .chartXScale(domain: chartXScaleDomain)
-        .chartOverlay { proxy in
-            GeometryReader { geometry in
-                ZStack(alignment: .topLeading) {
-                    Rectangle()
-                        .fill(.clear)
-                        .contentShape(Rectangle())
-                        .onContinuousHover { phase in
-                            switch phase {
-                            case .active(let point):
-                                hoveredCompositionRow = compositionRow(at: point, proxy: proxy, geometry: geometry)
-                                hoveredCompositionPoint = hoveredCompositionRow == nil ? nil : point
-                            case .ended:
-                                hoveredCompositionRow = nil
-                                hoveredCompositionPoint = nil
-                            }
-                        }
-
-                    if let hoveredRow = hoveredCompositionRow, let point = hoveredCompositionPoint {
-                        let dateKey = periodKey(for: hoveredRow.date)
-                        let inputTokens = compositionRows.first { $0.kind == .input && periodKey(for: $0.date) == dateKey }?.tokens ?? 0
-                        let cacheReadTokens = compositionRows.first { $0.kind == .cacheRead && periodKey(for: $0.date) == dateKey }?.tokens ?? 0
-                        let outputTokens = compositionRows.first { $0.kind == .output && periodKey(for: $0.date) == dateKey }?.tokens ?? 0
-                        let totalInput = cacheReadTokens + inputTokens
-                        let rawCoverage = totalInput > 0 ? Double(cacheReadTokens) / Double(totalInput) * 100 : 0
-                        let cacheCoverage = min(floor(rawCoverage * 10) / 10, 99.9)
-
-                        ChartTooltipPanel(
-                            title: "Token Composition",
-                            rows: [
-                                (dateColumnTitle, tooltipDateText(for: hoveredRow.date)),
-                                ("Input", inputTokens.tokenText),
-                                ("Cache Read", cacheReadTokens.tokenText),
-                                ("Output", outputTokens.tokenText),
-                                ("Cache Coverage", String(format: "%.1f%%", cacheCoverage)),
-                            ]
-                        )
-                        .position(tooltipPosition(for: point, in: geometry.size))
-                        .zIndex(1)
-                    }
-                }
-                .allowsHitTesting(true)
-                .animation(nil, value: hoveredCompositionRow?.id)
-            }
-        }
-        .transaction { transaction in
-            transaction.animation = nil
-        }
-        .chartYAxis {
-            AxisMarks { value in
-                AxisGridLine()
-                AxisTick()
-                AxisValueLabel {
-                    if let tokens = value.as(Double.self) {
-                        Text(tokens.tokenAxisText)
-                    }
-                }
-            }
-        }
-        .chartYAxisLabel("Tokens")
-        .frame(height: 280)
+        CompositionChartView(
+            inputRows: dashboardData.compositionInputRows,
+            cacheReadRows: dashboardData.compositionCacheReadRows,
+            outputRows: dashboardData.compositionOutputRows,
+            byDateKey: dashboardData.compositionByDateKey,
+            viewMode: store.selectedViewMode,
+            dateColumnTitle: dateColumnTitle,
+            monthlyXAxisValues: monthlyXAxisValues,
+            dailyXAxisValues: dailyXAxisValues,
+            chartXScaleDomain: chartXScaleDomain,
+            tooltipDateText: tooltipDateText(for:),
+            monthAxisLabel: monthAxisLabel(for:),
+            monthSeparatorLabel: monthSeparatorLabel(for:),
+            isFirstDayOfMonth: isFirstDayOfMonth(_:)
+        )
     }
 
     private var modelCostChart: some View {
@@ -1320,40 +1200,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     modelCostLegendPage = min(clampedModelCostLegendPage + 1, modelCostLegendPageCount - 1)
                 }
             )
-        }
-    }
-
-    @AxisContentBuilder
-    private var xAxisMarks: some AxisContent {
-        if store.selectedViewMode == .monthly {
-            AxisMarks(values: monthlyXAxisValues) { value in
-                AxisGridLine()
-                AxisTick()
-                AxisValueLabel {
-                    if let date = value.as(Date.self) {
-                        Text(monthAxisLabel(for: date))
-                    }
-                }
-            }
-        } else {
-            AxisMarks(values: dailyXAxisValues) { value in
-                if let date = value.as(Date.self), isFirstDayOfMonth(date) {
-                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.8))
-                    AxisTick(stroke: StrokeStyle(lineWidth: 0.8))
-                    AxisValueLabel {
-                        Text(monthSeparatorLabel(for: date))
-                            .font(.caption.weight(.semibold))
-                    }
-                } else {
-                    AxisGridLine()
-                    AxisTick()
-                    AxisValueLabel {
-                        if let date = value.as(Date.self) {
-                            Text(dayOfMonthLabel(for: date))
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1433,7 +1279,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             }
             .width(min: 80, ideal: 90)
         }
-        .frame(minHeight: 220)
+        .frame(minHeight: 360, maxHeight: 560)
     }
 
     private var usageTableWithSessionIDModelsAtEnd: some View {
@@ -1494,7 +1340,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             }
             .width(min: 180, ideal: 260)
         }
-        .frame(minHeight: 220)
+        .frame(minHeight: 360, maxHeight: 560)
     }
 
     @ViewBuilder
@@ -1555,7 +1401,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             }
             .width(min: 80, ideal: 90)
         }
-        .frame(minHeight: 220)
+        .frame(minHeight: 360, maxHeight: 560)
     }
 
     private var usageTableWithoutSessionIDModelsAtEnd: some View {
@@ -1607,7 +1453,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             }
             .width(min: 180, ideal: 260)
         }
-        .frame(minHeight: 220)
+        .frame(minHeight: 360, maxHeight: 560)
     }
 
     private var modelCostSlices: [ModelCostSlice] {
@@ -1754,10 +1600,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         return date.formatted(.dateTime.month(.abbreviated))
     }
 
-    private func dayOfMonthLabel(for date: Date) -> String {
-        date.formatted(.dateTime.day())
-    }
-
     private var chartXScaleDomain: ClosedRange<Date> {
         switch store.selectedViewMode {
         case .monthly:
@@ -1784,28 +1626,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    private func periodKey(for record: TokenUsageRecord) -> String {
-        switch store.selectedViewMode {
-        case .daily, .sessions:
-            record.date.formatted(.iso8601.year().month().day())
-        case .monthly:
-            record.date.formatted(.iso8601.year().month())
-        }
-    }
-
-    private func histogramBarWidth(for _: [Date]) -> MarkDimension {
-        store.selectedViewMode == .monthly ? .fixed(maximumBarWidth) : .automatic
-    }
-
-    private func periodKey(for date: Date) -> String {
-        switch store.selectedViewMode {
-        case .daily, .sessions:
-            date.formatted(.iso8601.year().month().day())
-        case .monthly:
-            date.formatted(.iso8601.year().month())
-        }
-    }
-
     private func tooltipDateText(for date: Date) -> String {
         switch store.selectedViewMode {
         case .daily, .sessions:
@@ -1813,162 +1633,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         case .monthly:
             date.formatted(.dateTime.year().month())
         }
-    }
-
-    private func tooltipPosition(for point: CGPoint, in size: CGSize) -> CGPoint {
-        let tooltipWidth = chartTooltipWidth
-        let tooltipHeight = chartTooltipHeight
-        let horizontalPadding = 10.0
-        let verticalPadding = 10.0
-
-        let x = min(
-            max(point.x + 18 + tooltipWidth / 2, tooltipWidth / 2 + horizontalPadding),
-            max(tooltipWidth / 2 + horizontalPadding, size.width - tooltipWidth / 2 - horizontalPadding)
-        )
-        let preferredY = point.y - 18 - tooltipHeight / 2
-        let fallbackY = point.y + 18 + tooltipHeight / 2
-        let unclampedY = preferredY >= tooltipHeight / 2 + verticalPadding ? preferredY : fallbackY
-        let y = min(
-            max(unclampedY, tooltipHeight / 2 + verticalPadding),
-            max(tooltipHeight / 2 + verticalPadding, size.height - tooltipHeight / 2 - verticalPadding)
-        )
-
-        return CGPoint(x: x, y: y)
-    }
-
-    private func tokenTrendRow(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> TokenTrendRow? {
-        guard let hit = stackedBarHit(at: point, proxy: proxy, geometry: geometry, dates: tokenTrendRows.map(\.date)) else {
-            return nil
-        }
-
-        return hitStackedRow(
-            date: hit.date,
-            tokens: hit.tokens,
-            rows: tokenTrendRows,
-            rowDate: \.date,
-            rowTokens: \.tokens,
-            rowOrder: { tokenTrendColorDomain.firstIndex(of: $0.series) ?? Int.max }
-        )
-    }
-
-    private func compositionRow(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> TokenCompositionRow? {
-        guard let hit = stackedBarHit(at: point, proxy: proxy, geometry: geometry, dates: compositionRows.map(\.date)) else {
-            return nil
-        }
-
-        return hitStackedRow(
-            date: hit.date,
-            tokens: hit.tokens,
-            rows: compositionRows,
-            rowDate: \.date,
-            rowTokens: \.tokens,
-            rowOrder: { $0.kind.sortOrder }
-        )
-    }
-
-    private func stackedBarHit(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy, dates: [Date]) -> (date: Date, tokens: Double)? {
-        guard let plotFrame = proxy.plotFrame else {
-            return nil
-        }
-
-        let plotRect = geometry[plotFrame]
-        guard plotRect.contains(point) else {
-            return nil
-        }
-
-        let plotPoint = CGPoint(
-            x: min(max(point.x - plotRect.minX, 0), plotRect.width),
-            y: min(max(point.y - plotRect.minY, 0), plotRect.height)
-        )
-        guard
-            let date = proxy.value(atX: plotPoint.x, as: Date.self),
-            let tokens = proxy.value(atY: plotPoint.y, as: Double.self),
-            tokens >= 0
-        else {
-            return nil
-        }
-
-        let hitDate = periodStart(for: date)
-        guard let barDate = representativeDate(for: hitDate, in: dates) else {
-            return nil
-        }
-        let uniqueCount = Set(dates.map { periodKey(for: $0) }).count
-        let barCenterX: CGFloat
-        let barHalfWidth: CGFloat
-        if store.selectedViewMode == .monthly,
-           let monthEnd = Calendar.current.date(byAdding: .month, value: 1, to: hitDate),
-           let monthStartX = proxy.position(forX: hitDate),
-           let monthEndX = proxy.position(forX: monthEnd) {
-            barCenterX = (monthStartX + monthEndX) / 2
-            barHalfWidth = maximumBarWidth / 2 + 4
-        } else if let barX = proxy.position(forX: barDate) {
-            barCenterX = barX
-            if uniqueCount <= 1 {
-                barHalfWidth = 52
-            } else {
-                barHalfWidth = min(max(plotRect.width / CGFloat(uniqueCount * 2), 8), 80) + 4
-            }
-        } else {
-            return nil
-        }
-        guard abs(plotPoint.x - barCenterX) <= barHalfWidth else {
-            return nil
-        }
-
-        return (hitDate, tokens)
-    }
-
-    private func hitStackedRow<Row>(
-        date: Date,
-        tokens: Double,
-        rows: [Row],
-        rowDate: KeyPath<Row, Date>,
-        rowTokens: KeyPath<Row, Int>,
-        rowOrder: (Row) -> Int
-    ) -> Row? {
-        let period = periodKey(for: date)
-        let periodRows = rows
-            .filter { periodKey(for: $0[keyPath: rowDate]) == period && $0[keyPath: rowTokens] > 0 }
-            .sorted {
-                let leftOrder = rowOrder($0)
-                let rightOrder = rowOrder($1)
-                if leftOrder == rightOrder {
-                    return $0[keyPath: rowDate] < $1[keyPath: rowDate]
-                }
-                return leftOrder < rightOrder
-            }
-        let total = periodRows.reduce(0) { $0 + $1[keyPath: rowTokens] }
-        let tolerance = max(Double(total) * 0.015, 1.0)
-        guard tokens >= -tolerance, tokens <= Double(total) + tolerance else {
-            return nil
-        }
-
-        var lowerBound = 0.0
-        for row in periodRows {
-            let upperBound = lowerBound + Double(row[keyPath: rowTokens])
-            if tokens >= lowerBound - tolerance, tokens <= upperBound + tolerance {
-                return row
-            }
-            lowerBound = upperBound
-        }
-
-        return nil
-    }
-
-    private func periodStart(for date: Date) -> Date {
-        switch store.selectedViewMode {
-        case .daily, .sessions:
-            Calendar.current.startOfDay(for: date)
-        case .monthly:
-            Calendar.current.dateInterval(of: .month, for: date)?.start ?? date
-        }
-    }
-
-    private func representativeDate(for date: Date, in dates: [Date]) -> Date? {
-        let period = periodKey(for: date)
-        return dates
-            .filter { periodKey(for: $0) == period }
-            .min()
     }
 }
 
@@ -1985,6 +1649,10 @@ private struct TokenUsageDashboardData {
     let tokenTrendRows: [TokenTrendRow]
     let tokenTrendColorDomain: [String]
     let compositionRows: [TokenCompositionRow]
+    let compositionInputRows: [TokenCompositionRow]
+    let compositionCacheReadRows: [TokenCompositionRow]
+    let compositionOutputRows: [TokenCompositionRow]
+    let compositionByDateKey: [String: (input: Int, cacheRead: Int, output: Int)]
     let monthlyXAxisValues: [Date]
     let dailyXAxisValues: [Date]
     let spansMultipleYears: Bool
@@ -2027,6 +1695,21 @@ private struct TokenUsageDashboardData {
         )
         let tokenTrendColorDomain = Array(Set(tokenTrendRows.map(\.series))).sorted()
         let compositionRows = makeCompositionRows(from: filteredRecords, viewMode: selectedViewMode)
+        let compositionInputRows = compositionRows.filter { $0.kind == .input }
+        let compositionCacheReadRows = compositionRows.filter { $0.kind == .cacheRead }
+        let compositionOutputRows = compositionRows.filter { $0.kind == .output }
+        var compositionByDateKey: [String: (input: Int, cacheRead: Int, output: Int)] = [:]
+        for row in compositionRows {
+            let key = periodKey(for: row.date, viewMode: selectedViewMode)
+            var entry = compositionByDateKey[key] ?? (0, 0, 0)
+            switch row.kind {
+            case .input: entry.input = row.tokens
+            case .cacheRead: entry.cacheRead = row.tokens
+            case .output: entry.output = row.tokens
+            case .cacheCreation: break
+            }
+            compositionByDateKey[key] = entry
+        }
         let monthlyXAxisValues = makeMonthlyXAxisValues(rangeStart: rangeStart, rangeEnd: rangeEnd, calendar: calendar)
         let dailyXAxisValues = makeDailyXAxisValues(from: filteredRecords, rangeStart: rangeStart, rangeEnd: rangeEnd, calendar: calendar)
         let spansMultipleYears = Set(monthlyXAxisValues.map { calendar.component(.year, from: $0) }).count > 1
@@ -2044,6 +1727,10 @@ private struct TokenUsageDashboardData {
             tokenTrendRows: tokenTrendRows,
             tokenTrendColorDomain: tokenTrendColorDomain,
             compositionRows: compositionRows,
+            compositionInputRows: compositionInputRows,
+            compositionCacheReadRows: compositionCacheReadRows,
+            compositionOutputRows: compositionOutputRows,
+            compositionByDateKey: compositionByDateKey,
             monthlyXAxisValues: monthlyXAxisValues,
             dailyXAxisValues: dailyXAxisValues,
             spansMultipleYears: spansMultipleYears
@@ -2216,6 +1903,468 @@ private struct TokenUsageDashboardData {
     }
 }
 
+// MARK: - Chart helpers (file-private)
+
+private func dashboardPeriodKey(for date: Date, viewMode: TokenUsageViewMode) -> String {
+    switch viewMode {
+    case .daily, .sessions:
+        date.formatted(.iso8601.year().month().day())
+    case .monthly:
+        date.formatted(.iso8601.year().month())
+    }
+}
+
+private func dashboardPeriodStart(for date: Date, viewMode: TokenUsageViewMode) -> Date {
+    switch viewMode {
+    case .daily, .sessions:
+        Calendar.current.startOfDay(for: date)
+    case .monthly:
+        Calendar.current.dateInterval(of: .month, for: date)?.start ?? date
+    }
+}
+
+private func dashboardRepresentativeDate(for date: Date, in dates: [Date], viewMode: TokenUsageViewMode) -> Date? {
+    let period = dashboardPeriodKey(for: date, viewMode: viewMode)
+    return dates
+        .filter { dashboardPeriodKey(for: $0, viewMode: viewMode) == period }
+        .min()
+}
+
+private func dashboardHistogramBarWidth(for viewMode: TokenUsageViewMode) -> MarkDimension {
+    viewMode == .monthly ? .fixed(maximumBarWidth) : .automatic
+}
+
+private func dashboardTooltipPosition(for point: CGPoint, in size: CGSize) -> CGPoint {
+    let tooltipWidth = chartTooltipWidth
+    let tooltipHeight = chartTooltipHeight
+    let horizontalPadding = 10.0
+    let verticalPadding = 10.0
+
+    let x = min(
+        max(point.x + 18 + tooltipWidth / 2, tooltipWidth / 2 + horizontalPadding),
+        max(tooltipWidth / 2 + horizontalPadding, size.width - tooltipWidth / 2 - horizontalPadding)
+    )
+    let preferredY = point.y - 18 - tooltipHeight / 2
+    let fallbackY = point.y + 18 + tooltipHeight / 2
+    let unclampedY = preferredY >= tooltipHeight / 2 + verticalPadding ? preferredY : fallbackY
+    let y = min(
+        max(unclampedY, tooltipHeight / 2 + verticalPadding),
+        max(tooltipHeight / 2 + verticalPadding, size.height - tooltipHeight / 2 - verticalPadding)
+    )
+
+    return CGPoint(x: x, y: y)
+}
+
+private func dashboardStackedBarHit(
+    at point: CGPoint,
+    proxy: ChartProxy,
+    geometry: GeometryProxy,
+    dates: [Date],
+    viewMode: TokenUsageViewMode
+) -> (date: Date, tokens: Double)? {
+    guard let plotFrame = proxy.plotFrame else {
+        return nil
+    }
+
+    let plotRect = geometry[plotFrame]
+    guard plotRect.contains(point) else {
+        return nil
+    }
+
+    let plotPoint = CGPoint(
+        x: min(max(point.x - plotRect.minX, 0), plotRect.width),
+        y: min(max(point.y - plotRect.minY, 0), plotRect.height)
+    )
+    guard
+        let date = proxy.value(atX: plotPoint.x, as: Date.self),
+        let tokens = proxy.value(atY: plotPoint.y, as: Double.self),
+        tokens >= 0
+    else {
+        return nil
+    }
+
+    let hitDate = dashboardPeriodStart(for: date, viewMode: viewMode)
+    guard let barDate = dashboardRepresentativeDate(for: hitDate, in: dates, viewMode: viewMode) else {
+        return nil
+    }
+    let uniqueCount = Set(dates.map { dashboardPeriodKey(for: $0, viewMode: viewMode) }).count
+    let barCenterX: CGFloat
+    let barHalfWidth: CGFloat
+    if viewMode == .monthly,
+       let monthEnd = Calendar.current.date(byAdding: .month, value: 1, to: hitDate),
+       let monthStartX = proxy.position(forX: hitDate),
+       let monthEndX = proxy.position(forX: monthEnd) {
+        barCenterX = (monthStartX + monthEndX) / 2
+        barHalfWidth = maximumBarWidth / 2 + 4
+    } else if let barX = proxy.position(forX: barDate) {
+        barCenterX = barX
+        if uniqueCount <= 1 {
+            barHalfWidth = 52
+        } else {
+            barHalfWidth = min(max(plotRect.width / CGFloat(uniqueCount * 2), 8), 80) + 4
+        }
+    } else {
+        return nil
+    }
+    guard abs(plotPoint.x - barCenterX) <= barHalfWidth else {
+        return nil
+    }
+
+    return (hitDate, tokens)
+}
+
+private func dashboardHitStackedRow<Row>(
+    date: Date,
+    tokens: Double,
+    rows: [Row],
+    rowDate: KeyPath<Row, Date>,
+    rowTokens: KeyPath<Row, Int>,
+    rowOrder: (Row) -> Int,
+    viewMode: TokenUsageViewMode
+) -> Row? {
+    let period = dashboardPeriodKey(for: date, viewMode: viewMode)
+    let periodRows = rows
+        .filter { dashboardPeriodKey(for: $0[keyPath: rowDate], viewMode: viewMode) == period && $0[keyPath: rowTokens] > 0 }
+        .sorted {
+            let leftOrder = rowOrder($0)
+            let rightOrder = rowOrder($1)
+            if leftOrder == rightOrder {
+                return $0[keyPath: rowDate] < $1[keyPath: rowDate]
+            }
+            return leftOrder < rightOrder
+        }
+    let total = periodRows.reduce(0) { $0 + $1[keyPath: rowTokens] }
+    let tolerance = max(Double(total) * 0.015, 1.0)
+    guard tokens >= -tolerance, tokens <= Double(total) + tolerance else {
+        return nil
+    }
+
+    var lowerBound = 0.0
+    for row in periodRows {
+        let upperBound = lowerBound + Double(row[keyPath: rowTokens])
+        if tokens >= lowerBound - tolerance, tokens <= upperBound + tolerance {
+            return row
+        }
+        lowerBound = upperBound
+    }
+
+    return nil
+}
+
+// MARK: - TokenTrendChartView
+
+private struct TokenTrendChartView: View {
+    let rows: [TokenTrendRow]
+    let colorDomain: [String]
+    let colorRange: [Color]
+    let seriesLabel: String
+    let viewMode: TokenUsageViewMode
+    let dateColumnTitle: String
+    let monthlyXAxisValues: [Date]
+    let dailyXAxisValues: [Date]
+    let chartXScaleDomain: ClosedRange<Date>
+    let tooltipDateText: (Date) -> String
+    let monthAxisLabel: (Date) -> String
+    let monthSeparatorLabel: (Date) -> String
+    let isFirstDayOfMonth: (Date) -> Bool
+
+    @State private var hoveredRow: TokenTrendRow?
+    @State private var hoveredPoint: CGPoint?
+
+    var body: some View {
+        let barWidth = dashboardHistogramBarWidth(for: viewMode)
+
+        Chart {
+            ForEach(rows) { row in
+                BarMark(
+                    x: .value(dateColumnTitle, row.date, unit: viewMode == .monthly ? .month : .day),
+                    y: .value("Tokens", row.tokens),
+                    width: barWidth
+                )
+                .foregroundStyle(by: .value(seriesLabel, row.series))
+            }
+        }
+        .chartForegroundStyleScale(domain: colorDomain, range: colorRange)
+        .chartLegend(.hidden)
+        .chartXAxis {
+            xAxisMarks
+        }
+        .chartXScale(domain: chartXScaleDomain)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                ZStack(alignment: .topLeading) {
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let point):
+                                hoveredRow = tokenTrendRow(at: point, proxy: proxy, geometry: geometry)
+                                hoveredPoint = hoveredRow == nil ? nil : point
+                            case .ended:
+                                hoveredRow = nil
+                                hoveredPoint = nil
+                            }
+                        }
+
+                    if let row = hoveredRow, let point = hoveredPoint {
+                        ChartTooltipPanel(
+                            title: row.series,
+                            rows: [
+                                (dateColumnTitle, tooltipDateText(row.date)),
+                                ("Tokens", row.tokens.tokenText),
+                            ]
+                        )
+                        .position(dashboardTooltipPosition(for: point, in: geometry.size))
+                        .zIndex(1)
+                    }
+                }
+                .allowsHitTesting(true)
+                .animation(nil, value: hoveredRow?.id)
+            }
+        }
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+        .chartYAxis {
+            AxisMarks { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let tokens = value.as(Double.self) {
+                        Text(tokens.tokenAxisText)
+                    }
+                }
+            }
+        }
+        .chartYAxisLabel("Tokens")
+        .frame(height: 220)
+    }
+
+    @AxisContentBuilder
+    private var xAxisMarks: some AxisContent {
+        if viewMode == .monthly {
+            AxisMarks(values: monthlyXAxisValues) { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let date = value.as(Date.self) {
+                        Text(monthAxisLabel(date))
+                    }
+                }
+            }
+        } else {
+            AxisMarks(values: dailyXAxisValues) { value in
+                if let date = value.as(Date.self), isFirstDayOfMonth(date) {
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.8))
+                    AxisTick(stroke: StrokeStyle(lineWidth: 0.8))
+                    AxisValueLabel {
+                        Text(monthSeparatorLabel(date))
+                            .font(.caption.weight(.semibold))
+                    }
+                } else {
+                    AxisGridLine()
+                    AxisTick()
+                    AxisValueLabel {
+                        if let date = value.as(Date.self) {
+                            Text(date.formatted(.dateTime.day()))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func tokenTrendRow(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> TokenTrendRow? {
+        guard let hit = dashboardStackedBarHit(at: point, proxy: proxy, geometry: geometry, dates: rows.map(\.date), viewMode: viewMode) else {
+            return nil
+        }
+
+        return dashboardHitStackedRow(
+            date: hit.date,
+            tokens: hit.tokens,
+            rows: rows,
+            rowDate: \.date,
+            rowTokens: \.tokens,
+            rowOrder: { colorDomain.firstIndex(of: $0.series) ?? Int.max },
+            viewMode: viewMode
+        )
+    }
+}
+
+// MARK: - CompositionChartView
+
+private struct CompositionChartView: View {
+    let inputRows: [TokenCompositionRow]
+    let cacheReadRows: [TokenCompositionRow]
+    let outputRows: [TokenCompositionRow]
+    let byDateKey: [String: (input: Int, cacheRead: Int, output: Int)]
+    let viewMode: TokenUsageViewMode
+    let dateColumnTitle: String
+    let monthlyXAxisValues: [Date]
+    let dailyXAxisValues: [Date]
+    let chartXScaleDomain: ClosedRange<Date>
+    let tooltipDateText: (Date) -> String
+    let monthAxisLabel: (Date) -> String
+    let monthSeparatorLabel: (Date) -> String
+    let isFirstDayOfMonth: (Date) -> Bool
+
+    @State private var hoveredRow: TokenCompositionRow?
+    @State private var hoveredPoint: CGPoint?
+
+    private var allRows: [TokenCompositionRow] {
+        inputRows + cacheReadRows + outputRows
+    }
+
+    var body: some View {
+        let allDates = allRows.map(\.date)
+        let barWidth = dashboardHistogramBarWidth(for: viewMode)
+
+        Chart {
+            ForEach(outputRows) { row in
+                BarMark(
+                    x: .value("Date", row.date, unit: viewMode == .monthly ? .month : .day),
+                    y: .value("Tokens", row.tokens),
+                    width: barWidth
+                )
+                .foregroundStyle(colorRose.primary)
+            }
+            ForEach(inputRows) { row in
+                BarMark(
+                    x: .value("Date", row.date, unit: viewMode == .monthly ? .month : .day),
+                    y: .value("Tokens", row.tokens),
+                    width: barWidth
+                )
+                .foregroundStyle(colorOcean.primary)
+            }
+            ForEach(cacheReadRows) { row in
+                BarMark(
+                    x: .value("Date", row.date, unit: viewMode == .monthly ? .month : .day),
+                    y: .value("Tokens", row.tokens),
+                    width: barWidth
+                )
+                .foregroundStyle(colorOcean.light)
+            }
+        }
+        .chartLegend(position: .bottom, alignment: .center)
+        .chartXAxis {
+            xAxisMarks
+        }
+        .chartXScale(domain: chartXScaleDomain)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                ZStack(alignment: .topLeading) {
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let point):
+                                hoveredRow = compositionRow(at: point, proxy: proxy, geometry: geometry, dates: allDates)
+                                hoveredPoint = hoveredRow == nil ? nil : point
+                            case .ended:
+                                hoveredRow = nil
+                                hoveredPoint = nil
+                            }
+                        }
+
+                    if let hovered = hoveredRow, let point = hoveredPoint {
+                        let dateKey = dashboardPeriodKey(for: hovered.date, viewMode: viewMode)
+                        let entry = byDateKey[dateKey] ?? (0, 0, 0)
+                        let inputTokens = entry.input
+                        let cacheReadTokens = entry.cacheRead
+                        let outputTokens = entry.output
+                        let totalInput = cacheReadTokens + inputTokens
+                        let rawCoverage = totalInput > 0 ? Double(cacheReadTokens) / Double(totalInput) * 100 : 0
+                        let cacheCoverage = min(floor(rawCoverage * 10) / 10, 99.9)
+
+                        ChartTooltipPanel(
+                            title: "Token Composition",
+                            rows: [
+                                (dateColumnTitle, tooltipDateText(hovered.date)),
+                                ("Input", inputTokens.tokenText),
+                                ("Cache Read", cacheReadTokens.tokenText),
+                                ("Output", outputTokens.tokenText),
+                                ("Cache Coverage", String(format: "%.1f%%", cacheCoverage)),
+                            ]
+                        )
+                        .position(dashboardTooltipPosition(for: point, in: geometry.size))
+                        .zIndex(1)
+                    }
+                }
+                .allowsHitTesting(true)
+                .animation(nil, value: hoveredRow?.id)
+            }
+        }
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+        .chartYAxis {
+            AxisMarks { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let tokens = value.as(Double.self) {
+                        Text(tokens.tokenAxisText)
+                    }
+                }
+            }
+        }
+        .chartYAxisLabel("Tokens")
+        .frame(height: 280)
+    }
+
+    @AxisContentBuilder
+    private var xAxisMarks: some AxisContent {
+        if viewMode == .monthly {
+            AxisMarks(values: monthlyXAxisValues) { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let date = value.as(Date.self) {
+                        Text(monthAxisLabel(date))
+                    }
+                }
+            }
+        } else {
+            AxisMarks(values: dailyXAxisValues) { value in
+                if let date = value.as(Date.self), isFirstDayOfMonth(date) {
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.8))
+                    AxisTick(stroke: StrokeStyle(lineWidth: 0.8))
+                    AxisValueLabel {
+                        Text(monthSeparatorLabel(date))
+                            .font(.caption.weight(.semibold))
+                    }
+                } else {
+                    AxisGridLine()
+                    AxisTick()
+                    AxisValueLabel {
+                        if let date = value.as(Date.self) {
+                            Text(date.formatted(.dateTime.day()))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func compositionRow(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy, dates: [Date]) -> TokenCompositionRow? {
+        guard let hit = dashboardStackedBarHit(at: point, proxy: proxy, geometry: geometry, dates: dates, viewMode: viewMode) else {
+            return nil
+        }
+
+        return dashboardHitStackedRow(
+            date: hit.date,
+            tokens: hit.tokens,
+            rows: allRows,
+            rowDate: \.date,
+            rowTokens: \.tokens,
+            rowOrder: { $0.kind.sortOrder },
+            viewMode: viewMode
+        )
+    }
+}
+
 private struct SummaryCard: View {
     let title: String
     let value: String
@@ -2238,6 +2387,7 @@ private struct SummaryCard: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         )
+        .drawingGroup()
     }
 }
 
@@ -2278,8 +2428,11 @@ private struct ProviderMetadata {
         if model.contains("gemini") || model.contains("google") {
             return ProviderMetadata(label: "Gemini", abbreviation: "GM", color: colorViolet.primary, imageAssetName: "gemini-mark", preservesOriginalImageColor: true)
         }
-        if model.contains("grok") || model.contains("xai") || model.contains("x.ai") || model.contains("x-ai") {
+        if model.contains("grok") || model.contains("composer-2.5-fast") || model.contains("composer-2-5-fast") || model.contains("xai") || model.contains("x.ai") || model.contains("x-ai") {
             return ProviderMetadata(label: "Grok", abbreviation: "GK", color: colorSlate.dark, imageAssetName: "grok-mark")
+        }
+        if model.contains("stepfun") || model.contains("step-3") {
+            return ProviderMetadata(label: "StepFun", abbreviation: "ST", color: colorOcean.dark, imageAssetName: "stepfun-mark", preservesOriginalImageColor: true)
         }
         if model.contains("qwen") || model.contains("qwq") {
             return ProviderMetadata(label: "Qwen", abbreviation: "QW", color: colorTeal.primary, imageAssetName: "qwen-mark", preservesOriginalImageColor: true)
@@ -2306,8 +2459,8 @@ private struct ProviderMetadata {
     }
 }
 
-private struct ProviderIconBadge: View {
-    let metadata: ProviderMetadata
+struct ProviderIconBadge: View {
+    private let metadata: ProviderMetadata
 
     init(modelName: String) {
         metadata = ProviderMetadata.forModel(modelName)
@@ -2534,13 +2687,14 @@ private struct TodayMetricCard: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         )
+        .drawingGroup()
     }
 }
 
 private struct TodaySourceRowView: View {
     let row: TodaySourceUsageRow
     let maxTokens: Int
-    @ObservedObject var currencyController: TokenUsageBillingCurrencyController
+    let costText: String
 
     private var fillWidthRatio: Double {
         guard maxTokens > 0 else { return 0 }
@@ -2557,7 +2711,7 @@ private struct TodaySourceRowView: View {
                 Spacer()
                 Text(row.totalTokens.tokenText)
                     .font(.system(.callout, design: .monospaced))
-                Text(currencyController.string(fromUSD: row.totalCostDecimal))
+                Text(costText)
                     .font(.system(.callout, design: .monospaced))
                     .frame(width: 86, alignment: .trailing)
             }
@@ -2729,7 +2883,7 @@ private struct TodayTokenMixRowView: View {
 
 private struct TodayModelRowView: View {
     let row: TodayModelUsageRow
-    @ObservedObject var currencyController: TokenUsageBillingCurrencyController
+    let costText: String
 
     var body: some View {
         let modelLabel = displayModelName(row.modelName)
@@ -2757,7 +2911,7 @@ private struct TodayModelRowView: View {
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .frame(width: 78, alignment: .trailing)
-            Text(currencyController.string(fromUSD: row.totalCostDecimal))
+            Text(costText)
                 .font(.system(.caption, design: .monospaced))
                 .frame(width: 86, alignment: .trailing)
         }
@@ -3111,7 +3265,7 @@ private struct ModelCostDistributionChart: View {
         } else {
             HStack(alignment: .center, spacing: 22) {
                 ZStack {
-                    ModelCostSectorChart(slices: slices, currencyController: currencyController)
+                    ModelCostSectorChart(slices: slices, formatCost: { currencyController.string(fromUSD: $0) })
                         .zIndex(1)
 
                     VStack(spacing: 4) {
@@ -3140,7 +3294,7 @@ private struct ModelCostDistributionChart: View {
 
 private struct ModelCostSectorChart: View {
     let slices: [ModelCostSlice]
-    @ObservedObject var currencyController: TokenUsageBillingCurrencyController
+    let formatCost: (Decimal) -> String
     @State private var hoveredSlice: ModelCostSlice?
     @State private var hoveredPoint: CGPoint?
 
@@ -3178,7 +3332,7 @@ private struct ModelCostSectorChart: View {
                         ChartTooltipPanel(
                             title: displayModelName(slice.model),
                             rows: [
-                                ("Cost", currencyController.string(fromUSD: slice.cost)),
+                                ("Cost", formatCost(slice.cost)),
                                 ("Share", slice.percentText),
                             ]
                         )
@@ -3511,14 +3665,59 @@ private extension TokenUsageModelBreakdown {
     }
 }
 
-private func displayModelName(_ modelName: String) -> String {
-    if modelName.localizedCaseInsensitiveContains("kiro-claude-opus-4.7") {
-        return "kiro-claude-opus-4.7"
+/// Maps `claude-{family}-4.8` / `claude-{family}-4-8` to `claude-{family}-4-8`.
+private func canonicalClaude4xModelName(_ modelName: String) -> String? {
+    let lower = modelName.lowercased()
+    guard let range = lower.range(of: "claude-") else { return nil }
+    let segment = String(lower[range.lowerBound...])
+    let afterClaude = segment.dropFirst("claude-".count)
+    guard let dash = afterClaude.firstIndex(of: "-") else { return nil }
+    let family = afterClaude[..<dash]
+    guard !family.isEmpty else { return nil }
+    let version = afterClaude[afterClaude.index(after: dash)...]
+    let minor: String
+    let suffix: Substring
+    if version.hasPrefix("4.") {
+        let rest = version.dropFirst(2)
+        minor = String(rest.prefix(while: { $0.isNumber }))
+        suffix = rest.dropFirst(minor.count)
+    } else if version.hasPrefix("4-") {
+        let rest = version.dropFirst(2)
+        minor = String(rest.prefix(while: { $0.isNumber }))
+        suffix = rest.dropFirst(minor.count)
+    } else {
+        return nil
     }
-    if modelName.hasPrefix("[pi] ") {
-        return String(modelName.dropFirst(5))
+    guard !minor.isEmpty else { return nil }
+    let prefix = modelName[..<range.lowerBound]
+    return "\(prefix)claude-\(family)-4-\(minor)\(suffix)".lowercased()
+}
+
+func displayModelName(_ modelName: String) -> String {
+    let stripped = modelName.split(separator: "/").last.map(String.init) ?? modelName
+    let normalized = stripped.lowercased()
+    let displayName: String
+    if normalized.contains("ark-code-latest") || normalized == "ark-code" {
+        displayName = "glm-5.2"
+    } else if normalized.contains("glm-5.2") || normalized.contains("glm-5-2") {
+        displayName = "glm-5.2"
+    } else if normalized.contains("step-3.7-flash") {
+        displayName = "step-3.7-flash"
+    } else if normalized.contains("composer-2.5-fast") {
+        displayName = "composer-2.5-fast"
+    } else if normalized.contains("grok-composer-2.5-fast") || normalized.contains("grok-composer-2-5-fast") {
+        displayName = "composer-2.5-fast"
+    } else if modelName.localizedCaseInsensitiveContains("kiro-claude-opus-4.7")
+        || modelName.localizedCaseInsensitiveContains("kiro-claude-opus-4-7") {
+        displayName = "kiro-claude-opus-4-7"
+    } else if let canon = canonicalClaude4xModelName(stripped) {
+        displayName = canon
+    } else if stripped.hasPrefix("[pi] ") {
+        displayName = String(stripped.dropFirst(5))
+    } else {
+        displayName = stripped
     }
-    return modelName
+    return displayName.lowercased()
 }
 
 private extension Decimal {
@@ -3536,7 +3735,8 @@ extension TokenUsageSource {
         case .hermes: .hermes
         case .openclaw: .openclaw
         case .pi: .pi
-        case .factory: .factory
+        case .grok: .grok
+        case .cursor: .cursor
         }
     }
 
@@ -3553,7 +3753,8 @@ extension TokenUsageSource {
         case .hermes: "paperplane"
         case .openclaw: "hammer"
         case .pi: "p.circle"
-        case .factory: "gearshape.2"
+        case .grok: "sparkles"
+        case .cursor: "cursorarrow.rays"
         }
     }
 
@@ -3566,7 +3767,8 @@ extension TokenUsageSource {
         case .hermes: "hermes-mark"
         case .openclaw: "openclaw-mark"
         case .pi: "pi-mark"
-        case .factory: "factory-mark"
+        case .grok: "grok-mark"
+        case .cursor: "cursor-mark"
         }
     }
 
@@ -3597,7 +3799,8 @@ extension UsageSource {
         case .hermes: "paperplane"
         case .openclaw: "hammer"
         case .pi: "p.circle"
-        case .factory: "gearshape.2"
+        case .grok: "sparkles"
+        case .cursor: "cursorarrow.rays"
         }
     }
 
@@ -3609,7 +3812,8 @@ extension UsageSource {
         case .hermes: "hermes-mark"
         case .openclaw: "openclaw-mark"
         case .pi: "pi-mark"
-        case .factory: "factory-mark"
+        case .grok: "grok-mark"
+        case .cursor: "cursor-mark"
         }
     }
 
@@ -3678,8 +3882,8 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
 
     private static func makePreviewRecords(startDate: Date) -> [TokenUsageRecord] {
         let calendar = Calendar.current
-        let sources: [TokenUsageSource] = [.claude, .codex, .opencode, .factory]
-        let models = ["claude-sonnet-4", "gpt-5.2-codex", "qwen3-coder", "factory-droid"]
+        let sources: [TokenUsageSource] = [.claude, .codex, .opencode, .grok]
+        let models = ["claude-sonnet-4", "gpt-5.2-codex", "qwen3-coder", "grok-composer-2.5-fast"]
 
         return (0..<14).flatMap { dayOffset in
             sources.enumerated().map { sourceIndex, source in

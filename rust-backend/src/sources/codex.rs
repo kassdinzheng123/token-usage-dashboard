@@ -1,5 +1,6 @@
 use crate::pricing::{model_cost_usd, TokenUsage};
-use chrono::{DateTime, Duration, Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -11,6 +12,7 @@ use std::{
 
 const UNKNOWN_MODEL: &str = "unknown";
 const FALLBACK_PRICING_MODEL: &str = "gpt-5";
+const CODEX_HOMES_ENV: &str = "TOKEN_USAGE_CODEX_HOMES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceView {
@@ -58,6 +60,18 @@ struct TokenUsageEvent {
     cost: f64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTokenUsageEvent {
+    date: String,
+    time: String,
+    timestamp_millis: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    total_tokens: i64,
+    explicit_cost: f64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ModelUsage {
     input_tokens: i64,
@@ -82,6 +96,13 @@ struct UsageGroup {
     models: BTreeMap<String, ModelUsage>,
 }
 
+#[derive(Debug, Clone)]
+struct SessionFile {
+    codex_home: PathBuf,
+    session_root: PathBuf,
+    file: PathBuf,
+}
+
 pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String> {
     let _ = refresh;
     let view = SourceView::try_from(view)?;
@@ -92,8 +113,8 @@ pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String>
 
     let events = load_events()?;
     Ok(match view {
-        SourceView::Daily => events_to_daily(&events),
-        SourceView::Monthly => events_to_monthly(&events),
+        SourceView::Daily => events_to_period_rows(&events, PeriodView::Daily),
+        SourceView::Monthly => events_to_period_rows(&events, PeriodView::Monthly),
         SourceView::Sessions => events_to_sessions(&events),
         SourceView::Blocks => Vec::new(),
     })
@@ -102,28 +123,24 @@ pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String>
 pub fn load_daily_for_date(date: &str, refresh: bool) -> Result<Vec<Value>, String> {
     let _ = refresh;
     let events = load_events_for_date(date)?;
-    Ok(events_to_daily(&events)
+    Ok(events_to_period_rows(&events, PeriodView::Daily)
         .into_iter()
         .filter(|row| row.get("date").and_then(Value::as_str) == Some(date))
         .collect())
 }
 
 fn load_events() -> Result<Vec<TokenUsageEvent>, String> {
-    let Some(sessions_dir) = codex_home().map(|home| home.join("sessions")) else {
-        return Ok(Vec::new());
-    };
-
-    if !sessions_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut files = Vec::new();
-    collect_jsonl_files(&sessions_dir, &mut files)?;
-    files.sort();
+    let mut files = collect_session_files()?;
+    let include_home_in_session_id = files
+        .iter()
+        .map(|file| file.codex_home.as_path())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1;
 
     let mut events = Vec::new();
-    for file in files {
-        append_events_from_file(&sessions_dir, &file, &mut events)?;
+    for session_file in files.drain(..) {
+        append_events_from_file(&session_file, include_home_in_session_id, &mut events)?;
     }
 
     events.sort_by_key(|event| event.timestamp_millis);
@@ -131,55 +148,129 @@ fn load_events() -> Result<Vec<TokenUsageEvent>, String> {
 }
 
 fn load_events_for_date(date: &str) -> Result<Vec<TokenUsageEvent>, String> {
-    let Some(sessions_dir) = codex_home().map(|home| home.join("sessions")) else {
+    if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
         return Ok(Vec::new());
-    };
-
-    let Some(day_dirs) = candidate_day_dirs(&sessions_dir, date) else {
-        return Ok(Vec::new());
-    };
-
-    let mut files = Vec::new();
-    for day_dir in day_dirs {
-        if day_dir.is_dir() {
-            collect_jsonl_files(&day_dir, &mut files)?;
-        }
-    }
-    files.sort();
-
-    let mut events = Vec::new();
-    for file in files {
-        append_events_from_file(&sessions_dir, &file, &mut events)?;
     }
 
+    let mut events = load_events()?;
     events.retain(|event| event.date == date);
-    events.sort_by_key(|event| event.timestamp_millis);
     Ok(events)
 }
 
-fn candidate_day_dirs(sessions_dir: &Path, date: &str) -> Option<Vec<PathBuf>> {
-    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
-    let mut dates = vec![date];
-    if let Some(previous) = date.checked_sub_signed(Duration::days(1)) {
-        dates.push(previous);
-    }
-    if let Some(next) = date.checked_add_signed(Duration::days(1)) {
-        dates.push(next);
+fn collect_session_files() -> Result<Vec<SessionFile>, String> {
+    let mut files_by_path = BTreeMap::new();
+
+    for codex_home in codex_homes() {
+        let session_roots = [
+            codex_home.join("sessions"),
+            codex_home.join("archived_sessions"),
+        ];
+
+        for session_root in session_roots {
+            if !session_root.is_dir() {
+                continue;
+            }
+
+            let mut root_files = Vec::new();
+            collect_jsonl_files(&session_root, &mut root_files)?;
+            for file in root_files {
+                insert_session_file(
+                    &mut files_by_path,
+                    SessionFile {
+                        codex_home: codex_home.clone(),
+                        session_root: session_root.clone(),
+                        file,
+                    },
+                );
+            }
+        }
+
+        append_rollout_paths_from_state(&codex_home, &mut files_by_path);
     }
 
-    dates.sort();
-    dates.dedup();
-    Some(
-        dates
-            .into_iter()
-            .map(|date| {
-                sessions_dir
-                    .join(date.format("%Y").to_string())
-                    .join(date.format("%m").to_string())
-                    .join(date.format("%d").to_string())
-            })
-            .collect(),
-    )
+    Ok(files_by_path.into_values().collect())
+}
+
+fn insert_session_file(files_by_path: &mut BTreeMap<PathBuf, SessionFile>, file: SessionFile) {
+    let key = file
+        .file
+        .canonicalize()
+        .unwrap_or_else(|_| file.file.clone());
+    files_by_path.entry(key).or_insert(file);
+}
+
+fn append_rollout_paths_from_state(
+    codex_home: &Path,
+    files_by_path: &mut BTreeMap<PathBuf, SessionFile>,
+) {
+    let Ok(entries) = fs::read_dir(codex_home) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("state_") || !name.ends_with(".sqlite") {
+            continue;
+        }
+        append_rollout_paths_from_state_db(codex_home, &path, files_by_path);
+    }
+}
+
+fn append_rollout_paths_from_state_db(
+    codex_home: &Path,
+    db_path: &Path,
+    files_by_path: &mut BTreeMap<PathBuf, SessionFile>,
+) {
+    let Ok(connection) = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT DISTINCT rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path <> ''",
+    ) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+
+    for row in rows.flatten() {
+        let raw_file = PathBuf::from(row);
+        let file = if raw_file.is_absolute() {
+            raw_file
+        } else {
+            codex_home.join(raw_file)
+        };
+        if !file.is_file() {
+            continue;
+        }
+        insert_session_file(
+            files_by_path,
+            SessionFile {
+                codex_home: codex_home.to_path_buf(),
+                session_root: session_root_for_rollout_path(codex_home, &file),
+                file,
+            },
+        );
+    }
+}
+
+fn session_root_for_rollout_path(codex_home: &Path, file: &Path) -> PathBuf {
+    for root in [
+        codex_home.join("sessions"),
+        codex_home.join("archived_sessions"),
+    ] {
+        if file.starts_with(&root) {
+            return root;
+        }
+    }
+
+    file.parent().unwrap_or(codex_home).to_path_buf()
 }
 
 fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -210,18 +301,20 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Strin
 }
 
 fn append_events_from_file(
-    sessions_dir: &Path,
-    file_path: &Path,
+    session_file: &SessionFile,
+    include_home_in_session_id: bool,
     events: &mut Vec<TokenUsageEvent>,
 ) -> Result<(), String> {
-    let file = match File::open(file_path) {
+    let file = match File::open(&session_file.file) {
         Ok(file) => file,
         Err(_) => return Ok(()),
     };
 
-    let session_id = session_id_for(sessions_dir, file_path);
-    let mut previous_totals: Option<RawUsage> = None;
+    let session_id = session_id_for(session_file, include_home_in_session_id);
+    let mut previous_totals_by_scope = BTreeMap::new();
     let mut current_model: Option<String> = None;
+    let mut current_provider: Option<String> = None;
+    let mut pending_without_model = Vec::new();
 
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
@@ -239,9 +332,25 @@ fn append_events_from_file(
             continue;
         };
 
+        if entry.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if let Some(provider) = extract_provider(payload) {
+                current_provider = Some(provider);
+            }
+            continue;
+        }
+
         if entry.get("type").and_then(Value::as_str) == Some("turn_context") {
+            if let Some(provider) = extract_provider(payload) {
+                current_provider = Some(provider);
+            }
             if let Some(model) = extract_model(payload) {
-                current_model = Some(model);
+                current_model = Some(model.clone());
+                flush_pending_token_usage_events(
+                    &mut pending_without_model,
+                    events,
+                    &session_id,
+                    model,
+                );
             }
             continue;
         }
@@ -261,17 +370,20 @@ fn append_events_from_file(
             .get("info")
             .and_then(|info| info.get("last_token_usage"))
             .and_then(normalize_raw_usage);
+        let extracted_model = extract_model(payload);
+        let usage_scope = usage_scope(current_provider.as_deref(), payload);
 
         let raw_usage = match (last_usage, total_usage) {
             (Some(last), total) => {
                 if let Some(total) = total {
-                    previous_totals = Some(total);
+                    previous_totals_by_scope.insert(usage_scope.clone(), total);
                 }
                 Some(last)
             }
             (None, Some(total)) => {
+                let previous_totals = previous_totals_by_scope.get(&usage_scope).copied();
                 let delta = subtract_raw_usage(total, previous_totals);
-                previous_totals = Some(total);
+                previous_totals_by_scope.insert(usage_scope, total);
                 Some(delta)
             }
             (None, None) => None,
@@ -295,98 +407,111 @@ fn append_events_from_file(
             continue;
         };
 
-        let extracted_model = extract_model(payload);
         if let Some(model) = extracted_model.as_ref() {
             current_model = Some(model.clone());
+            flush_pending_token_usage_events(
+                &mut pending_without_model,
+                events,
+                &session_id,
+                model.clone(),
+            );
         }
-        let (model_name, is_fallback_model) = extracted_model
-            .or_else(|| current_model.clone())
-            .map(|model| (model, false))
-            .unwrap_or_else(|| (UNKNOWN_MODEL.to_string(), true));
         let cache_read_tokens = raw_usage
             .cached_input_tokens
             .min(raw_usage.input_tokens)
             .max(0);
-        let non_cached_input = raw_usage.input_tokens.saturating_sub(cache_read_tokens);
-        let total_tokens = if raw_usage.total_tokens > 0 {
-            raw_usage.total_tokens
-        } else {
-            raw_usage.input_tokens + raw_usage.output_tokens
-        };
-
-        let explicit_cost = explicit_cost(payload);
-        let cost = if explicit_cost > 0.0 {
-            explicit_cost
-        } else {
-            model_cost_usd(
-                if is_fallback_model {
-                    FALLBACK_PRICING_MODEL
-                } else {
-                    &model_name
-                },
-                TokenUsage {
-                    input_tokens: non_cached_input,
-                    output_tokens: raw_usage.output_tokens,
-                    cache_creation_tokens: 0,
-                    cache_read_tokens,
-                },
-            )
-        };
-
-        events.push(TokenUsageEvent {
-            session_id: session_id.clone(),
+        let pending_event = PendingTokenUsageEvent {
             date,
             time,
             timestamp_millis,
-            model_name,
-            is_fallback_model,
-            input_tokens: non_cached_input,
+            input_tokens: raw_usage.input_tokens.saturating_sub(cache_read_tokens),
             output_tokens: raw_usage.output_tokens,
             cache_read_tokens,
-            total_tokens,
-            cost,
-        });
+            total_tokens: if raw_usage.total_tokens > 0 {
+                raw_usage.total_tokens
+            } else {
+                raw_usage.input_tokens + raw_usage.output_tokens
+            },
+            explicit_cost: explicit_cost(payload),
+        };
+
+        if let Some(model_name) = extracted_model.or_else(|| current_model.clone()) {
+            push_token_usage_event(events, &session_id, pending_event, model_name, false);
+        } else {
+            pending_without_model.push(pending_event);
+        }
     }
+
+    flush_pending_unknown_token_usage_events(&mut pending_without_model, events, &session_id);
 
     Ok(())
 }
 
-fn events_to_daily(events: &[TokenUsageEvent]) -> Vec<Value> {
-    aggregate_events(events, |event| event.date.clone())
-        .into_iter()
-        .map(|group| {
-            json!({
-                "date": group.key,
-                "inputTokens": group.input_tokens,
-                "outputTokens": group.output_tokens,
-                "cacheCreationTokens": 0,
-                "cacheReadTokens": group.cache_read_tokens,
-                "totalTokens": group.total_tokens,
-                "totalCost": group.total_cost,
-                "modelsUsed": models_used(&group),
-                "modelBreakdowns": model_breakdowns(&group),
-            })
-        })
-        .collect()
+fn flush_pending_token_usage_events(
+    pending_events: &mut Vec<PendingTokenUsageEvent>,
+    events: &mut Vec<TokenUsageEvent>,
+    session_id: &str,
+    model_name: String,
+) {
+    for pending_event in pending_events.drain(..) {
+        push_token_usage_event(events, session_id, pending_event, model_name.clone(), false);
+    }
 }
 
-fn events_to_monthly(events: &[TokenUsageEvent]) -> Vec<Value> {
-    aggregate_events(events, |event| event.date.chars().take(7).collect())
-        .into_iter()
-        .map(|group| {
-            json!({
-                "month": group.key,
-                "inputTokens": group.input_tokens,
-                "outputTokens": group.output_tokens,
-                "cacheCreationTokens": 0,
-                "cacheReadTokens": group.cache_read_tokens,
-                "totalTokens": group.total_tokens,
-                "totalCost": group.total_cost,
-                "modelsUsed": models_used(&group),
-                "modelBreakdowns": model_breakdowns(&group),
-            })
-        })
-        .collect()
+fn flush_pending_unknown_token_usage_events(
+    pending_events: &mut Vec<PendingTokenUsageEvent>,
+    events: &mut Vec<TokenUsageEvent>,
+    session_id: &str,
+) {
+    for pending_event in pending_events.drain(..) {
+        push_token_usage_event(
+            events,
+            session_id,
+            pending_event,
+            UNKNOWN_MODEL.to_string(),
+            true,
+        );
+    }
+}
+
+fn push_token_usage_event(
+    events: &mut Vec<TokenUsageEvent>,
+    session_id: &str,
+    pending_event: PendingTokenUsageEvent,
+    model_name: String,
+    is_fallback_model: bool,
+) {
+    let cost = if pending_event.explicit_cost > 0.0 {
+        pending_event.explicit_cost
+    } else {
+        model_cost_usd(
+            if is_fallback_model {
+                FALLBACK_PRICING_MODEL
+            } else {
+                &model_name
+            },
+            TokenUsage {
+                input_tokens: pending_event.input_tokens,
+                output_tokens: pending_event.output_tokens,
+                cache_creation_tokens: 0,
+                cache_read_tokens: pending_event.cache_read_tokens,
+            },
+        )
+    };
+
+    events.push(TokenUsageEvent {
+        session_id: session_id.to_string(),
+        date: pending_event.date,
+        time: pending_event.time,
+        timestamp_millis: pending_event.timestamp_millis,
+        model_name,
+        is_fallback_model,
+        input_tokens: pending_event.input_tokens,
+        output_tokens: pending_event.output_tokens,
+        cache_read_tokens: pending_event.cache_read_tokens,
+        total_tokens: pending_event.total_tokens,
+        cost,
+    });
 }
 
 fn events_to_sessions(events: &[TokenUsageEvent]) -> Vec<Value> {
@@ -405,6 +530,69 @@ fn events_to_sessions(events: &[TokenUsageEvent]) -> Vec<Value> {
                 "totalCost": group.total_cost,
                 "modelsUsed": models_used(&group),
                 "modelBreakdowns": model_breakdowns(&group),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PeriodView {
+    Daily,
+    Monthly,
+}
+
+fn events_to_period_rows(events: &[TokenUsageEvent], view: PeriodView) -> Vec<Value> {
+    let groups = aggregate_events(events, |event| match view {
+        PeriodView::Daily => event.date.clone(),
+        PeriodView::Monthly => event.date.chars().take(7).collect(),
+    });
+    groups
+        .into_iter()
+        .map(|group| match view {
+            PeriodView::Daily => json!({
+                "date": group.key,
+                "inputTokens": group.input_tokens,
+                "outputTokens": group.output_tokens,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": group.cache_read_tokens,
+                "totalTokens": group.total_tokens,
+                "totalCost": group.total_cost,
+                "modelsUsed": models_used_from_model_map(&group.models),
+                "modelBreakdowns": model_breakdowns_from_model_map(&group.models),
+            }),
+            PeriodView::Monthly => json!({
+                "month": group.key,
+                "inputTokens": group.input_tokens,
+                "outputTokens": group.output_tokens,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": group.cache_read_tokens,
+                "totalTokens": group.total_tokens,
+                "totalCost": group.total_cost,
+                "modelsUsed": models_used_from_model_map(&group.models),
+                "modelBreakdowns": model_breakdowns_from_model_map(&group.models),
+            }),
+        })
+        .collect()
+}
+
+fn models_used_from_model_map(models: &BTreeMap<String, ModelUsage>) -> Vec<String> {
+    models
+        .iter()
+        .filter_map(|(model_name, usage)| usage.has_non_fallback.then(|| model_name.clone()))
+        .collect()
+}
+
+fn model_breakdowns_from_model_map(models: &BTreeMap<String, ModelUsage>) -> Vec<Value> {
+    models
+        .iter()
+        .map(|(model_name, usage)| {
+            json!({
+                "modelName": model_name,
+                "inputTokens": usage.input_tokens,
+                "outputTokens": usage.output_tokens,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": usage.cache_read_tokens,
+                "cost": usage.cost,
             })
         })
         .collect()
@@ -442,7 +630,7 @@ fn aggregate_events(
 
         let model = group
             .models
-            .entry(event.model_name.clone())
+            .entry(super::cluster_model_name(&event.model_name))
             .or_insert_with(ModelUsage::default);
         model.input_tokens += event.input_tokens;
         model.output_tokens += event.output_tokens;
@@ -515,6 +703,9 @@ fn normalize_raw_usage(value: &Value) -> Option<RawUsage> {
 
 fn subtract_raw_usage(current: RawUsage, previous: Option<RawUsage>) -> RawUsage {
     let previous = previous.unwrap_or_default();
+    if current.total_tokens < previous.total_tokens {
+        return current;
+    }
     RawUsage {
         input_tokens: (current.input_tokens - previous.input_tokens).max(0),
         cached_input_tokens: (current.cached_input_tokens - previous.cached_input_tokens).max(0),
@@ -548,6 +739,41 @@ fn extract_model(payload: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn extract_provider(payload: &Value) -> Option<String> {
+    let candidates = [
+        payload.get("model_provider"),
+        payload.get("provider"),
+        payload.get("provider_id"),
+        payload.get("modelProvider"),
+        payload
+            .get("metadata")
+            .and_then(|metadata| metadata.get("model_provider")),
+        payload
+            .get("metadata")
+            .and_then(|metadata| metadata.get("provider")),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|provider| !provider.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn usage_scope(current_provider: Option<&str>, payload: &Value) -> String {
+    payload
+        .get("rate_limits")
+        .and_then(|rate_limits| rate_limits.get("limit_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .or(current_provider)
+        .unwrap_or("default-provider")
+        .to_string()
+}
+
 fn explicit_cost(payload: &Value) -> f64 {
     let candidates = [
         payload.get("cost"),
@@ -579,21 +805,144 @@ fn timestamp_parts(timestamp: &str) -> Option<(String, String, i64)> {
     ))
 }
 
-fn session_id_for(sessions_dir: &Path, file_path: &Path) -> String {
-    let relative = file_path.strip_prefix(sessions_dir).unwrap_or(file_path);
+fn session_id_for(session_file: &SessionFile, include_home: bool) -> String {
+    let relative = session_file
+        .file
+        .strip_prefix(&session_file.session_root)
+        .unwrap_or(&session_file.file);
     let without_extension = relative.with_extension("");
-    without_extension
+    let session_id = without_extension
         .components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+
+    if include_home {
+        format!(
+            "{}/{}",
+            codex_home_label(&session_file.codex_home),
+            session_id
+        )
+    } else {
+        session_id
+    }
 }
 
-fn codex_home() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
+fn codex_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+
+    if let Some(value) = std::env::var_os(CODEX_HOMES_ENV) {
+        for path in split_path_list(&value.to_string_lossy()) {
+            push_codex_home(&mut homes, expand_home_path(path));
+        }
+        return existing_codex_homes(homes);
+    }
+
+    if let Some(path) = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    {
+        push_codex_home(&mut homes, path);
+        return existing_codex_homes(homes);
+    }
+
+    if let Some(home) = super::home_dir() {
+        push_codex_home(&mut homes, home.join(".codex"));
+        discover_codex_homes_in(&home, |name| name.starts_with(".codex"), &mut homes);
+        discover_codex_homes_in(
+            &home.join(".local").join("share"),
+            contains_codex,
+            &mut homes,
+        );
+        discover_codex_homes_in(
+            &home.join("Library").join("Application Support"),
+            contains_codex,
+            &mut homes,
+        );
+    }
+
+    existing_codex_homes(homes)
+}
+
+fn existing_codex_homes(mut homes: Vec<PathBuf>) -> Vec<PathBuf> {
+    homes.retain(|home| has_codex_storage(home));
+    homes.sort();
+    homes.dedup();
+    homes
+}
+
+fn has_codex_storage(home: &Path) -> bool {
+    if home.join("sessions").is_dir() || home.join("archived_sessions").is_dir() {
+        return true;
+    }
+
+    let Ok(entries) = fs::read_dir(home) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("state_") && name.ends_with(".sqlite"))
+    })
+}
+
+fn push_codex_home(homes: &mut Vec<PathBuf>, path: PathBuf) {
+    let canonical = path.canonicalize().unwrap_or(path);
+    if !homes.contains(&canonical) {
+        homes.push(canonical);
+    }
+}
+
+fn discover_codex_homes_in(
+    dir: &Path,
+    matches_name: impl Fn(&str) -> bool,
+    homes: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if matches_name(name) {
+            push_codex_home(homes, path);
+        }
+    }
+}
+
+fn contains_codex(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("codex")
+}
+
+fn split_path_list(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split([',', ':'])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = super::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn codex_home_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("codex")
+        .to_string()
 }
 
 fn to_i64(value: &Value) -> i64 {
@@ -699,6 +1048,82 @@ mod tests {
     }
 
     #[test]
+    fn splits_cross_day_session_usage_by_event_date() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let first_timestamp = "2026-06-01T12:00:00.000Z";
+        let second_timestamp = "2026-06-02T12:00:00.000Z";
+        let first_date = timestamp_parts(first_timestamp).unwrap().0;
+        let second_date = timestamp_parts(second_timestamp).unwrap().0;
+        assert_ne!(first_date, second_date);
+
+        fixture.write_session(
+            "cross-day.jsonl",
+            &[
+                json!({
+                    "timestamp": first_timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "model_name": "gpt-5-codex",
+                            "total_token_usage": {
+                                "input_tokens": 120,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 50,
+                                "total_tokens": 170
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 120,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 50,
+                                "total_tokens": 170
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "timestamp": second_timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "model_name": "gpt-5-codex",
+                            "total_token_usage": {
+                                "input_tokens": 200,
+                                "cached_input_tokens": 35,
+                                "output_tokens": 80,
+                                "total_tokens": 280
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let daily = load_source_view("daily", false).unwrap();
+        assert_eq!(daily.len(), 2);
+        assert_eq!(daily[0]["date"], first_date);
+        assert_eq!(daily[0]["inputTokens"], 100);
+        assert_eq!(daily[0]["outputTokens"], 50);
+        assert_eq!(daily[0]["cacheReadTokens"], 20);
+        assert_eq!(daily[0]["totalTokens"], 170);
+        assert_eq!(daily[1]["date"], second_date);
+        assert_eq!(daily[1]["inputTokens"], 65);
+        assert_eq!(daily[1]["outputTokens"], 30);
+        assert_eq!(daily[1]["cacheReadTokens"], 15);
+        assert_eq!(daily[1]["totalTokens"], 110);
+
+        let sessions = load_source_view("sessions", false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["date"], second_date);
+        assert_eq!(sessions[0]["inputTokens"], 165);
+        assert_eq!(sessions[0]["outputTokens"], 80);
+        assert_eq!(sessions[0]["cacheReadTokens"], 35);
+        assert_eq!(sessions[0]["totalTokens"], 280);
+    }
+
+    #[test]
     fn keeps_fallback_model_out_of_models_used() {
         let _guard = ENV_LOCK.lock().unwrap();
         let fixture = TestCodexHome::new();
@@ -768,22 +1193,365 @@ mod tests {
     }
 
     #[test]
-    fn loads_daily_for_date_from_cross_day_session_directory() {
+    fn counts_total_usage_after_provider_model_switch_resets_totals() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        fixture.write_session(
+            "provider-switch.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-06T10:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "model_provider": "openai"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T10:00:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T10:00:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 30,
+                                "total_tokens": 130
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T10:00:03.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model_provider": "custom",
+                        "model": "deepseek-v4-flash"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T10:00:04.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 50,
+                                "cached_input_tokens": 10,
+                                "output_tokens": 15,
+                                "total_tokens": 65
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let rows = load_source_view("sessions", false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["inputTokens"], 120);
+        assert_eq!(rows[0]["outputTokens"], 45);
+        assert_eq!(rows[0]["cacheReadTokens"], 30);
+        assert_eq!(rows[0]["totalTokens"], 195);
+        assert_eq!(
+            rows[0]["modelsUsed"],
+            json!(["deepseek-v4-flash", "gpt-5.5"])
+        );
+    }
+
+    #[test]
+    fn loads_sessions_from_multiple_codex_homes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let first = TestCodexHome::new_without_env("token-usage-codex-first");
+        let second = TestCodexHome::new_without_env("token-usage-codex-second");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_codex_homes = std::env::var_os(CODEX_HOMES_ENV);
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var(
+            CODEX_HOMES_ENV,
+            format!("{}:{}", first.root.display(), second.root.display()),
+        );
+
+        first.write_session(
+            "shared-name.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-06T10:00:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T10:00:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 30,
+                                "total_tokens": 130
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+        second.write_session(
+            "shared-name.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-06T11:00:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "deepseek-v4-flash"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T11:00:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 50,
+                                "cached_input_tokens": 10,
+                                "output_tokens": 15,
+                                "total_tokens": 65
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let daily = load_source_view("daily", false).unwrap();
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0]["inputTokens"], 120);
+        assert_eq!(daily[0]["outputTokens"], 45);
+        assert_eq!(daily[0]["cacheReadTokens"], 30);
+        assert_eq!(daily[0]["totalTokens"], 195);
+        assert_eq!(
+            daily[0]["modelsUsed"],
+            json!(["deepseek-v4-flash", "gpt-5.5"])
+        );
+
+        let sessions = load_source_view("sessions", false).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|row| row["sessionId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("token-usage-codex-first-"))));
+        assert!(sessions.iter().any(|row| row["sessionId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("token-usage-codex-second-"))));
+
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env(CODEX_HOMES_ENV, previous_codex_homes);
+    }
+
+    #[test]
+    fn ignores_removed_dashboard_usage_cache_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let removed_cache_path = fixture.root.join("removed-dashboard-cache.json");
+
+        fixture.write_session(
+            "current.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-06T10:00:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-06T10:00:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 30,
+                                "total_tokens": 130
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+        fs::write(
+            &removed_cache_path,
+            json!({
+                "version": 1,
+                "savedAt": "2026-04-30T14:31:14.884Z",
+                "data": {
+                    "codex:sessions": [{
+                        "sessionId": "2026/04/30/rollout-old",
+                        "date": "2026-04-30",
+                        "time": "22:30",
+                        "inputTokens": 200,
+                        "outputTokens": 40,
+                        "cacheCreationTokens": 0,
+                        "cacheReadTokens": 50,
+                        "totalTokens": 240,
+                        "totalCost": 0.25,
+                        "modelsUsed": ["gpt-5.4"],
+                        "modelBreakdowns": [{
+                            "modelName": "gpt-5.4",
+                            "inputTokens": 200,
+                            "outputTokens": 40,
+                            "cacheCreationTokens": 0,
+                            "cacheReadTokens": 50,
+                            "cost": 0.25
+                        }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let sessions = load_source_view("sessions", false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions
+            .iter()
+            .any(|row| row.get("sessionId").and_then(Value::as_str) == Some("current")));
+
+        let daily = load_source_view("daily", false).unwrap();
+        assert_eq!(daily.len(), 1);
+        assert!(daily
+            .iter()
+            .any(
+                |row| row.get("date").and_then(Value::as_str) == Some("2026-06-06")
+                    && row.get("totalTokens").and_then(Value::as_i64) == Some(130)
+            ));
+    }
+
+    #[test]
+    fn loads_rollout_paths_from_codex_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let rollout_path = fixture
+            .root
+            .join("provider-state-rollouts")
+            .join("state-only.jsonl");
+        fs::create_dir_all(rollout_path.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout_path,
+            [
+                json!({
+                    "timestamp": "2026-06-07T10:00:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5"
+                    }
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-06-07T10:00:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 30,
+                                "total_tokens": 130
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let connection = Connection::open(fixture.root.join("state_5.sqlite")).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES ('thread-1', ?1)",
+                [rollout_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+
+        let sessions = load_source_view("sessions", false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "state-only");
+        assert_eq!(sessions[0]["inputTokens"], 80);
+        assert_eq!(sessions[0]["outputTokens"], 30);
+        assert_eq!(sessions[0]["cacheReadTokens"], 20);
+        assert_eq!(sessions[0]["totalTokens"], 130);
+    }
+
+    #[test]
+    fn applies_first_later_model_to_initial_token_count_before_turn_context() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        fixture.write_session(
+            "initial-token-count.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-05-06T03:34:28.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 25,
+                                "output_tokens": 20,
+                                "total_tokens": 120
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-05-06T03:34:29.958Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5"
+                    }
+                }),
+            ],
+        );
+
+        let rows = load_source_view("sessions", false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["modelsUsed"], json!(["gpt-5.5"]));
+        assert_eq!(rows[0]["modelBreakdowns"][0]["modelName"], "gpt-5.5");
+        assert_eq!(rows[0]["modelBreakdowns"][0]["inputTokens"], 75);
+        assert_eq!(rows[0]["modelBreakdowns"][0]["outputTokens"], 20);
+        assert_eq!(rows[0]["modelBreakdowns"][0]["cacheReadTokens"], 25);
+    }
+
+    #[test]
+    fn loads_daily_for_date_from_resumed_older_session_directory() {
         let _guard = ENV_LOCK.lock().unwrap();
         let fixture = TestCodexHome::new();
         let timestamp = "2026-05-09T02:47:18.216Z";
         let expected_date = timestamp_parts(timestamp).unwrap().0;
-        let previous_date = NaiveDate::parse_from_str(&expected_date, "%Y-%m-%d")
-            .unwrap()
-            .checked_sub_signed(Duration::days(1))
-            .unwrap();
         fixture.write_session(
-            &format!(
-                "{}/{}/{}/cross-day.jsonl",
-                previous_date.format("%Y"),
-                previous_date.format("%m"),
-                previous_date.format("%d")
-            ),
+            "2026/01/01/resumed-old-thread.jsonl",
             &[
                 json!({
                     "timestamp": "2026-05-09T02:47:15.183Z",
@@ -818,6 +1586,50 @@ mod tests {
     }
 
     #[test]
+    fn loads_archived_sessions() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let timestamp = "2026-05-10T02:47:18.216Z";
+        let expected_date = timestamp_parts(timestamp).unwrap().0;
+        fixture.write_archived_session(
+            "rollout-2026-05-10T02-47-18-archived.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-05-10T02:47:15.183Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5"
+                    }
+                }),
+                json!({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 90,
+                                "cached_input_tokens": 30,
+                                "output_tokens": 10,
+                                "total_tokens": 100
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let rows = load_daily_for_date(&expected_date, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["date"], expected_date);
+        assert_eq!(rows[0]["inputTokens"], 60);
+        assert_eq!(rows[0]["outputTokens"], 10);
+        assert_eq!(rows[0]["cacheReadTokens"], 30);
+        assert_eq!(rows[0]["totalTokens"], 100);
+        assert_eq!(rows[0]["modelsUsed"], json!(["gpt-5.5"]));
+    }
+
+    #[test]
     fn returns_empty_blocks_view() {
         let _guard = ENV_LOCK.lock().unwrap();
         let fixture = TestCodexHome::new();
@@ -830,21 +1642,32 @@ mod tests {
     struct TestCodexHome {
         root: PathBuf,
         previous_codex_home: Option<std::ffi::OsString>,
+        previous_codex_homes: Option<std::ffi::OsString>,
+        restores_env: bool,
     }
 
     impl TestCodexHome {
         fn new() -> Self {
+            let fixture = Self::new_without_env("token-usage-codex");
+            std::env::set_var("CODEX_HOME", &fixture.root);
+            fixture
+        }
+
+        fn new_without_env(prefix: &str) -> Self {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let root = std::env::temp_dir().join(format!("token-usage-codex-{now}"));
+            let root = std::env::temp_dir().join(format!("{prefix}-{now}"));
             fs::create_dir_all(root.join("sessions")).unwrap();
+            fs::create_dir_all(root.join("archived_sessions")).unwrap();
             let previous_codex_home = std::env::var_os("CODEX_HOME");
-            std::env::set_var("CODEX_HOME", &root);
+            let previous_codex_homes = std::env::var_os(CODEX_HOMES_ENV);
             Self {
                 root,
                 previous_codex_home,
+                previous_codex_homes,
+                restores_env: prefix == "token-usage-codex",
             }
         }
 
@@ -858,16 +1681,34 @@ mod tests {
                 .join("\n");
             fs::write(path, contents).unwrap();
         }
+
+        fn write_archived_session(&self, relative_path: &str, lines: &[Value]) {
+            let path = self.root.join("archived_sessions").join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let contents = lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(path, contents).unwrap();
+        }
     }
 
     impl Drop for TestCodexHome {
         fn drop(&mut self) {
-            if let Some(value) = &self.previous_codex_home {
-                std::env::set_var("CODEX_HOME", value);
-            } else {
-                std::env::remove_var("CODEX_HOME");
+            if self.restores_env {
+                restore_env("CODEX_HOME", self.previous_codex_home.clone());
+                restore_env(CODEX_HOMES_ENV, self.previous_codex_homes.clone());
             }
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
         }
     }
 }

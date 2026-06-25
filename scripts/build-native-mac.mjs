@@ -237,7 +237,7 @@ async function main() {
     env: { RUSTFLAGS: rustFlags },
   });
   await rm(join(nativeRoot, '.build', 'release', swiftResourceBundleName), { recursive: true, force: true });
-  run('swift', ['build', '-c', 'release'], { cwd: nativeRoot });
+  run('swift', ['build', '-c', 'release', '--disable-sandbox'], { cwd: nativeRoot });
 
   await rm(appPath, { recursive: true, force: true });
   await mkdir(macOSPath, { recursive: true });

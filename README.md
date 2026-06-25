@@ -11,7 +11,7 @@ The current native package targets Apple silicon and requires macOS 14.0 or late
 - Packaging scripts in `scripts` that bundle the Swift app and Rust backend into a `.app` or `.dmg`.
 - Local usage readers for supported sources such as Claude, Codex, OpenCode, Hermes, OpenClaw, Pi, and Factory Droid.
 
-The backend reads local tool data from user-owned directories and writes only application cache/log data under `~/Library/Application Support/Token Usage Dashboard`.
+The backend incrementally imports local tool data into `~/Library/Application Support/Token Usage Dashboard/usage-ledger.sqlite`. API responses are served from that SQLite ledger, so source transcript cleanup does not remove already imported historical token counts. Set `TOKEN_USAGE_LEDGER_PATH` to use a different local ledger path for debugging or tests.
 
 ## Requirements
 
@@ -150,7 +150,7 @@ The script refuses to notarize without a real signing identity so it does not ac
 
 ## Cleanup Commands
 
-The backend has a cleanup command for application-owned cache data. Always inspect first:
+The backend has a cleanup command for temporary application-owned files. Always inspect first:
 
 ```bash
 cargo run --release --manifest-path rust-backend/Cargo.toml -- cleanup --dry-run
@@ -162,7 +162,7 @@ Apply only after reviewing the dry run:
 cargo run --release --manifest-path rust-backend/Cargo.toml -- cleanup --apply
 ```
 
-Cleanup is intended for app-owned cache data only; it should not delete source records from Claude, Codex, OpenCode, Hermes, OpenClaw, or other tool-owned directories.
+Cleanup is intended for temporary app-owned files only; it should not delete the SQLite usage ledger or source records from Claude, Codex, OpenCode, Hermes, OpenClaw, or other tool-owned directories.
 
 ## Contract Comparison
 

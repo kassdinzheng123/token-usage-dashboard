@@ -1,6 +1,9 @@
 pub mod claude;
 pub mod codex;
-pub mod factory;
+pub mod cursor;
+pub mod cursor_api;
+pub mod cursorpp;
+pub mod grok;
 pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
@@ -20,7 +23,8 @@ pub enum LocalSource {
     Hermes,
     OpenClaw,
     Pi,
-    Factory,
+    Grok,
+    Cursor,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -33,8 +37,9 @@ impl TryFrom<&str> for LocalSource {
             "opencode" => Ok(Self::Opencode),
             "hermes" => Ok(Self::Hermes),
             "openclaw" => Ok(Self::OpenClaw),
-            "pi" => Ok(Self::Pi),
-            "factory" => Ok(Self::Factory),
+            "pi" | "oh-my-pi" | "ohmypi" | "omp" => Ok(Self::Pi),
+            "grok" => Ok(Self::Grok),
+            "cursor" | "cursorpp" => Ok(Self::Cursor),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -178,13 +183,10 @@ pub fn load_local_source(
         LocalSource::Pi => {
             return pi::load_source_view(view_name, _refresh).map_err(SourceError::Source);
         }
-        LocalSource::Factory => {
-            return factory::load_source_view(view_name, _refresh).map_err(SourceError::Source);
-        }
         LocalSource::OpenClaw => {
             return openclaw::load_source_view(view_name, _refresh).map_err(SourceError::Source);
         }
-        LocalSource::Hermes => {}
+        LocalSource::Hermes | LocalSource::Grok | LocalSource::Cursor => {}
     }
 
     if view == SourceView::Blocks {
@@ -197,8 +199,10 @@ pub fn load_local_source(
         | LocalSource::Opencode
         | LocalSource::OpenClaw
         | LocalSource::Pi
-        | LocalSource::Factory => unreachable!(),
+        => unreachable!(),
         LocalSource::Hermes => hermes::load_sessions()?,
+        LocalSource::Grok => grok::load_sessions()?,
+        LocalSource::Cursor => cursor::load_sessions()?,
     };
 
     Ok(match view {
@@ -261,7 +265,7 @@ fn sessions_to_sessions(sessions: &[LocalSession]) -> Vec<Value> {
                 "cacheReadTokens": session.cache_read_tokens,
                 "totalTokens": session.total_tokens(),
                 "totalCost": session.total_cost,
-                "modelsUsed": [session.model_name.clone()],
+                "modelsUsed": [cluster_model_name(&session.model_name)],
                 "modelBreakdowns": [model_breakdown(session)],
             })
         })
@@ -290,8 +294,9 @@ fn aggregate_sessions(
         group.total_tokens += session.total_tokens();
         group.total_cost += session.total_cost;
 
-        if !group.models_used.contains(&session.model_name) {
-            group.models_used.push(session.model_name.clone());
+        let clustered = cluster_model_name(&session.model_name);
+        if !group.models_used.contains(&clustered) {
+            group.models_used.push(clustered);
         }
         group.model_breakdowns.push(model_breakdown(session));
     }
@@ -301,7 +306,7 @@ fn aggregate_sessions(
 
 fn model_breakdown(session: &LocalSession) -> Value {
     json!({
-        "modelName": session.model_name.clone(),
+        "modelName": cluster_model_name(&session.model_name),
         "inputTokens": session.input_tokens,
         "outputTokens": session.output_tokens,
         "cacheCreationTokens": session.cache_creation_tokens,
@@ -320,6 +325,138 @@ fn sort_key(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default();
     format!("{date}T{time}")
+}
+
+/// Drops a leading provider prefix (`CPA/`, `cliproxy/`, `openrouter/foo/`, etc.).
+fn strip_provider_prefix(model_name: &str) -> &str {
+    model_name
+        .rsplit('/')
+        .next()
+        .filter(|suffix| !suffix.is_empty())
+        .unwrap_or(model_name)
+}
+
+/// `claude-{family}-4.8` and `claude-{family}-4-8` both become `claude-{family}-4-8`.
+fn canonical_claude_4x_segment(segment: &str) -> Option<String> {
+    let lower = segment.to_ascii_lowercase();
+    let after_claude = lower.strip_prefix("claude-")?;
+    let (family, version) = after_claude.split_once('-')?;
+    if family.is_empty() {
+        return None;
+    }
+    let (minor, suffix) = if let Some(rest) = version.strip_prefix("4.") {
+        take_ascii_digits(rest)
+    } else if let Some(rest) = version.strip_prefix("4-") {
+        take_ascii_digits(rest)
+    } else {
+        return None;
+    };
+    if minor.is_empty() {
+        return None;
+    }
+    Some(format!("claude-{family}-4-{minor}{suffix}"))
+}
+
+fn take_ascii_digits(s: &str) -> (String, &str) {
+    let minor: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let consumed = minor.len();
+    (minor, &s[consumed..])
+}
+
+fn canonicalize_claude_4x_in_string(model_name: &str) -> String {
+    let lower = model_name.to_ascii_lowercase();
+    let Some(idx) = lower.find("claude-") else {
+        return model_name.to_string();
+    };
+    let prefix = &model_name[..idx];
+    let segment = &lower[idx..];
+    let Some(canon) = canonical_claude_4x_segment(segment) else {
+        return model_name.to_string();
+    };
+    format!("{prefix}{canon}")
+}
+
+/// Normalizes a model name by matching against known canonical model names.
+/// Variants like `custom:deepseek-v4-flash` or `dqweqwe:deepseek-v4-pro21312421h43jk`
+/// are merged into the canonical base model name.
+pub(crate) fn cluster_model_name(model_name: &str) -> String {
+    let lowered = model_name.trim().to_ascii_lowercase();
+    if lowered == "zai-org/glm-5.2" || lowered == "zai-org/glm-5-2" {
+        return "glm-5.2".to_string();
+    }
+    let stripped = strip_provider_prefix(&lowered);
+    let mapped = if stripped.contains("ark-code-latest") || stripped == "ark-code" {
+        "glm-5.2"
+    } else if stripped.contains("glm-5.2") || stripped.contains("glm-5-2") {
+        "glm-5.2"
+    } else if stripped.contains("deepseek-v4-pro") {
+        "deepseek-v4-pro"
+    } else if stripped.contains("deepseek-v4-flash") {
+        "deepseek-v4-flash"
+    } else if stripped.contains("kimi-k2.6") {
+        "kimi-k2.6"
+    } else if stripped.contains("qwen3.6-plus") {
+        "qwen3.6-plus"
+    } else if stripped.contains("step-3.7-flash") {
+        "step-3.7-flash"
+    } else if stripped.contains("composer-2.5-fast") {
+        "composer-2.5-fast"
+    } else {
+        stripped
+    };
+    canonicalize_claude_4x_in_string(mapped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cluster_model_name, LocalSource};
+    use std::convert::TryFrom;
+
+    #[test]
+    fn cluster_model_name_maps_known_substrings() {
+        assert_eq!(
+            cluster_model_name("custom:deepseek-v4-flash"),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(cluster_model_name("3e12312kimi-k2.6213123"), "kimi-k2.6");
+        assert_eq!(cluster_model_name("foo/qwen3.6-plus-bar"), "qwen3.6-plus");
+        assert_eq!(cluster_model_name("zai-org/glm-5.2"), "glm-5.2");
+        assert_eq!(
+            cluster_model_name("openrouter/stepfun/step-3.7-flash-preview"),
+            "step-3.7-flash"
+        );
+        assert_eq!(
+            cluster_model_name("grok-composer-2.5-fast-extra"),
+            "composer-2.5-fast"
+        );
+        assert_eq!(cluster_model_name("CPA/ark-code-latest"), "glm-5.2");
+        assert_eq!(cluster_model_name("ark-code-latest"), "glm-5.2");
+        assert_eq!(cluster_model_name("glm-5.2-max"), "glm-5.2");
+        assert_eq!(cluster_model_name("z-ai/glm-5.2-preview"), "glm-5.2");
+        assert_eq!(cluster_model_name("glm-5-2-max"), "glm-5.2");
+        assert_eq!(cluster_model_name("cliproxy/gpt-5.5"), "gpt-5.5");
+        assert_eq!(cluster_model_name("other-model"), "other-model");
+        assert_eq!(cluster_model_name("GPT-5.5"), "gpt-5.5");
+        assert_eq!(cluster_model_name("OTHER-MODEL"), "other-model");
+        assert_eq!(cluster_model_name("Grok-Composer-2.5-Fast"), "composer-2.5-fast");
+    }
+
+    #[test]
+    fn cluster_model_name_canonicalizes_claude_4x_versions() {
+        assert_eq!(cluster_model_name("claude-opus-4.8"), "claude-opus-4-8");
+        assert_eq!(cluster_model_name("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(cluster_model_name("claude-opus-4.7"), "claude-opus-4-7");
+        assert_eq!(cluster_model_name("anthropic/claude-opus-4.8"), "claude-opus-4-8");
+        assert_eq!(cluster_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
+        assert_eq!(cluster_model_name("kiro-claude-opus-4.7"), "kiro-claude-opus-4-7");
+    }
+
+    #[test]
+    fn oh_my_pi_aliases_map_to_pi() {
+        assert_eq!(LocalSource::try_from("oh-my-pi").unwrap(), LocalSource::Pi);
+        assert_eq!(LocalSource::try_from("ohmypi").unwrap(), LocalSource::Pi);
+        assert_eq!(LocalSource::try_from("omp").unwrap(), LocalSource::Pi);
+    }
 }
 
 pub(crate) fn home_dir() -> Option<std::path::PathBuf> {

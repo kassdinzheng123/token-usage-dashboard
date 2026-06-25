@@ -1,5 +1,6 @@
 use crate::{
     cache::UsageCache,
+    ledger::UsageLedger,
     protocol::{
         RefreshResponse, Source, TodayModelRow, TodayResponse, TodaySourceRow, View, ALL_TASKS,
     },
@@ -19,13 +20,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
     str::FromStr,
     sync::Arc,
 };
 use tokio::sync::{Mutex, Semaphore};
 use tower_http::compression::CompressionLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub type ProviderResult = Result<Vec<Value>, String>;
 pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = ProviderResult> + Send + 'a>>;
@@ -59,14 +61,18 @@ impl SourceProvider for EmptyProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LocalSourceProvider {
     source: Source,
+    ledger_path: Option<PathBuf>,
 }
 
 impl LocalSourceProvider {
     pub fn new(source: Source) -> Self {
-        Self { source }
+        Self {
+            source,
+            ledger_path: None,
+        }
     }
 }
 
@@ -80,10 +86,28 @@ impl SourceProvider for LocalSourceProvider {
 
     fn load<'a>(&'a self, view: View, refresh: bool) -> ProviderFuture<'a> {
         let source = self.source;
+        let ledger_path = self.ledger_path.clone();
         Box::pin(async move {
+            if uses_direct_period_rows(source, view) {
+                return tokio::task::spawn_blocking(move || {
+                    sources::load_source_view(&source.to_string(), &view.to_string(), refresh)
+                        .map_err(|err| err.to_string())
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+            }
+
             tokio::task::spawn_blocking(move || {
-                sources::load_source_view(&source.to_string(), &view.to_string(), refresh)
-                    .map_err(|err| err.to_string())
+                let ledger = open_usage_ledger(ledger_path)?;
+                let _ = refresh;
+                if let Err(err) = ingest_source_into_ledger(&ledger, source) {
+                    warn!(
+                        source = %source,
+                        error = %err,
+                        "ledger ingest failed; serving persisted rows"
+                    );
+                }
+                ledger.load_view(source, view)
             })
             .await
             .map_err(|err| err.to_string())?
@@ -92,31 +116,68 @@ impl SourceProvider for LocalSourceProvider {
 
     fn load_today_daily<'a>(&'a self, date: &'a str, refresh: bool) -> ProviderFuture<'a> {
         let source = self.source;
+        let ledger_path = self.ledger_path.clone();
         let date = date.to_owned();
         Box::pin(async move {
-            let rows = tokio::task::spawn_blocking(move || match source {
-                Source::Claude => sources::claude::load_daily_for_date(&date, refresh)
-                    .map_err(|err| err.to_string()),
-                Source::Codex => sources::codex::load_daily_for_date(&date, refresh)
-                    .map_err(|err| err.to_string()),
-                Source::Opencode => sources::opencode::load_daily_for_date(&date, refresh)
-                    .map_err(|err| err.to_string()),
-                Source::Hermes | Source::Openclaw | Source::Pi | Source::Factory => {
-                    let rows = sources::load_source_view(&source.to_string(), "daily", refresh)
-                        .map_err(|err| err.to_string())?;
-                    Ok(rows
+            if source == Source::Codex {
+                return tokio::task::spawn_blocking(move || {
+                    sources::codex::load_daily_for_date(&date, refresh)
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+            }
+
+            let rows = tokio::task::spawn_blocking(move || {
+                let ledger = open_usage_ledger(ledger_path)?;
+                let _ = refresh;
+                if let Err(err) = ingest_source_into_ledger(&ledger, source) {
+                    warn!(
+                        source = %source,
+                        error = %err,
+                        "ledger ingest failed; serving persisted rows"
+                    );
+                }
+                Ok::<Vec<Value>, String>(
+                    ledger
+                        .load_view(source, View::Daily)?
                         .into_iter()
                         .filter(|row| {
                             row.get("date").and_then(Value::as_str) == Some(date.as_str())
                         })
-                        .collect())
-                }
+                        .collect(),
+                )
             })
             .await
             .map_err(|err| err.to_string())??;
             Ok(rows)
         })
     }
+}
+
+fn uses_direct_period_rows(source: Source, view: View) -> bool {
+    source == Source::Codex && matches!(view, View::Daily | View::Monthly)
+}
+
+fn open_usage_ledger(path: Option<PathBuf>) -> Result<UsageLedger, String> {
+    match path {
+        Some(path) => UsageLedger::new(path),
+        None => UsageLedger::default(),
+    }
+}
+
+fn ingest_source_into_ledger(ledger: &UsageLedger, source: Source) -> Result<(), String> {
+    let source_name = source.to_string();
+    let sessions =
+        sources::load_source_view(&source_name, "sessions", true).map_err(|err| err.to_string())?;
+    ledger.ingest_live_sessions(source, &sessions)?;
+
+    if source == Source::Claude {
+        let blocks = sources::load_source_view(&source_name, "blocks", true)
+            .map_err(|err| err.to_string())?;
+        ledger.ingest_live_blocks(source, &blocks)?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -628,7 +689,8 @@ fn today_task_key(source: Source) -> Option<&'static str> {
         Source::Hermes => Some("hermes:today"),
         Source::Openclaw => Some("openclaw:today"),
         Source::Pi => Some("pi:today"),
-        Source::Factory => Some("factory:today"),
+        Source::Grok => Some("grok:today"),
+        Source::Cursor => Some("cursor:today"),
     }
 }
 
@@ -1053,12 +1115,18 @@ mod tests {
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
     };
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        fs,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+        },
+        time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::Notify;
     use tower::ServiceExt;
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[derive(Debug, Clone)]
     struct StaticProvider {
@@ -1689,6 +1757,126 @@ mod tests {
         assert_eq!(provider.daily_calls(), 1);
     }
 
+    #[tokio::test]
+    async fn local_provider_reads_persisted_ledger_after_source_files_disappear() {
+        let ledger = UsageLedger::new(temp_ledger_path()).unwrap();
+        let source = Source::Codex;
+
+        let raw_sessions = vec![json!({
+            "sessionId": "rollout-2026-06-01",
+            "date": "2026-06-01",
+            "time": "10:00",
+            "inputTokens": 80,
+            "outputTokens": 30,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 20,
+            "totalTokens": 130,
+            "totalCost": 0.12,
+            "modelsUsed": ["gpt-5.5"],
+            "modelBreakdowns": [{
+                "modelName": "gpt-5.5",
+                "inputTokens": 80,
+                "outputTokens": 30,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 20,
+                "cost": 0.12
+            }]
+        })];
+
+        ledger
+            .upsert_view_rows(source, View::Sessions, &raw_sessions)
+            .unwrap();
+        let imported = ledger.load_view(source, View::Daily).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0]["date"], "2026-06-01");
+        assert_eq!(imported[0]["totalTokens"], 130);
+
+        let persisted = ledger.load_view(source, View::Daily).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0]["date"], "2026-06-01");
+        assert_eq!(persisted[0]["totalTokens"], 130);
+    }
+
+    #[tokio::test]
+    async fn local_codex_daily_bypasses_session_ledger_rollup() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let codex_home = temp_codex_home();
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(
+            sessions_dir.join("cross-day.jsonl"),
+            [
+                json!({
+                    "timestamp": "2026-06-01T12:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "model_name": "gpt-5-codex",
+                            "total_token_usage": {
+                                "input_tokens": 120,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 50,
+                                "total_tokens": 170
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 120,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 50,
+                                "total_tokens": 170
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-06-02T12:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "model_name": "gpt-5-codex",
+                            "total_token_usage": {
+                                "input_tokens": 200,
+                                "cached_input_tokens": 35,
+                                "output_tokens": 80,
+                                "total_tokens": 280
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_codex_homes = std::env::var_os("TOKEN_USAGE_CODEX_HOMES");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::remove_var("TOKEN_USAGE_CODEX_HOMES");
+
+        let provider = LocalSourceProvider {
+            source: Source::Codex,
+            ledger_path: Some(temp_ledger_path()),
+        };
+        let daily = provider.load(View::Daily, true).await.unwrap();
+        let second_day = provider.load_today_daily("2026-06-02", true).await.unwrap();
+
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("TOKEN_USAGE_CODEX_HOMES", previous_codex_homes);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(daily.len(), 2);
+        assert_eq!(daily[0]["date"], "2026-06-01");
+        assert_eq!(daily[0]["totalTokens"], 170);
+        assert_eq!(daily[1]["date"], "2026-06-02");
+        assert_eq!(daily[1]["totalTokens"], 110);
+        assert_eq!(second_day.len(), 1);
+        assert_eq!(second_day[0]["date"], "2026-06-02");
+        assert_eq!(second_day[0]["totalTokens"], 110);
+    }
+
     #[test]
     fn filters_daily_and_monthly_ranges() {
         let data = vec![
@@ -1704,5 +1892,31 @@ mod tests {
                 json!({ "month": "2026-02" })
             ]
         );
+    }
+
+    fn temp_ledger_path() -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("token-usage-provider-ledger-{stamp}"))
+            .join("usage-ledger.sqlite")
+    }
+
+    fn temp_codex_home() -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("token-usage-server-codex-{stamp}"))
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 }

@@ -311,8 +311,9 @@ fn aggregate_sessions(
             group.latest_time = session.time.clone();
         }
 
-        if !group.models_used.contains(&session.model_name) {
-            group.models_used.push(session.model_name.clone());
+        let clustered = super::cluster_model_name(&session.model_name);
+        if !group.models_used.contains(&clustered) {
+            group.models_used.push(clustered);
         }
         group.model_breakdowns.push(model_breakdown(session));
     }
@@ -337,7 +338,7 @@ struct OpenClawAggregate {
 
 fn model_breakdown(session: &LocalSession) -> Value {
     json!({
-        "modelName": session.model_name.clone(),
+        "modelName": super::cluster_model_name(&session.model_name),
         "inputTokens": session.input_tokens,
         "outputTokens": session.output_tokens,
         "cacheCreationTokens": session.cache_creation_tokens,

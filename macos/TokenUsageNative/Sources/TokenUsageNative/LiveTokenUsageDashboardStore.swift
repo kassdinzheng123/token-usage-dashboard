@@ -21,6 +21,7 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     private var isTodayRefreshInFlight = false
     private var dashboardWarmTask: Task<Void, Never>?
     private var dashboardCacheRefreshTask: Task<Void, Never>?
+    private var dashboardCacheRefreshTasks: [DashboardRecordRequest: Task<Void, Never>] = [:]
     private var backendPollerTask: Task<Void, Never>?
     private var activeDashboardRequest: DashboardRecordRequest?
     private let dashboardRecordsCache: DashboardRecordsCache
@@ -42,6 +43,7 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     deinit {
         dashboardWarmTask?.cancel()
         dashboardCacheRefreshTask?.cancel()
+        dashboardCacheRefreshTasks.values.forEach { $0.cancel() }
         backendPollerTask?.cancel()
     }
 
@@ -182,22 +184,39 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     }
 
     private func refreshDashboardCacheInBackground(request: DashboardRecordRequest) {
-        Task { [weak self, dashboardRecordsCache] in
+        guard dashboardCacheRefreshTasks[request] == nil else {
+            return
+        }
+
+        let task = Task { [weak self, dashboardRecordsCache] in
+            defer {
+                Task { @MainActor in
+                    self?.dashboardCacheRefreshTasks[request] = nil
+                }
+            }
+
             do {
                 try await self?.serverProcess.ensureRunning()
+                guard !Task.isCancelled else { return }
                 guard let refreshedRecords = try await dashboardRecordsCache.refreshIncrementally(for: request) else {
                     return
                 }
                 await MainActor.run {
-                    guard self?.activeDashboardRequest == request else {
+                    guard let self else { return }
+                    guard self.activeDashboardRequest == request else {
                         return
                     }
-                    self?.records = refreshedRecords
+                    guard self.records != refreshedRecords else {
+                        return
+                    }
+                    self.records = refreshedRecords
                 }
             } catch {
                 // Stale dashboard cache is preferable to surfacing background refresh noise.
             }
         }
+
+        dashboardCacheRefreshTasks[request] = task
     }
 
     private func dashboardRecordRequest() -> DashboardRecordRequest {
@@ -300,10 +319,19 @@ private struct DashboardRecordsSnapshot: Sendable {
 private struct DashboardRecordsCacheEntry: Sendable {
     let records: [TokenUsageRecord]
     let refreshedAt: Date
+    var lastAccessed: Date
+
+    init(records: [TokenUsageRecord], refreshedAt: Date = Date(), lastAccessed: Date? = nil) {
+        self.records = records
+        self.refreshedAt = refreshedAt
+        self.lastAccessed = lastAccessed ?? refreshedAt
+    }
 }
 
 private actor DashboardRecordsCache {
     static let refreshIntervalNanoseconds: UInt64 = 5 * 60 * 1_000_000_000
+    private static let maximumEntryAge: TimeInterval = 30 * 60
+    private static let maximumEntryCount = 24
 
     private let client: TokenUsageAPIClient
     private var entries: [DashboardRecordRequest: DashboardRecordsCacheEntry] = [:]
@@ -314,9 +342,12 @@ private actor DashboardRecordsCache {
     }
 
     func snapshot(for request: DashboardRecordRequest) -> DashboardRecordsSnapshot? {
-        guard let entry = entries[request] else {
+        pruneEntries()
+        guard var entry = entries[request] else {
             return nil
         }
+        entry.lastAccessed = Date()
+        entries[request] = entry
 
         return DashboardRecordsSnapshot(
             records: entry.records,
@@ -325,7 +356,10 @@ private actor DashboardRecordsCache {
     }
 
     func records(for request: DashboardRecordRequest, force: Bool) async throws -> [TokenUsageRecord] {
-        if !force, let entry = entries[request], Self.isFresh(entry) {
+        pruneEntries()
+        if !force, var entry = entries[request], Self.isFresh(entry) {
+            entry.lastAccessed = Date()
+            entries[request] = entry
             return entry.records
         }
 
@@ -342,6 +376,7 @@ private actor DashboardRecordsCache {
             let records = try await task.value
             entries[request] = DashboardRecordsCacheEntry(records: records, refreshedAt: Date())
             inFlightRequests[request] = nil
+            pruneEntries(protecting: request)
             return records
         } catch {
             inFlightRequests[request] = nil
@@ -350,9 +385,12 @@ private actor DashboardRecordsCache {
     }
 
     func refreshIncrementally(for request: DashboardRecordRequest) async throws -> [TokenUsageRecord]? {
-        guard let entry = entries[request], request.viewMode != .sessions else {
+        pruneEntries()
+        guard var entry = entries[request], request.viewMode != .sessions else {
             return nil
         }
+        entry.lastAccessed = Date()
+        entries[request] = entry
 
         if let inFlightRequest = inFlightRequests[request] {
             return try await inFlightRequest.value
@@ -371,10 +409,28 @@ private actor DashboardRecordsCache {
             let records = try await task.value
             entries[request] = DashboardRecordsCacheEntry(records: records, refreshedAt: Date())
             inFlightRequests[request] = nil
+            pruneEntries(protecting: request)
             return records
         } catch {
             inFlightRequests[request] = nil
             throw error
+        }
+    }
+
+    private func pruneEntries(protecting protectedRequest: DashboardRecordRequest? = nil) {
+        let now = Date()
+        entries = entries.filter { request, entry in
+            request == protectedRequest || now.timeIntervalSince(entry.lastAccessed) < Self.maximumEntryAge
+        }
+
+        while entries.count > Self.maximumEntryCount {
+            let oldestRequest = entries
+                .filter { request, _ in request != protectedRequest }
+                .min { left, right in left.value.lastAccessed < right.value.lastAccessed }?
+                .key
+
+            guard let oldestRequest else { break }
+            entries.removeValue(forKey: oldestRequest)
         }
     }
 
@@ -707,7 +763,7 @@ private actor DashboardRecordsCache {
 }
 
 private extension TokenUsageSource {
-    static let apiSources: [TokenUsageSource] = [.claude, .codex, .opencode, .hermes, .openclaw, .pi, .factory]
+    static let apiSources: [TokenUsageSource] = [.claude, .codex, .opencode, .hermes, .openclaw, .pi, .grok, .cursor]
 
     var apiSource: UsageSource {
         switch self {
@@ -725,8 +781,10 @@ private extension TokenUsageSource {
             .openclaw
         case .pi:
             .pi
-        case .factory:
-            .factory
+        case .grok:
+            .grok
+        case .cursor:
+            .cursor
         }
     }
 }

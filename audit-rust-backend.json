@@ -1,0 +1,123 @@
+{
+  "status": "completed",
+  "findings": [
+    {
+      "severity": "critical",
+      "type": "auth_gap",
+      "file": "rust-backend/src/server.rs",
+      "line": 119,
+      "code": "Router::new()\n    .route(\"/api/health\", get(health_handler))\n    .route(\"/api/refresh\", get(refresh_handler))\n    .route(\"/api/today\", get(today_handler))\n    .route(\"/api/{source}/{view}\", get(source_view_handler))\n    .layer(CompressionLayer::new())\n    .with_state(state)",
+      "issue": "No authentication or authorization on any endpoint. All four API routes are publicly accessible without any token, API key, or session validation. The /api/refresh endpoint allows any caller to trigger expensive cache refreshes across 22 data sources. The /api/{source}/{view} endpoints expose the complete usage data (token counts, costs, model names, session IDs) with no access control.",
+      "remediation": "Add authentication middleware (e.g., bearer token from an env var, or integrate with an auth provider). At minimum, protect the /api/refresh endpoint with an admin-only token check. Consider adding a read-only API key for data access endpoints."
+    },
+    {
+      "severity": "high",
+      "type": "http_security",
+      "file": "rust-backend/src/server.rs",
+      "line": 119,
+      "code": "Router::new()\n    .route(\"/api/health\", get(health_handler))\n    .route(\"/api/refresh\", get(refresh_handler))\n    .route(\"/api/today\", get(today_handler))\n    .route(\"/api/{source}/{view}\", get(source_view_handler))\n    .layer(CompressionLayer::new())\n    .with_state(state)",
+      "issue": "No CORS configuration and no security headers. CORS defaults in axum allow all origins (Access-Control-Allow-Origin: *). Missing security headers: Content-Security-Policy, X-Content-Type-Options, X-Frame-Options, Strict-Transport-Security. The only middleware applied is CompressionLayer. If this server is exposed beyond localhost (the --port flag or behind a reverse proxy), it is fully open to cross-origin requests from any website.",
+      "remediation": "Add tower-http CORS layer with explicit allowed origins (or restrict to same-origin). Add SecurityHeaders layer with CSP, HSTS, X-Content-Type-Options: nosniff, X-Frame-Options: DENY. Consider adding a request ID header and rate-limiting middleware."
+    },
+    {
+      "severity": "high",
+      "type": "dos_vector",
+      "file": "rust-backend/src/server.rs",
+      "line": 204,
+      "code": "async fn refresh_handler(State(state): State<AppState>) -> Json<RefreshResponse> {\n    tokio::spawn(async move {\n        state.refresh_all(false).await;\n    });\n    Json(RefreshResponse { status: \"refreshing\" })\n}",
+      "issue": "Unauthenticated DoS via /api/refresh. Any caller can trigger a full cache refresh that spawns concurrent tasks to reload ALL_TASKS (22 data sources) plus clears today_cache. Each task performs file I/O (reading JSONL/SQLite databases) and, for sources like OpenCode, may open/query SQLite databases and compute aggregate queries. With REFRESH_CONCURRENCY=4, this creates significant disk I/O and CPU load. Repeated requests (even at low frequency) prevent cache from settling, degrading server responsiveness.",
+      "remediation": "Require authentication for /api/refresh. Add a debounce/cooldown: ignore refresh requests if one completed within the last 30 seconds. Return 429 Too Many Requests under sustained load."
+    },
+    {
+      "severity": "high",
+      "type": "ssrf",
+      "file": "rust-backend/src/pricing/mod.rs",
+      "line": 55,
+      "code": "fn fetch_pricing_map(url: &str) -> Result<HashMap<String, ModelPricing>, String> {\n    let client = reqwest::blocking::Client::builder()\n        .timeout(Duration::from_secs(PRICING_HTTP_TIMEOUT_SECS))\n        .build()\n        .map_err(|err| err.to_string())?;\n    let text = client\n        .get(url)\n        .send()\n        .map_err(|err| err.to_string())?\n        .error_for_status()\n        .map_err(|err| err.to_string())?\n        .text()\n        .map_err(|err| err.to_string())?;",
+      "issue": "Blocking HTTP client fetches from external URLs without TLS verification configuration. While URLs are hardcoded constants (github.com and llm-prices.com), the blocking reqwest client is invoked from async context. In refresh_pricing_for_model() (line ~213), this blocks the async runtime thread pool when a new model name triggers a pricing fetch. The fetched JSON is parsed via serde_json::from_str<Value> which could consume arbitrary memory for a maliciously crafted response (the pricing response could be very large with deeply nested objects). No user agent is set.",
+      "remediation": "Make HTTP client async (reqwest::Client, not blocking). Configure TLS certificate verification explicitly. Set a size limit on the response body (e.g., content-length check or streaming with a cap). Add a User-Agent header. Consider using tokio::task::spawn_blocking for the blocking call if kept."
+    },
+    {
+      "severity": "medium",
+      "type": "dos_vector",
+      "file": "rust-backend/src/pricing/mod.rs",
+      "line": 156,
+      "code": "fn candidates_for(model: &str) -> Vec<String> {\n    let mut candidates = HashSet::new();\n    add_candidate(&mut candidates, model);\n    // ... generates 50+ candidate variations from prefixes, aliases, provider variants ...",
+      "issue": "Exponential candidate expansion for model name lookup. The candidates_for() function generates ~50+ candidate strings for a single model name by iterating through 15+ prefixes, provider variants, Fireworks router variants, alias resolutions, and custom-stripped variants. Each candidate is added with multiple normalizations (colon/hyphen/dot replacements). This function is called on every model_cost_usd() invocation. While currently acceptable for normal token count sizes, a crafted request with many unique model names could cause significant CPU/memory allocation.",
+      "remediation": "Add a cache for model → pricing lookups to avoid re-computing candidates for repeated model names. Consider pre-computing a trie-index pricing lookup structure at startup instead of linear candidate generation per call."
+    },
+    {
+      "severity": "medium",
+      "type": "information_leak",
+      "file": "rust-backend/src/server.rs",
+      "line": 325,
+      "code": "fn number_f64(row: &Value, field: &str) -> f64 {\n    row.get(field)\n        .and_then(|value| {\n            value\n                .as_f64()\n                .or_else(|| value.as_i64().map(|value| value as f64))\n                .or_else(|| value.as_u64().map(|value| value as f64))\n        })\n        .unwrap_or_default()\n}",
+      "issue": "The error handling path in today_rows_for_source returns internal errors via the SourceError type. When a source provider fails, the error message (which may include file paths from fs::read_dir errors, JSON parse errors, or rusqlite errors) is logged server-side. However, some error paths propagate error descriptions as strings that could contain path information from format strings like format!(\"failed to read {}: {err}\", dir.display()). These show up in server logs, which if exposed could leak filesystem structure.",
+      "remediation": "Ensure all error messages logged server-side use a safe representation. Strip file paths from user-visible log outputs if logs are aggregated externally. Consider structured logging with error types rather than string formatting."
+    },
+    {
+      "severity": "medium",
+      "type": "dos_vector",
+      "file": "rust-backend/src/server.rs",
+      "line": 685,
+      "code": "async fn source_view_handler(\n    State(state): State<AppState>,\n    Path((source, view)): Path<(String, String)>,\n    Query(query): Query<DataQuery>,\n) -> Response {\n    let Ok(source) = Source::from_str(&source) else {\n        return not_found(\"unknown source\");\n    };\n    let Ok(view) = View::from_str(&view) else {\n        return not_found(\"unknown view\");\n    };\n    let force = query.refresh.as_deref() == Some(\"true\");\n    let refreshed_incrementally = force\n        && view == View::Daily\n        && state\n            .refresh_daily_range(source, query.since.as_deref(), query.until.as_deref())\n            .await;",
+      "issue": "The query_date_range function (line 758) accepts user-supplied since/until strings and parses them as dates. While it limits to 45 dates, the compact_to_iso() function (line 775) does string slicing without validating that the substrings are valid numeric components. An input like \"99999999\" passes the ascii_digit check and becomes \"9999-99-99\", which NaiveDate::parse_from_str rejects harmlessly (returns None). A very long (non-date) string like \"AAAAAAA\" bypasses the 8-char codepath and passes through as-is to parse, which rejects. No crash path exists, but a crafted 7-character all-digit string would not enter the 8-char branch and could be parsed as an unexpected date format. Additionally, before calling today_summary, query_date_range calls load_today_daily for each date (up to 45 times), each potentially performing I/O.",
+      "remediation": "Add input validation on since/until: enforce a maximum string length (e.g., 10 chars for YYYY-MM-DD, 8 for compact). Validate the string format matches ^\\d{4}-\\d{2}-\\d{2}$ or ^\\d{8}$ before processing. Consider rate-limiting per-source refresh operations."
+    },
+    {
+      "severity": "medium",
+      "type": "race_condition",
+      "file": "rust-backend/src/server.rs",
+      "line": 571,
+      "code": "let today_cache_key = (source, date.to_owned());\nif !force {\n    if let Some(rows) = self.today_cache.lock().await.get(&today_cache_key).cloned() {\n        return rows;\n    }\n}\n// ... other checks ...\nlet _guard = refresh_lock.lock().await;\n\nif let Some(key) = task_key(source, View::Daily) {\n    if !force && self.cache.has(key).await {\n        return self.cache.get(key).await;\n    }\n}\nif !force {\n    if let Some(rows) = self.today_cache.lock().await.get(&today_cache_key).cloned() {\n        return rows;\n    }\n}",
+      "issue": "TOCTOU race window in today_rows_for_source between today_cache check (line 577, lock released) and the re-check after refresh_lock acquisition (line 590, lock re-acquired). Between these two operations, a concurrent request for the same (source, date) pair could have cached the data, resulting in duplicate work. While this does not cause data corruption (the second write just overwrites), it wastes resources.",
+      "remediation": "Keep today_cache lock held across the check-and-refresh boundary, or restructure to hold one lock for the entire critical section. Alternatively, set a in-flight flag to deduplicate concurrent requests for the same (source, date) pair."
+    },
+    {
+      "severity": "medium",
+      "type": "dos_vector",
+      "file": "rust-backend/src/server.rs",
+      "line": 494,
+      "code": "pub async fn today_summary(&self, force: bool) -> TodayResponse {\n    let today = Local::now().format(\"%Y-%m-%d\").to_string();\n    // ...\n    for source in Source::ALL {\n        let state = self.clone();\n        let today = today.clone();\n        handles.push(tokio::spawn(async move {\n            let rows = state.today_rows_for_source(source, &today, force).await;\n            (source, rows)\n        }));\n    }\n    for handle in handles {\n        let Ok((source, rows)) = handle.await else { continue; };\n        // Iterates ALL rows for the source to filter and aggregate",
+      "issue": "The today_summary() handler spawns one tokio task per source (7 tasks) and then iterates all rows returned (which can be many thousands for sources with cross-day sessions). When force=true, this triggers a full daily data load for every source, causing significant I/O and computation. Each concurrent request to /api/today?refresh=true could independently trigger these operations.",
+      "remediation": "Add a rate limiter or caching layer for the today endpoint. Consider debouncing refresh requests within a short window (e.g., 5 seconds). Return stale data with a warning header rather than recalculating for every request."
+    },
+    {
+      "severity": "low",
+      "type": "information_leak",
+      "file": "rust-backend/src/sources/factory.rs",
+      "line": 70,
+      "code": "fn collect_settings_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {\n    let entries = match fs::read_dir(dir) {\n        Ok(entries) => entries,\n        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),\n        Err(err) => return Err(format!(\"failed to read {}: {err}\", dir.display())),\n    };",
+      "issue": "Error messages in factory.rs and other source modules include the full file system path in the error string (e.g., format!(\"failed to read {}: {err}\", dir.display())). While these errors are returned as Strings and currently only logged server-side, if the error handling path changes or if errors are propagated to HTTP responses, file paths would be leaked to clients, revealing the user's filesystem structure.",
+      "remediation": "Use structured error types that separate the display message (safe) from the internal file path (logged separately). Avoid embedding full paths in user-facing error strings."
+    },
+    {
+      "severity": "low",
+      "type": "memory_safety",
+      "file": "rust-backend/src/sources/opencode.rs",
+      "line": 840,
+      "code": "fn try_prepare_opencode_indexes(db_path: &Path) {\n    let Ok(connection) = Connection::open_with_flags(\n        db_path,\n        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,\n    ) else {\n        return;\n    };\n\n    let _ = connection.execute_batch(\n        r#\"\n        CREATE INDEX IF NOT EXISTS idx_token_usage_message_time_created\n        ON message(time_created)\n        WHERE data IS NOT NULL;\n        \"#\n    );\n}",
+      "issue": "Opens the OpenCode SQLite database with READ_WRITE flags to create indexes. While the path is determined from OpenCode's expected directory structure (not user-controllable), this write access to a third-party application's SQLite database is risky. Concurrent writes by OpenCode could cause SQLITE_BUSY errors or database corruption. Additionally, the execute_batch could fail silently (the _ = pattern discards the error). Error path drops the connection without explicit close.",
+      "remediation": "Open the connection READ_ONLY after the index creation attempt, or check if the index exists before attempting write. Handle the execute_batch error with at least a log message. Consider dropping the connection explicitly after index creation."
+    },
+    {
+      "severity": "low",
+      "type": "input_validation",
+      "file": "rust-backend/src/server.rs",
+      "line": 775,
+      "code": "fn compact_to_iso(value: &str) -> String {\n    if value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit()) {\n        format!(\"{}-{}-{}\", &value[0..4], &value[4..6], &value[6..8])\n    } else {\n        value.to_owned()\n    }",
+      "issue": "The compact_to_iso function slices the string at indices 0..4, 4..6, 6..8 without validating that the string is exactly 8 ASCII digits. While the length check and is_ascii_digit() guard against non-numeric content, there is no validation that the resulting date components form a valid date (e.g., month 00 or day 32 would pass through but be rejected by NaiveDate::parse_from_str later). An input like \"19990000\" becomes \"1999-00-00\" which is invalid but flows through the entire code path before rejection.",
+      "remediation": "Combine compact_to_iso with date validation in one step: validate that month is 01-12 and day is valid for the month before returning a formatted string. Alternatively, use chrono's NaiveDate::parse_from_str with a custom format that handles both compact and ISO formats."
+    },
+    {
+      "severity": "low",
+      "type": "information_leak",
+      "file": "rust-backend/src/server.rs",
+      "line": 121,
+      "code": "pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {\n    let listener = tokio::net::TcpListener::bind(addr).await?;\n    let local_addr = listener.local_addr()?;\n    info!(\"Server running on http://{}\", local_addr);",
+      "issue": "The default bind address is 127.0.0.1 (localhost), which provides network isolation. However, serve_from_env reads the PORT env var and binds to 127.0.0.1 with that port. There is no validation that the port is within the ephemeral range or a reasonable range (0-65535). The unwrap_or(3456) default is fine, but a misconfigured PORT env var (e.g., a very high port number or zero) could bind unexpectedly. u16::parse already validates range, so this is a minor concern.",
+      "remediation": "Add a log warning when binding to a non-loopback address. Consider validating that the port is not 0. Add configuration for BIND_ADDRESS to allow non-localhost binding explicitly."
+    }
+  ],
+  "summary": "The Rust backend has a clear privilege separation issue: it is designed as a local-only dashboard server (binds to 127.0.0.1 by default) but exposes all endpoints without any authentication, CORS hardening, or security headers. The lack of auth is the single most critical finding — any process on the same machine can read all usage data and trigger expensive refresh operations. The server is otherwise well-constructed: SQL injection is fully prevented through parameterized queries, path traversal through route params is impossible (strict enum parsing), memory growth is bounded in caches (max 500 entries, 56 today-cache entries), and error messages are generally sanitized for HTTP responses. The pricing module's use of a blocking HTTP client from async context is a design concern that could block the runtime. The most impactful fixes are: (1) add authentication middleware, (2) add CORS and security headers, (3) require auth or rate-limit the /api/refresh endpoint, (4) make pricing HTTP calls async with body size limits."
+}
