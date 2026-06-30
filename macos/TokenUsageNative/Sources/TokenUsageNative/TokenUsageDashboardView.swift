@@ -35,6 +35,7 @@ private let tokenTrendSourceColors: [String: Color] = [
     TokenUsageSource.pi.label:       colorCoral.primary,
     TokenUsageSource.grok.label:     colorSlate.primary,
     TokenUsageSource.cursor.label: colorSlate.primary,
+    TokenUsageSource.cherry.label: colorRose.light,
 ]
 
 // Model trend chart palette (single-source view): primary shades from each family
@@ -70,6 +71,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case pi
     case grok
     case cursor
+    case cherry
 
     public var id: String { rawValue }
 
@@ -84,6 +86,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
         case .pi: "Pi Agent"
         case .grok: "Grok CLI"
         case .cursor: "Cursor"
+        case .cherry: "Cherry Studio"
         }
     }
 }
@@ -2428,7 +2431,10 @@ private struct ProviderMetadata {
         if model.contains("gemini") || model.contains("google") {
             return ProviderMetadata(label: "Gemini", abbreviation: "GM", color: colorViolet.primary, imageAssetName: "gemini-mark", preservesOriginalImageColor: true)
         }
-        if model.contains("grok") || model.contains("composer-2.5-fast") || model.contains("composer-2-5-fast") || model.contains("xai") || model.contains("x.ai") || model.contains("x-ai") {
+        if model.contains("composer-2.5") || model.contains("composer-2-5") {
+            return ProviderMetadata(label: "Cursor", abbreviation: "CR", color: colorSlate.primary, imageAssetName: "cursor-mark", preservesOriginalImageColor: true)
+        }
+        if model.contains("grok") || model.contains("xai") || model.contains("x.ai") || model.contains("x-ai") {
             return ProviderMetadata(label: "Grok", abbreviation: "GK", color: colorSlate.dark, imageAssetName: "grok-mark")
         }
         if model.contains("stepfun") || model.contains("step-3") {
@@ -3703,10 +3709,12 @@ func displayModelName(_ modelName: String) -> String {
         displayName = "glm-5.2"
     } else if normalized.contains("step-3.7-flash") {
         displayName = "step-3.7-flash"
-    } else if normalized.contains("composer-2.5-fast") {
+    } else if normalized.contains("composer-2.5-fast") || normalized.contains("composer-2-5-fast") {
         displayName = "composer-2.5-fast"
     } else if normalized.contains("grok-composer-2.5-fast") || normalized.contains("grok-composer-2-5-fast") {
         displayName = "composer-2.5-fast"
+    } else if normalized.contains("composer-2.5") || normalized.contains("composer-2-5") {
+        displayName = "composer-2.5"
     } else if modelName.localizedCaseInsensitiveContains("kiro-claude-opus-4.7")
         || modelName.localizedCaseInsensitiveContains("kiro-claude-opus-4-7") {
         displayName = "kiro-claude-opus-4-7"
@@ -3737,6 +3745,7 @@ extension TokenUsageSource {
         case .pi: .pi
         case .grok: .grok
         case .cursor: .cursor
+        case .cherry: .cherry
         }
     }
 
@@ -3755,6 +3764,7 @@ extension TokenUsageSource {
         case .pi: "p.circle"
         case .grok: "sparkles"
         case .cursor: "cursorarrow.rays"
+        case .cherry: "leaf"
         }
     }
 
@@ -3769,12 +3779,13 @@ extension TokenUsageSource {
         case .pi: "pi-mark"
         case .grok: "grok-mark"
         case .cursor: "cursor-mark"
+        case .cherry: "cherrystudio-mark"
         }
     }
 
     var iconBadgeBackgroundColor: Color {
         switch self {
-        case .codex, .opencode:
+        case .codex, .opencode, .cherry:
             .clear
         default:
             tintColor.opacity(0.12)
@@ -3801,6 +3812,7 @@ extension UsageSource {
         case .pi: "p.circle"
         case .grok: "sparkles"
         case .cursor: "cursorarrow.rays"
+        case .cherry: "leaf"
         }
     }
 
@@ -3814,12 +3826,13 @@ extension UsageSource {
         case .pi: "pi-mark"
         case .grok: "grok-mark"
         case .cursor: "cursor-mark"
+        case .cherry: "cherrystudio-mark"
         }
     }
 
     var iconBadgeBackgroundColor: Color {
         switch self {
-        case .codex, .opencode:
+        case .codex, .opencode, .cherry:
             .clear
         default:
             tintColor.opacity(0.12)

@@ -9,6 +9,7 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
     case pi
     case grok
     case cursor
+    case cherry
 
     var id: String { rawValue }
 
@@ -30,6 +31,8 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
             "Grok CLI"
         case .cursor:
             "Cursor"
+        case .cherry:
+            "Cherry Studio"
         }
     }
 }

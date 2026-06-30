@@ -83,7 +83,7 @@ pub fn model_cost_usd(model: &str, usage: TokenUsage) -> f64 {
 
 fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
     let candidates = candidates_for(model);
-    let is_composer = candidates.iter().any(|candidate| {
+    let is_composer_fast = candidates.iter().any(|candidate| {
         matches!(
             candidate.as_str(),
             "composer-2.5-fast"
@@ -92,16 +92,35 @@ fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
                 | "grok-composer-2-5-fast"
         )
     });
+    if is_composer_fast {
+        return Some(composer_fast_cost_usd(usage));
+    }
+    let is_composer = candidates.iter().any(|candidate| {
+        matches!(
+            candidate.as_str(),
+            "composer-2.5" | "composer-2-5" | "cursor-composer-2.5" | "cursor-composer-2-5"
+        )
+    });
     if is_composer {
-        return Some(
-            (usage.input_tokens.max(0) as f64 * 3.0
-                + usage.output_tokens.max(0) as f64 * 15.0
-                + usage.cache_creation_tokens.max(0) as f64 * 3.0
-                + usage.cache_read_tokens.max(0) as f64 * 0.08)
-                / MILLION,
-        );
+        return Some(composer_standard_cost_usd(usage));
     }
     None
+}
+
+fn composer_fast_cost_usd(usage: TokenUsage) -> f64 {
+    (usage.input_tokens.max(0) as f64 * 3.0
+        + usage.output_tokens.max(0) as f64 * 15.0
+        + usage.cache_creation_tokens.max(0) as f64 * 3.0
+        + usage.cache_read_tokens.max(0) as f64 * 0.08)
+        / MILLION
+}
+
+fn composer_standard_cost_usd(usage: TokenUsage) -> f64 {
+    (usage.input_tokens.max(0) as f64 * 0.5
+        + usage.output_tokens.max(0) as f64 * 2.5
+        + usage.cache_creation_tokens.max(0) as f64 * 0.5
+        + usage.cache_read_tokens.max(0) as f64 * (0.5 / 37.5))
+        / MILLION
 }
 
 pub fn model_breakdown(model: &str, usage: TokenUsage, cost: Option<f64>) -> Value {
@@ -786,8 +805,11 @@ fn resolve_alias(model: &str) -> String {
     if normalized.contains("step-3.7-flash") {
         return "step-3.7-flash".to_string();
     }
-    if normalized.contains("composer-2.5-fast") {
+    if normalized.contains("composer-2.5-fast") || normalized.contains("composer-2-5-fast") {
         return "composer-2.5-fast".to_string();
+    }
+    if normalized.contains("composer-2.5") || normalized.contains("composer-2-5") {
+        return "composer-2.5".to_string();
     }
     if normalized.contains("gpt-5.5")
         && !normalized.contains("gpt-5.5-mini")
@@ -986,6 +1008,17 @@ mod tests {
 
         assert!((cost - expected).abs() < 1e-12);
         assert_eq!(model_cost_usd("composer-2.5-fast", usage), cost);
+    }
+
+    #[test]
+    fn calculates_builtin_composer_25_standard_cost() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        let cost = model_cost_usd("composer-2.5", usage);
+        let expected =
+            (1_250_000.0 * 0.5 + 1_000_000.0 * 2.5 + 500_000.0 * (0.5 / 37.5)) / MILLION;
+
+        assert!((cost - expected).abs() < 1e-12);
+        assert_eq!(model_cost_usd("cursor-composer-2-5", usage), cost);
     }
 
     #[test]

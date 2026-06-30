@@ -1,3 +1,4 @@
+pub mod cherry;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
@@ -25,6 +26,7 @@ pub enum LocalSource {
     Pi,
     Grok,
     Cursor,
+    Cherry,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -40,6 +42,7 @@ impl TryFrom<&str> for LocalSource {
             "pi" | "oh-my-pi" | "ohmypi" | "omp" => Ok(Self::Pi),
             "grok" => Ok(Self::Grok),
             "cursor" | "cursorpp" => Ok(Self::Cursor),
+            "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -186,7 +189,7 @@ pub fn load_local_source(
         LocalSource::OpenClaw => {
             return openclaw::load_source_view(view_name, _refresh).map_err(SourceError::Source);
         }
-        LocalSource::Hermes | LocalSource::Grok | LocalSource::Cursor => {}
+        LocalSource::Hermes | LocalSource::Grok | LocalSource::Cursor | LocalSource::Cherry => {}
     }
 
     if view == SourceView::Blocks {
@@ -203,6 +206,7 @@ pub fn load_local_source(
         LocalSource::Hermes => hermes::load_sessions()?,
         LocalSource::Grok => grok::load_sessions()?,
         LocalSource::Cursor => cursor::load_sessions()?,
+        LocalSource::Cherry => cherry::load_sessions()?,
     };
 
     Ok(match view {
@@ -399,8 +403,10 @@ pub(crate) fn cluster_model_name(model_name: &str) -> String {
         "qwen3.6-plus"
     } else if stripped.contains("step-3.7-flash") {
         "step-3.7-flash"
-    } else if stripped.contains("composer-2.5-fast") {
+    } else if stripped.contains("composer-2.5-fast") || stripped.contains("composer-2-5-fast") {
         "composer-2.5-fast"
+    } else if stripped.contains("composer-2.5") || stripped.contains("composer-2-5") {
+        "composer-2.5"
     } else {
         stripped
     };
@@ -439,6 +445,8 @@ mod tests {
         assert_eq!(cluster_model_name("GPT-5.5"), "gpt-5.5");
         assert_eq!(cluster_model_name("OTHER-MODEL"), "other-model");
         assert_eq!(cluster_model_name("Grok-Composer-2.5-Fast"), "composer-2.5-fast");
+        assert_eq!(cluster_model_name("cursor-composer-2-5"), "composer-2.5");
+        assert_eq!(cluster_model_name("composer-2.5"), "composer-2.5");
     }
 
     #[test]

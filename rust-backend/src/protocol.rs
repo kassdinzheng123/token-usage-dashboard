@@ -12,10 +12,11 @@ pub enum Source {
     Pi,
     Grok,
     Cursor,
+    Cherry,
 }
 
 impl Source {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
@@ -24,6 +25,7 @@ impl Source {
         Self::Pi,
         Self::Grok,
         Self::Cursor,
+        Self::Cherry,
     ];
 
     pub fn label(self) -> &'static str {
@@ -36,6 +38,7 @@ impl Source {
             Self::Pi => "Pi Agent",
             Self::Grok => "Grok CLI",
             Self::Cursor => "Cursor",
+            Self::Cherry => "Cherry Studio",
         }
     }
 }
@@ -51,6 +54,7 @@ impl fmt::Display for Source {
             Self::Pi => "pi",
             Self::Grok => "grok",
             Self::Cursor => "cursor",
+            Self::Cherry => "cherry",
         })
     }
 }
@@ -68,6 +72,7 @@ impl FromStr for Source {
             "pi" | "oh-my-pi" | "ohmypi" | "omp" => Ok(Self::Pi),
             "grok" => Ok(Self::Grok),
             "cursor" | "cursorpp" => Ok(Self::Cursor),
+            "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
             _ => Err(ParseProtocolError::new("source", value)),
         }
     }
@@ -156,7 +161,7 @@ impl WarmTask {
     }
 }
 
-pub const ALL_TASKS: [WarmTask; 25] = [
+pub const ALL_TASKS: [WarmTask; 28] = [
     WarmTask {
         key: "claude:daily",
         source: Source::Claude,
@@ -280,6 +285,21 @@ pub const ALL_TASKS: [WarmTask; 25] = [
     WarmTask {
         key: "cursor:sessions",
         source: Source::Cursor,
+        view: View::Sessions,
+    },
+    WarmTask {
+        key: "cherry:daily",
+        source: Source::Cherry,
+        view: View::Daily,
+    },
+    WarmTask {
+        key: "cherry:monthly",
+        source: Source::Cherry,
+        view: View::Monthly,
+    },
+    WarmTask {
+        key: "cherry:sessions",
+        source: Source::Cherry,
         view: View::Sessions,
     },
 ];
