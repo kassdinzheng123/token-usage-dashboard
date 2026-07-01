@@ -13,10 +13,11 @@ pub enum Source {
     Grok,
     Cursor,
     Cherry,
+    ClaudeScience,
 }
 
 impl Source {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
@@ -26,6 +27,7 @@ impl Source {
         Self::Grok,
         Self::Cursor,
         Self::Cherry,
+        Self::ClaudeScience,
     ];
 
     pub fn label(self) -> &'static str {
@@ -39,6 +41,7 @@ impl Source {
             Self::Grok => "Grok CLI",
             Self::Cursor => "Cursor",
             Self::Cherry => "Cherry Studio",
+            Self::ClaudeScience => "Claude Science",
         }
     }
 }
@@ -55,6 +58,7 @@ impl fmt::Display for Source {
             Self::Grok => "grok",
             Self::Cursor => "cursor",
             Self::Cherry => "cherry",
+            Self::ClaudeScience => "claude-science",
         })
     }
 }
@@ -73,6 +77,7 @@ impl FromStr for Source {
             "grok" => Ok(Self::Grok),
             "cursor" | "cursorpp" => Ok(Self::Cursor),
             "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
+            "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
             _ => Err(ParseProtocolError::new("source", value)),
         }
     }
@@ -161,7 +166,7 @@ impl WarmTask {
     }
 }
 
-pub const ALL_TASKS: [WarmTask; 28] = [
+pub const ALL_TASKS: [WarmTask; 31] = [
     WarmTask {
         key: "claude:daily",
         source: Source::Claude,
@@ -300,6 +305,21 @@ pub const ALL_TASKS: [WarmTask; 28] = [
     WarmTask {
         key: "cherry:sessions",
         source: Source::Cherry,
+        view: View::Sessions,
+    },
+    WarmTask {
+        key: "claude-science:daily",
+        source: Source::ClaudeScience,
+        view: View::Daily,
+    },
+    WarmTask {
+        key: "claude-science:monthly",
+        source: Source::ClaudeScience,
+        view: View::Monthly,
+    },
+    WarmTask {
+        key: "claude-science:sessions",
+        source: Source::ClaudeScience,
         view: View::Sessions,
     },
 ];

@@ -692,6 +692,7 @@ fn today_task_key(source: Source) -> Option<&'static str> {
         Source::Grok => Some("grok:today"),
         Source::Cursor => Some("cursor:today"),
         Source::Cherry => Some("cherry:today"),
+        Source::ClaudeScience => Some("claude-science:today"),
     }
 }
 

@@ -36,6 +36,7 @@ private let tokenTrendSourceColors: [String: Color] = [
     TokenUsageSource.grok.label:     colorSlate.primary,
     TokenUsageSource.cursor.label: colorSlate.primary,
     TokenUsageSource.cherry.label: colorRose.light,
+    TokenUsageSource.claudeScience.label: colorOcean.primary,
 ]
 
 // Model trend chart palette (single-source view): primary shades from each family
@@ -72,6 +73,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case grok
     case cursor
     case cherry
+    case claudeScience = "claude-science"
 
     public var id: String { rawValue }
 
@@ -87,6 +89,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
         case .grok: "Grok CLI"
         case .cursor: "Cursor"
         case .cherry: "Cherry Studio"
+        case .claudeScience: "Claude Science"
         }
     }
 }
@@ -3746,6 +3749,7 @@ extension TokenUsageSource {
         case .grok: .grok
         case .cursor: .cursor
         case .cherry: .cherry
+        case .claudeScience: .claudeScience
         }
     }
 
@@ -3765,6 +3769,7 @@ extension TokenUsageSource {
         case .grok: "sparkles"
         case .cursor: "cursorarrow.rays"
         case .cherry: "leaf"
+        case .claudeScience: "flask"
         }
     }
 
@@ -3780,6 +3785,7 @@ extension TokenUsageSource {
         case .grok: "grok-mark"
         case .cursor: "cursor-mark"
         case .cherry: "cherrystudio-mark"
+        case .claudeScience: "anthropic-mark"
         }
     }
 
@@ -3813,6 +3819,7 @@ extension UsageSource {
         case .grok: "sparkles"
         case .cursor: "cursorarrow.rays"
         case .cherry: "leaf"
+        case .claudeScience: "flask"
         }
     }
 
@@ -3827,6 +3834,7 @@ extension UsageSource {
         case .grok: "grok-mark"
         case .cursor: "cursor-mark"
         case .cherry: "cherrystudio-mark"
+        case .claudeScience: "anthropic-mark"
         }
     }
 

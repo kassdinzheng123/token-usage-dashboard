@@ -1,5 +1,6 @@
 pub mod cherry;
 pub mod claude;
+pub mod claude_science;
 pub mod codex;
 pub mod cursor;
 pub mod cursor_api;
@@ -27,6 +28,7 @@ pub enum LocalSource {
     Grok,
     Cursor,
     Cherry,
+    ClaudeScience,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -43,6 +45,7 @@ impl TryFrom<&str> for LocalSource {
             "grok" => Ok(Self::Grok),
             "cursor" | "cursorpp" => Ok(Self::Cursor),
             "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
+            "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -189,7 +192,11 @@ pub fn load_local_source(
         LocalSource::OpenClaw => {
             return openclaw::load_source_view(view_name, _refresh).map_err(SourceError::Source);
         }
-        LocalSource::Hermes | LocalSource::Grok | LocalSource::Cursor | LocalSource::Cherry => {}
+        LocalSource::Hermes
+        | LocalSource::Grok
+        | LocalSource::Cursor
+        | LocalSource::Cherry
+        | LocalSource::ClaudeScience => {}
     }
 
     if view == SourceView::Blocks {
@@ -207,6 +214,7 @@ pub fn load_local_source(
         LocalSource::Grok => grok::load_sessions()?,
         LocalSource::Cursor => cursor::load_sessions()?,
         LocalSource::Cherry => cherry::load_sessions()?,
+        LocalSource::ClaudeScience => claude_science::load_sessions()?,
     };
 
     Ok(match view {
