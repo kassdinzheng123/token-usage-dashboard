@@ -5,7 +5,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Mutex, OnceLock, RwLock},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const LITELLM_PRICES_URL: &str =
@@ -15,6 +15,8 @@ const PI_DEV_MODELS_URL: &str = "https://pi.dev/models";
 const MILLION: f64 = 1_000_000.0;
 const PRICING_HTTP_TIMEOUT_SECS: u64 = 15;
 const PRICING_CACHE_FRESH_SECS: u64 = 24 * 60 * 60;
+// 2026-09-01T00:00:00Z — Anthropic standard Sonnet 5 pricing starts here.
+const CLAUDE_SONNET_5_STANDARD_PRICING_START_SECS: u64 = 1_788_220_800;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
@@ -104,6 +106,15 @@ fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
     if is_composer {
         return Some(composer_standard_cost_usd(usage));
     }
+    let is_sonnet_5 = candidates.iter().any(|candidate| {
+        matches!(
+            candidate.as_str(),
+            "claude-sonnet-5" | "anthropic/claude-sonnet-5"
+        ) || candidate.contains("claude-sonnet-5")
+    });
+    if is_sonnet_5 {
+        return Some(claude_sonnet_5_cost_usd(usage));
+    }
     None
 }
 
@@ -120,6 +131,27 @@ fn composer_standard_cost_usd(usage: TokenUsage) -> f64 {
         + usage.output_tokens.max(0) as f64 * 2.5
         + usage.cache_creation_tokens.max(0) as f64 * 0.5
         + usage.cache_read_tokens.max(0) as f64 * (0.5 / 37.5))
+        / MILLION
+}
+
+fn claude_sonnet_5_uses_intro_pricing() -> bool {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() < CLAUDE_SONNET_5_STANDARD_PRICING_START_SECS)
+        .unwrap_or(true)
+}
+
+fn claude_sonnet_5_cost_usd(usage: TokenUsage) -> f64 {
+    let (input_rate, output_rate, cache_write_rate, cache_read_rate) =
+        if claude_sonnet_5_uses_intro_pricing() {
+            (2.0, 10.0, 2.5, 0.20)
+        } else {
+            (3.0, 15.0, 3.75, 0.30)
+        };
+    (usage.input_tokens.max(0) as f64 * input_rate
+        + usage.output_tokens.max(0) as f64 * output_rate
+        + usage.cache_creation_tokens.max(0) as f64 * cache_write_rate
+        + usage.cache_read_tokens.max(0) as f64 * cache_read_rate)
         / MILLION
 }
 
@@ -811,6 +843,9 @@ fn resolve_alias(model: &str) -> String {
     if normalized.contains("composer-2.5") || normalized.contains("composer-2-5") {
         return "composer-2.5".to_string();
     }
+    if normalized.contains("claude-sonnet-5") {
+        return "claude-sonnet-5".to_string();
+    }
     if normalized.contains("gpt-5.5")
         && !normalized.contains("gpt-5.5-mini")
         && !normalized.contains("gpt-5.5-nano")
@@ -1008,6 +1043,29 @@ mod tests {
 
         assert!((cost - expected).abs() < 1e-12);
         assert_eq!(model_cost_usd("composer-2.5-fast", usage), cost);
+    }
+
+    #[test]
+    fn calculates_builtin_claude_sonnet_5_intro_cost() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        let cost = model_cost_usd("claude-sonnet-5", usage);
+        let expected = if claude_sonnet_5_uses_intro_pricing() {
+            (1_000_000.0 * 2.0 + 1_000_000.0 * 10.0 + 250_000.0 * 2.5 + 500_000.0 * 0.20)
+                / MILLION
+        } else {
+            (1_000_000.0 * 3.0 + 1_000_000.0 * 15.0 + 250_000.0 * 3.75 + 500_000.0 * 0.30)
+                / MILLION
+        };
+
+        assert!((cost - expected).abs() < 1e-12);
+        assert_eq!(model_cost_usd("claude-sonnet-5-thinking-high", usage), cost);
+        assert_eq!(model_cost_usd("anthropic/claude-sonnet-5", usage), cost);
+    }
+
+    #[test]
+    fn resolves_claude_sonnet_5_alias() {
+        let candidates = candidates_for("claude-sonnet-5-thinking-high");
+        assert!(candidates.contains(&"claude-sonnet-5".to_string()));
     }
 
     #[test]

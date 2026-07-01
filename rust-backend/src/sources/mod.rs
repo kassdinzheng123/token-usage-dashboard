@@ -407,6 +407,8 @@ pub(crate) fn cluster_model_name(model_name: &str) -> String {
         "composer-2.5-fast"
     } else if stripped.contains("composer-2.5") || stripped.contains("composer-2-5") {
         "composer-2.5"
+    } else if stripped.contains("claude-sonnet-5") {
+        "claude-sonnet-5"
     } else {
         stripped
     };
@@ -457,6 +459,19 @@ mod tests {
         assert_eq!(cluster_model_name("anthropic/claude-opus-4.8"), "claude-opus-4-8");
         assert_eq!(cluster_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
         assert_eq!(cluster_model_name("kiro-claude-opus-4.7"), "kiro-claude-opus-4-7");
+    }
+
+    #[test]
+    fn cluster_model_name_canonicalizes_claude_sonnet_5_variants() {
+        assert_eq!(cluster_model_name("claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(
+            cluster_model_name("claude-sonnet-5-thinking-high"),
+            "claude-sonnet-5"
+        );
+        assert_eq!(
+            cluster_model_name("anthropic/claude-sonnet-5"),
+            "claude-sonnet-5"
+        );
     }
 
     #[test]
