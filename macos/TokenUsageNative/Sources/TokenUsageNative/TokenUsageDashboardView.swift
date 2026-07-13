@@ -295,6 +295,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var isModelFilterExpanded = false
     @State private var tokenTrendLegendPage = 0
     @State private var modelCostLegendPage = 0
+    @State private var tokenMixLegendPage = 0
     @State private var todayModelPage = 0
     @State private var isViewModeTransitioning = false
     @State private var viewModeTransitionGeneration = 0
@@ -362,6 +363,12 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
         .onChange(of: selectedTimeRange) {
             applyTimeRange(selectedTimeRange)
+            tokenMixLegendPage = 0
+            todayModelPage = 0
+            modelCostLegendPage = 0
+            if selectedTimeRange == .today {
+                cliCompositionPane = .cli
+            }
         }
         .onChange(of: store.startDate) {
             updateDashboardData()
@@ -412,6 +419,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         dashboardData = Self.makeDashboardData(from: store, tokenTrendGroupBy: tokenTrendGroupBy)
         clearChartInteractionState()
         modelCostLegendPage = 0
+        tokenMixLegendPage = 0
     }
 
     private func clearChartInteractionState() {
@@ -428,6 +436,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     dashboardLoadingView
                 } else {
                     heroMetricsRow
+                    if selectedTimeRange != .today {
+                        dailyTokenUsageSection
+                    }
                     chartSection
                     modelConsumptionSection
                 }
@@ -1092,17 +1103,53 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 TodayModelTokenDonutChart(rows: rows, totalTokens: summary.totalTokens)
                     .frame(width: 156, height: 156)
 
-                ScrollView(.vertical) {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(rows) { row in
-                            TodayModelTokenRowView(row: row)
-                        }
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(visibleTokenMixRows(from: rows)) { row in
+                        TodayModelTokenRowView(row: row)
                     }
+                    Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
             .frame(height: todayOverviewResolvedContentHeight(for: summary), alignment: .topLeading)
+        }
+    }
+
+    private func tokenMixLegendPageCount(for rows: [TodayModelTokenRow]) -> Int {
+        max(Int(ceil(Double(rows.count) / Double(modelCostLegendPageSize))), 1)
+    }
+
+    private func clampedTokenMixLegendPage(for rows: [TodayModelTokenRow]) -> Int {
+        min(max(tokenMixLegendPage, 0), tokenMixLegendPageCount(for: rows) - 1)
+    }
+
+    private func visibleTokenMixRows(from rows: [TodayModelTokenRow]) -> [TodayModelTokenRow] {
+        let page = clampedTokenMixLegendPage(for: rows)
+        let start = page * modelCostLegendPageSize
+        guard start < rows.count else { return rows }
+        let end = min(start + modelCostLegendPageSize, rows.count)
+        return Array(rows[start..<end])
+    }
+
+    @ViewBuilder
+    private var tokenMixLegendPager: some View {
+        let rows = dashboardSummary.modelTokenRows
+        if !rows.isEmpty {
+            LegendPageControls(
+                currentPage: clampedTokenMixLegendPage(for: rows),
+                pageCount: tokenMixLegendPageCount(for: rows),
+                totalCount: rows.count,
+                onPrevious: {
+                    tokenMixLegendPage = max(clampedTokenMixLegendPage(for: rows) - 1, 0)
+                },
+                onNext: {
+                    tokenMixLegendPage = min(
+                        clampedTokenMixLegendPage(for: rows) + 1,
+                        tokenMixLegendPageCount(for: rows) - 1
+                    )
+                }
+            )
         }
     }
 
@@ -1148,15 +1195,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var heroMetricsRow: some View {
-        HStack(alignment: .top, spacing: 16) {
+        VStack(alignment: .leading, spacing: 16) {
             DashboardHeroView(
                 totalTokens: totalTokens,
                 costText: currencyController.string(fromUSD: totalCost),
                 isRefreshing: store.isLoading
             )
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 140)
 
-            VStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 TodayMetricCard(
                     title: "Cache Read",
                     value: dashboardData.cacheReadTokens.tokenText,
@@ -1186,7 +1233,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     tint: .pink
                 )
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1217,24 +1263,31 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var chartSection: some View {
         let paneHeight = todayOverviewResolvedContentHeight(for: dashboardSummary)
+        let showsCompositionToggle = selectedTimeRange != .today
 
         return Grid(horizontalSpacing: 16, verticalSpacing: 16) {
             GridRow {
-                ChartCard(title: cliCompositionPane.label) {
-                    Picker("", selection: $cliCompositionPane) {
-                        ForEach(DashboardCLICompositionPane.allCases) { pane in
-                            Text(pane.label).tag(pane)
+                ChartCard(title: showsCompositionToggle ? cliCompositionPane.label : DashboardCLICompositionPane.cli.label) {
+                    if showsCompositionToggle {
+                        Picker("", selection: $cliCompositionPane) {
+                            ForEach(DashboardCLICompositionPane.allCases) { pane in
+                                Text(pane.label).tag(pane)
+                            }
                         }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 220)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 220)
                 } content: {
-                    switch cliCompositionPane {
-                    case .cli:
+                    if showsCompositionToggle {
+                        switch cliCompositionPane {
+                        case .cli:
+                            todaySourceBreakdown(summary: dashboardSummary)
+                        case .composition:
+                            compositionChart
+                        }
+                    } else {
                         todaySourceBreakdown(summary: dashboardSummary)
-                    case .composition:
-                        compositionChart
                     }
                 }
                 .frame(height: paneHeight + 66, alignment: .top)
@@ -1252,6 +1305,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
                         if modelCostMixPane == .cost {
                             modelCostLegendPager
+                        } else {
+                            tokenMixLegendPager
                         }
                     }
                 } content: {
@@ -1264,26 +1319,25 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 }
                 .frame(height: paneHeight + 66, alignment: .top)
             }
+        }
+    }
 
-            GridRow {
-                ChartCard(title: "Daily Token Usage") {
-                    Picker("", selection: $dailyUsagePane) {
-                        ForEach(DashboardDailyUsagePane.allCases) { pane in
-                            Text(pane.label).tag(pane)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 160)
-                } content: {
-                    switch dailyUsagePane {
-                    case .bar:
-                        tokenTrendChart
-                    case .heatmap:
-                        DashboardHeatmapView(days: dashboardData.heatmapDays)
-                    }
+    private var dailyTokenUsageSection: some View {
+        ChartCard(title: "Daily Token Usage") {
+            Picker("", selection: $dailyUsagePane) {
+                ForEach(DashboardDailyUsagePane.allCases) { pane in
+                    Text(pane.label).tag(pane)
                 }
-                .gridCellColumns(2)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 160)
+        } content: {
+            switch dailyUsagePane {
+            case .bar:
+                tokenTrendChart
+            case .heatmap:
+                DashboardHeatmapView(days: dashboardData.heatmapDays)
             }
         }
     }
