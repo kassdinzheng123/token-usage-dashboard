@@ -110,18 +110,90 @@ public enum TokenUsageViewMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-private enum TokenUsageDashboardSection: String, CaseIterable, Identifiable {
+private enum TokenUsageTrendGroupBy: String, CaseIterable, Identifiable {
+    case cli
+    case model
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .cli: "CLI"
+        case .model: "Model"
+        }
+    }
+}
+
+private enum DashboardTimeRange: String, CaseIterable, Identifiable {
     case today
-    case dashboard
+    case month
+    case all
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .today: "Today"
-        case .dashboard: "Dashboard"
+        case .month: "This Month"
+        case .all: "All"
         }
     }
+}
+
+private enum DashboardCLICompositionPane: String, CaseIterable, Identifiable {
+    case cli
+    case composition
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .cli: "CLI Consumption"
+        case .composition: "Token Composition"
+        }
+    }
+}
+
+private enum DashboardModelCostMixPane: String, CaseIterable, Identifiable {
+    case cost
+    case mix
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .cost: "Model Cost"
+        case .mix: "Token Mix"
+        }
+    }
+}
+
+private enum DashboardDailyUsagePane: String, CaseIterable, Identifiable {
+    case bar
+    case heatmap
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .bar: "Bar"
+        case .heatmap: "Heatmap"
+        }
+    }
+}
+
+// Expanded stable model palette: primary/light/dark from every family.
+private let expandedModelPalette: [Color] = allColorFamilies.flatMap { [$0.primary, $0.light, $0.dark] }
+
+/// Deterministic color for a model, hashed from its display name so a model
+/// always keeps the same color regardless of ordering or filters.
+private func stableModelColor(for modelName: String) -> Color {
+    let key = displayModelName(modelName)
+    var hash: UInt64 = 14695981039346656037
+    for byte in key.utf8 {
+        hash = (hash ^ UInt64(byte)) &* 1099511628211
+    }
+    return expandedModelPalette[Int(hash % UInt64(expandedModelPalette.count))]
 }
 
 public struct TokenUsageModelBreakdown: Identifiable, Hashable, Sendable {
@@ -229,7 +301,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var viewModeTransitionTask: Task<Void, Never>?
     @State private var dateRangeRefreshSuppressionGeneration = 0
     @State private var isLogViewerPresented = false
-    @State private var selectedSection: TokenUsageDashboardSection = .today
+    @State private var selectedTimeRange: DashboardTimeRange = .today
+    @State private var cliCompositionPane: DashboardCLICompositionPane = .cli
+    @State private var modelCostMixPane: DashboardModelCostMixPane = .cost
+    @State private var dailyUsagePane: DashboardDailyUsagePane = .bar
+    @State private var tokenTrendGroupBy: TokenUsageTrendGroupBy = .cli
     @State private var dashboardData: TokenUsageDashboardData
 
     init(store: Store, currencyController: TokenUsageBillingCurrencyController) {
@@ -270,40 +346,29 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .task {
             await currencyController.refreshExchangeRateIfNeeded()
         }
-        .onChange(of: selectedSection) {
-            updateDashboardData()
-            Task {
-                await refreshSelectedSection()
-            }
-        }
         .onChange(of: store.records) {
             updateDashboardData()
         }
         .onChange(of: store.selectedSource) {
+            if store.selectedSource != .all {
+                tokenTrendGroupBy = .cli
+            }
             updateDashboardData()
             Task { await store.refresh() }
         }
-        .onChange(of: store.selectedViewMode) {
-            dateRangeRefreshSuppressionGeneration += 1
-            let suppressionGeneration = dateRangeRefreshSuppressionGeneration
-            store.updateDateRangeForViewMode()
+        .onChange(of: tokenTrendGroupBy) {
             updateDashboardData()
-            refreshForViewModeChange()
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 50_000_000)
-                if dateRangeRefreshSuppressionGeneration == suppressionGeneration {
-                    dateRangeRefreshSuppressionGeneration = 0
-                }
-            }
+            tokenTrendLegendPage = 0
+        }
+        .onChange(of: selectedTimeRange) {
+            applyTimeRange(selectedTimeRange)
         }
         .onChange(of: store.startDate) {
             updateDashboardData()
-            guard dateRangeRefreshSuppressionGeneration == 0 else { return }
             Task { await store.refresh() }
         }
         .onChange(of: store.endDate) {
             updateDashboardData()
-            guard dateRangeRefreshSuppressionGeneration == 0 else { return }
             Task { await store.refresh() }
         }
         .onChange(of: store.selectedModels) {
@@ -313,7 +378,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .onChange(of: tokenTrendColorDomain) {
             tokenTrendLegendPage = 0
         }
-        .onChange(of: todaySummary.modelRows.count) {
+        .onChange(of: dashboardData.modelUsageRows.count) {
             todayModelPage = 0
         }
         .onChange(of: currencyController.selectedCurrency) {
@@ -328,19 +393,23 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    private static func makeDashboardData(from store: Store) -> TokenUsageDashboardData {
+    private static func makeDashboardData(
+        from store: Store,
+        tokenTrendGroupBy: TokenUsageTrendGroupBy = .cli
+    ) -> TokenUsageDashboardData {
         TokenUsageDashboardData.make(
             records: store.records,
             selectedSource: store.selectedSource,
             selectedViewMode: store.selectedViewMode,
             startDate: store.startDate,
             endDate: store.endDate,
-            selectedModels: store.selectedModels
+            selectedModels: store.selectedModels,
+            tokenTrendGroupBy: tokenTrendGroupBy
         )
     }
 
     private func updateDashboardData() {
-        dashboardData = Self.makeDashboardData(from: store)
+        dashboardData = Self.makeDashboardData(from: store, tokenTrendGroupBy: tokenTrendGroupBy)
         clearChartInteractionState()
         modelCostLegendPage = 0
     }
@@ -352,17 +421,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(alignment: .leading, spacing: 20) {
                 header
-                sectionSwitcher
 
-                if selectedSection == .today {
-                    todayDashboard
-                } else if store.records.isEmpty {
+                filterBar
+
+                if store.records.isEmpty {
                     dashboardLoadingView
                 } else {
-                    filterBar
-                    summaryCards
+                    heroMetricsRow
                     chartSection
-                    usageTable
+                    modelConsumptionSection
                 }
             }
             .padding(24)
@@ -380,40 +447,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 320)
-    }
-
-    private var sectionSwitcher: some View {
-        HStack(spacing: 12) {
-            Picker("Section", selection: $selectedSection) {
-                ForEach(TokenUsageDashboardSection.allCases) { section in
-                    Text(section.label).tag(section)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 240)
-
-            if selectedSection == .today {
-                Label(Date().formatted(.dateTime.year().month().day()), systemImage: "calendar")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-            } else {
-                Text("Source, view, date range, and model filters")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-            }
-        }
-        .padding(16)
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
     }
 
     private var viewModeTransitionOverlay: some View {
@@ -581,12 +614,12 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
             VStack(alignment: .trailing, spacing: 6) {
                 Button {
-                    Task { await refreshSelectedSection(force: true) }
+                    Task { await refreshDashboardAndToday(force: true) }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
-                .help(selectedSection == .today ? "Refresh today usage" : "Refresh dashboard usage")
+                .help("Refresh usage")
                 .disabled(store.isLoading)
 
                 HStack(spacing: 4) {
@@ -601,13 +634,28 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    private func refreshSelectedSection(force: Bool = false) async {
-        switch selectedSection {
+    private func refreshDashboardAndToday(force: Bool = false) async {
+        await store.refreshDashboard(force: force)
+        await store.refreshToday(force: force)
+    }
+
+    private func applyTimeRange(_ range: DashboardTimeRange) {
+        let calendar = Calendar.current
+        let today = Date()
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: today) ?? today
+        switch range {
         case .today:
-            await store.refreshToday(force: force)
-        case .dashboard:
-            await store.refreshDashboard(force: force)
+            store.startDate = calendar.startOfDay(for: today)
+        case .month:
+            store.startDate = calendar.dateInterval(of: .month, for: today)?.start ?? calendar.startOfDay(for: today)
+        case .all:
+            var components = DateComponents()
+            components.year = 2024
+            components.month = 1
+            components.day = 1
+            store.startDate = calendar.date(from: components) ?? calendar.startOfDay(for: today)
         }
+        store.endDate = tomorrow
     }
 
     private var filterBar: some View {
@@ -625,43 +673,36 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         )
     }
 
-    @ViewBuilder
     private var filterControls: some View {
-        if store.selectedViewMode == .daily || store.selectedViewMode == .monthly {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 16) {
-                    sourcePicker
-                    viewModePicker
-                    Spacer(minLength: 0)
-                }
+        HStack(spacing: 16) {
+            sourcePicker
+            timeRangePicker
+            tokenTrendGroupByPicker
+            Spacer(minLength: 0)
+        }
+    }
 
-                HStack(spacing: 16) {
-                    dateRangePickers
-                    Spacer(minLength: 0)
+    private var timeRangePicker: some View {
+        Picker("Range", selection: $selectedTimeRange) {
+            ForEach(DashboardTimeRange.allCases) { range in
+                Text(range.label).tag(range)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: 260)
+    }
+
+    @ViewBuilder
+    private var tokenTrendGroupByPicker: some View {
+        if store.selectedSource == .all {
+            Picker("Group By", selection: $tokenTrendGroupBy) {
+                ForEach(TokenUsageTrendGroupBy.allCases) { groupBy in
+                    Text(groupBy.label).tag(groupBy)
                 }
             }
-        } else {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 16) {
-                    sourcePicker
-                    viewModePicker
-                    dateRangePickers
-                    Spacer(minLength: 0)
-                }
-
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(spacing: 16) {
-                        sourcePicker
-                        viewModePicker
-                        Spacer(minLength: 0)
-                    }
-
-                    HStack(spacing: 16) {
-                        dateRangePickers
-                        Spacer(minLength: 0)
-                    }
-                }
-            }
+            .pickerStyle(.segmented)
+            .frame(width: 160)
         }
     }
 
@@ -806,9 +847,13 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         return end
     }
 
+    private var showsModelFilter: Bool {
+        !availableModels.isEmpty && (store.selectedSource != .all || tokenTrendGroupBy == .model)
+    }
+
     @ViewBuilder
     private var modelFilter: some View {
-        if !availableModels.isEmpty {
+        if showsModelFilter {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Button {
@@ -913,55 +958,58 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         let overviewContentHeight = todayOverviewResolvedContentHeight(for: summary)
 
         return VStack(alignment: .leading, spacing: 16) {
-            LazyVGrid(
-                columns: [
-                    GridItem(.adaptive(minimum: 172), spacing: 12, alignment: .top),
-                ],
-                alignment: .leading,
-                spacing: 12
-            ) {
-                TodayMetricCard(
-                    title: "Cost",
-                    value: currencyController.string(fromUSD: summary.totalCostDecimal),
-                    subtitle: "\(summary.activeSourceCount) active CLI",
-                    systemImage: "creditcard",
-                    tint: .blue
+            HStack(alignment: .top, spacing: 16) {
+                TodayTokenHeroView(
+                    totalTokens: summary.totalTokens,
+                    modelCount: summary.modelCount,
+                    isRefreshing: store.isLoading
                 )
-                TodayMetricCard(
-                    title: "Tokens",
-                    value: summary.totalTokens.tokenText,
-                    subtitle: "\(summary.modelCount) models",
-                    systemImage: "number",
-                    tint: .green
-                )
-                TodayMetricCard(
-                    title: "Cache Read",
-                    value: summary.cacheReadTokens.tokenText,
-                    subtitle: "\(summary.cacheReadShare.percentText) of tokens",
-                    systemImage: "externaldrive.badge.icloud",
-                    tint: .purple
-                )
-                TodayMetricCard(
-                    title: "Cache Share",
-                    value: summary.cacheShare.percentText,
-                    subtitle: "read + create",
-                    systemImage: "chart.pie",
-                    tint: .orange
-                )
-                TodayMetricCard(
-                    title: "Input",
-                    value: summary.inputTokens.tokenText,
-                    subtitle: summary.inputShare.percentText,
-                    systemImage: "arrow.down.to.line.compact",
-                    tint: .cyan
-                )
-                TodayMetricCard(
-                    title: "Output",
-                    value: summary.outputTokens.tokenText,
-                    subtitle: summary.outputShare.percentText,
-                    systemImage: "arrow.up.to.line.compact",
-                    tint: .pink
-                )
+                .frame(minWidth: 280, idealWidth: 320, maxWidth: 360, alignment: .leading)
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.adaptive(minimum: 148), spacing: 12, alignment: .top),
+                    ],
+                    alignment: .leading,
+                    spacing: 12
+                ) {
+                    TodayMetricCard(
+                        title: "Cost",
+                        value: currencyController.string(fromUSD: summary.totalCostDecimal),
+                        subtitle: "\(summary.activeSourceCount) active CLI",
+                        systemImage: "creditcard",
+                        tint: .blue
+                    )
+                    TodayMetricCard(
+                        title: "Cache Read",
+                        value: summary.cacheReadTokens.tokenText,
+                        subtitle: "\(summary.cacheReadShare.percentText) of tokens",
+                        systemImage: "externaldrive.badge.icloud",
+                        tint: .purple
+                    )
+                    TodayMetricCard(
+                        title: "Cache Share",
+                        value: summary.cacheShare.percentText,
+                        subtitle: "read + create",
+                        systemImage: "chart.pie",
+                        tint: .orange
+                    )
+                    TodayMetricCard(
+                        title: "Input",
+                        value: summary.inputTokens.tokenText,
+                        subtitle: summary.inputShare.percentText,
+                        systemImage: "arrow.down.to.line.compact",
+                        tint: .cyan
+                    )
+                    TodayMetricCard(
+                        title: "Output",
+                        value: summary.outputTokens.tokenText,
+                        subtitle: summary.outputShare.percentText,
+                        systemImage: "arrow.up.to.line.compact",
+                        tint: .pink
+                    )
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Grid(horizontalSpacing: 16, verticalSpacing: 16) {
@@ -1099,36 +1147,211 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .frame(maxWidth: .infinity, minHeight: 220, alignment: .center)
     }
 
-    private var summaryCards: some View {
-        HStack(spacing: 16) {
-            SummaryCard(title: "Total Cost", value: currencyController.string(fromUSD: totalCost))
-            SummaryCard(title: "Total Tokens", value: totalTokens.tokenText)
-            SummaryCard(title: activePeriodLabel, value: activePeriodCount.formatted())
-            SummaryCard(title: "Unique Models", value: dashboardData.uniqueModelCount.formatted())
+    private var heroMetricsRow: some View {
+        HStack(alignment: .top, spacing: 16) {
+            DashboardHeroView(
+                totalTokens: totalTokens,
+                costText: currencyController.string(fromUSD: totalCost),
+                isRefreshing: store.isLoading
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(spacing: 12) {
+                TodayMetricCard(
+                    title: "Cache Read",
+                    value: dashboardData.cacheReadTokens.tokenText,
+                    subtitle: "\(dashboardCacheReadShare.percentText) of tokens",
+                    systemImage: "externaldrive.badge.icloud",
+                    tint: .purple
+                )
+                TodayMetricCard(
+                    title: "Cache Share",
+                    value: dashboardCacheShare.percentText,
+                    subtitle: "read + create",
+                    systemImage: "chart.pie",
+                    tint: .orange
+                )
+                TodayMetricCard(
+                    title: "Input",
+                    value: dashboardData.inputTokens.tokenText,
+                    subtitle: dashboardInputShare.percentText,
+                    systemImage: "arrow.down.to.line.compact",
+                    tint: .cyan
+                )
+                TodayMetricCard(
+                    title: "Output",
+                    value: dashboardData.outputTokens.tokenText,
+                    subtitle: dashboardOutputShare.percentText,
+                    systemImage: "arrow.up.to.line.compact",
+                    tint: .pink
+                )
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
+    private var dashboardCacheReadShare: Double {
+        dashboardShare(dashboardData.cacheReadTokens)
+    }
+
+    private var dashboardCacheShare: Double {
+        dashboardShare(dashboardData.cacheReadTokens + dashboardData.cacheCreationTokens)
+    }
+
+    private var dashboardInputShare: Double {
+        dashboardShare(dashboardData.inputTokens)
+    }
+
+    private var dashboardOutputShare: Double {
+        dashboardShare(dashboardData.outputTokens)
+    }
+
+    private func dashboardShare(_ tokens: Int) -> Double {
+        guard totalTokens > 0 else { return 0 }
+        return Double(tokens) / Double(totalTokens)
+    }
+
+    private var dashboardSummary: TodaySummaryResponse {
+        dashboardData.summary
+    }
+
     private var chartSection: some View {
-        Grid(horizontalSpacing: 16, verticalSpacing: 16) {
+        let paneHeight = todayOverviewResolvedContentHeight(for: dashboardSummary)
+
+        return Grid(horizontalSpacing: 16, verticalSpacing: 16) {
             GridRow {
-                ChartCard(title: primaryChartTitle) {
-                    tokenTrendChart
+                ChartCard(title: cliCompositionPane.label) {
+                    Picker("", selection: $cliCompositionPane) {
+                        ForEach(DashboardCLICompositionPane.allCases) { pane in
+                            Text(pane.label).tag(pane)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 220)
+                } content: {
+                    switch cliCompositionPane {
+                    case .cli:
+                        todaySourceBreakdown(summary: dashboardSummary)
+                    case .composition:
+                        compositionChart
+                    }
+                }
+                .frame(height: paneHeight + 66, alignment: .top)
+
+                ChartCard(title: modelCostMixPane.label) {
+                    HStack(spacing: 10) {
+                        Picker("", selection: $modelCostMixPane) {
+                            ForEach(DashboardModelCostMixPane.allCases) { pane in
+                                Text(pane.label).tag(pane)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 180)
+
+                        if modelCostMixPane == .cost {
+                            modelCostLegendPager
+                        }
+                    }
+                } content: {
+                    switch modelCostMixPane {
+                    case .cost:
+                        modelCostChart
+                    case .mix:
+                        todayTokenMix(summary: dashboardSummary)
+                    }
+                }
+                .frame(height: paneHeight + 66, alignment: .top)
+            }
+
+            GridRow {
+                ChartCard(title: "Daily Token Usage") {
+                    Picker("", selection: $dailyUsagePane) {
+                        ForEach(DashboardDailyUsagePane.allCases) { pane in
+                            Text(pane.label).tag(pane)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 160)
+                } content: {
+                    switch dailyUsagePane {
+                    case .bar:
+                        tokenTrendChart
+                    case .heatmap:
+                        DashboardHeatmapView(days: dashboardData.heatmapDays)
+                    }
                 }
                 .gridCellColumns(2)
             }
+        }
+    }
 
-            GridRow {
-                ChartCard(title: "Token Composition") {
-                    compositionChart
+    private var modelConsumptionSection: some View {
+        ChartCard(title: "Model Consumption") {
+            if dashboardModelPageCount > 1 {
+                LegendPageControls(
+                    currentPage: clampedDashboardModelPage,
+                    pageCount: dashboardModelPageCount,
+                    totalCount: dashboardData.modelUsageRows.count,
+                    onPrevious: {
+                        todayModelPage = max(clampedDashboardModelPage - 1, 0)
+                    },
+                    onNext: {
+                        todayModelPage = min(clampedDashboardModelPage + 1, dashboardModelPageCount - 1)
+                    }
+                )
+            }
+        } content: {
+            dashboardModelConsumption
+        }
+    }
+
+    @ViewBuilder
+    private var dashboardModelConsumption: some View {
+        let rows = dashboardData.modelUsageRows
+        if rows.isEmpty {
+            emptyTodayState(text: store.isLoading ? "Loading models..." : "No model usage recorded")
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    Text("Model")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Source")
+                        .frame(width: 120, alignment: .leading)
+                    Text("Tokens")
+                        .frame(width: 92, alignment: .trailing)
+                    Text("Cache")
+                        .frame(width: 78, alignment: .trailing)
+                    Text("Cost")
+                        .frame(width: 86, alignment: .trailing)
                 }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
 
-                ChartCard(title: "Model Cost Distribution") {
-                    modelCostLegendPager
-                } content: {
-                    modelCostChart
+                ForEach(visibleDashboardModelRows, id: \.dashboardID) { row in
+                    TodayModelRowView(row: row, costText: currencyController.string(fromUSD: row.totalCostDecimal))
                 }
             }
+            .frame(maxWidth: .infinity, minHeight: 260, alignment: .topLeading)
         }
+    }
+
+    private var dashboardModelPageCount: Int {
+        max(Int(ceil(Double(dashboardData.modelUsageRows.count) / Double(todayModelPageSize))), 1)
+    }
+
+    private var clampedDashboardModelPage: Int {
+        min(max(todayModelPage, 0), dashboardModelPageCount - 1)
+    }
+
+    private var visibleDashboardModelRows: [TodayModelUsageRow] {
+        let rows = dashboardData.modelUsageRows
+        let start = clampedDashboardModelPage * todayModelPageSize
+        guard start < rows.count else { return rows }
+        let end = min(start + todayModelPageSize, rows.count)
+        return Array(rows[start..<end])
     }
 
     private var tokenTrendChart: some View {
@@ -1209,259 +1432,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    @ViewBuilder
-    private var usageTable: some View {
-        if store.selectedViewMode == .sessions {
-            usageTableWithSessionID
-        } else {
-            usageTableWithoutSessionID
-        }
-    }
-
-    @ViewBuilder
-    private var usageTableWithSessionID: some View {
-        if store.selectedSource == .all {
-            usageTableWithSessionIDModelsAfterSource
-        } else {
-            usageTableWithSessionIDModelsAtEnd
-        }
-    }
-
-    private var usageTableWithSessionIDModelsAfterSource: some View {
-        Table(filteredRecords) {
-            TableColumn("Source") { record in
-                TokenUsageSourceLabel(source: record.source)
-            }
-            .width(min: 110, ideal: 130)
-
-            TableColumn("Models") { record in
-                ModelListLabel(models: Array(record.modelsUsed.prefix(5)))
-            }
-            .width(min: 180, ideal: 260)
-
-            TableColumn(dateColumnTitle) { record in
-                Text(record.date, format: store.selectedViewMode == .monthly ? .dateTime.year().month() : .dateTime.year().month().day())
-            }
-            .width(min: 100, ideal: 120)
-
-            TableColumn("Session ID") { record in
-                Text(sessionIDText(for: record))
-                    .font(.system(.body, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(record.sessionID ?? "")
-            }
-            .width(min: 120, ideal: 150)
-
-            TableColumn("Input") { record in
-                Text(record.inputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Output") { record in
-                Text(record.outputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Cache Create") { record in
-                Text(record.cacheCreationTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Cache Read") { record in
-                Text(record.cacheReadTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Total Tokens") { record in
-                Text(record.totalTokens.tokenText)
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 110, ideal: 120)
-
-            TableColumn("Cost") { record in
-                Text(currencyController.string(fromUSD: record.totalCost))
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 80, ideal: 90)
-        }
-        .frame(minHeight: 360, maxHeight: 560)
-    }
-
-    private var usageTableWithSessionIDModelsAtEnd: some View {
-        Table(filteredRecords) {
-            TableColumn("Source") { record in
-                TokenUsageSourceLabel(source: record.source)
-            }
-            .width(min: 110, ideal: 130)
-
-            TableColumn(dateColumnTitle) { record in
-                Text(record.date, format: store.selectedViewMode == .monthly ? .dateTime.year().month() : .dateTime.year().month().day())
-            }
-            .width(min: 100, ideal: 120)
-
-            TableColumn("Session ID") { record in
-                Text(sessionIDText(for: record))
-                    .font(.system(.body, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(record.sessionID ?? "")
-            }
-            .width(min: 120, ideal: 150)
-
-            TableColumn("Input") { record in
-                Text(record.inputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Output") { record in
-                Text(record.outputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Cache Create") { record in
-                Text(record.cacheCreationTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Cache Read") { record in
-                Text(record.cacheReadTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Total Tokens") { record in
-                Text(record.totalTokens.tokenText)
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 110, ideal: 120)
-
-            TableColumn("Cost") { record in
-                Text(currencyController.string(fromUSD: record.totalCost))
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Models") { record in
-                ModelListLabel(models: Array(record.modelsUsed.prefix(5)))
-            }
-            .width(min: 180, ideal: 260)
-        }
-        .frame(minHeight: 360, maxHeight: 560)
-    }
-
-    @ViewBuilder
-    private var usageTableWithoutSessionID: some View {
-        if store.selectedSource == .all {
-            usageTableWithoutSessionIDModelsAfterSource
-        } else {
-            usageTableWithoutSessionIDModelsAtEnd
-        }
-    }
-
-    private var usageTableWithoutSessionIDModelsAfterSource: some View {
-        Table(filteredRecords) {
-            TableColumn("Source") { record in
-                TokenUsageSourceLabel(source: record.source)
-            }
-            .width(min: 110, ideal: 130)
-
-            TableColumn("Models") { record in
-                ModelListLabel(models: Array(record.modelsUsed.prefix(5)))
-            }
-            .width(min: 180, ideal: 260)
-
-            TableColumn(dateColumnTitle) { record in
-                Text(record.date, format: store.selectedViewMode == .monthly ? .dateTime.year().month() : .dateTime.year().month().day())
-            }
-            .width(min: 100, ideal: 120)
-
-            TableColumn("Input") { record in
-                Text(record.inputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Output") { record in
-                Text(record.outputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Cache Create") { record in
-                Text(record.cacheCreationTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Cache Read") { record in
-                Text(record.cacheReadTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Total Tokens") { record in
-                Text(record.totalTokens.tokenText)
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 110, ideal: 120)
-
-            TableColumn("Cost") { record in
-                Text(currencyController.string(fromUSD: record.totalCost))
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 80, ideal: 90)
-        }
-        .frame(minHeight: 360, maxHeight: 560)
-    }
-
-    private var usageTableWithoutSessionIDModelsAtEnd: some View {
-        Table(filteredRecords) {
-            TableColumn("Source") { record in
-                TokenUsageSourceLabel(source: record.source)
-            }
-            .width(min: 110, ideal: 130)
-
-            TableColumn(dateColumnTitle) { record in
-                Text(record.date, format: store.selectedViewMode == .monthly ? .dateTime.year().month() : .dateTime.year().month().day())
-            }
-            .width(min: 100, ideal: 120)
-
-            TableColumn("Input") { record in
-                Text(record.inputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Output") { record in
-                Text(record.outputTokens.tokenText)
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Cache Create") { record in
-                Text(record.cacheCreationTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Cache Read") { record in
-                Text(record.cacheReadTokens.tokenText)
-            }
-            .width(min: 100, ideal: 110)
-
-            TableColumn("Total Tokens") { record in
-                Text(record.totalTokens.tokenText)
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 110, ideal: 120)
-
-            TableColumn("Cost") { record in
-                Text(currencyController.string(fromUSD: record.totalCost))
-                    .font(.system(.body, design: .monospaced))
-            }
-            .width(min: 80, ideal: 90)
-
-            TableColumn("Models") { record in
-                ModelListLabel(models: Array(record.modelsUsed.prefix(5)))
-            }
-            .width(min: 180, ideal: 260)
-        }
-        .frame(minHeight: 360, maxHeight: 560)
-    }
-
     private var modelCostSlices: [ModelCostSlice] {
         dashboardData.modelCostSlices
     }
@@ -1505,7 +1475,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var tokenTrendSeriesLabel: String {
-        store.selectedSource == .all ? "Source" : "Model"
+        usesCLITokenTrendGrouping ? "Source" : "Model"
+    }
+
+    private var usesCLITokenTrendGrouping: Bool {
+        store.selectedSource == .all && tokenTrendGroupBy == .cli
     }
 
     private var tokenTrendColorDomain: [String] {
@@ -1513,13 +1487,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var tokenTrendColorRange: [Color] {
-        if store.selectedSource == .all {
+        if usesCLITokenTrendGrouping {
             return tokenTrendColorDomain.map { tokenTrendSourceColors[$0] ?? .blue }
         }
 
-        return tokenTrendColorDomain.enumerated().map { index, _ in
-            tokenTrendChartPalette[index % tokenTrendChartPalette.count]
-        }
+        return tokenTrendColorDomain.map { stableModelColor(for: $0) }
     }
 
     private var tokenTrendLegendPageCount: Int {
@@ -1544,12 +1516,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private func tokenTrendColor(for series: String) -> Color {
-        if store.selectedSource == .all {
+        if usesCLITokenTrendGrouping {
             return tokenTrendSourceColors[series] ?? .blue
         }
 
-        let index = tokenTrendColorDomain.firstIndex(of: series) ?? 0
-        return tokenTrendChartPalette[index % tokenTrendChartPalette.count]
+        return stableModelColor(for: series)
     }
 
     private var compositionRows: [TokenCompositionRow] {
@@ -1647,8 +1618,15 @@ private struct TokenUsageDashboardData {
     let availableModels: [String]
     let totalCost: Decimal
     let totalTokens: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheCreationTokens: Int
+    let cacheReadTokens: Int
     let activePeriodCount: Int
     let uniqueModelCount: Int
+    let summary: TodaySummaryResponse
+    let modelUsageRows: [TodayModelUsageRow]
+    let heatmapDays: [DashboardHeatmapDay]
     let modelCostRows: [ModelCostRow]
     let modelCostSlices: [ModelCostSlice]
     let modelCostTotalCost: Decimal
@@ -1669,7 +1647,8 @@ private struct TokenUsageDashboardData {
         selectedViewMode: TokenUsageViewMode,
         startDate: Date,
         endDate: Date,
-        selectedModels: Set<String>
+        selectedModels: Set<String>,
+        tokenTrendGroupBy: TokenUsageTrendGroupBy = .cli
     ) -> TokenUsageDashboardData {
         let calendar = Calendar.current
         let rangeStart = selectedViewMode == .monthly
@@ -1690,14 +1669,31 @@ private struct TokenUsageDashboardData {
         let availableModels = Array(Set(filteredRecords.flatMap(\.modelsUsed))).sorted()
         let totalCost = filteredRecords.reduce(Decimal.zero) { $0 + $1.totalCost }
         let totalTokens = filteredRecords.reduce(0) { $0 + $1.totalTokens }
+        let inputTokens = filteredRecords.reduce(0) { $0 + $1.inputTokens }
+        let outputTokens = filteredRecords.reduce(0) { $0 + $1.outputTokens }
+        let cacheCreationTokens = filteredRecords.reduce(0) { $0 + $1.cacheCreationTokens }
+        let cacheReadTokens = filteredRecords.reduce(0) { $0 + $1.cacheReadTokens }
         let activePeriodCount = Set(filteredRecords.map { periodKey(for: $0.date, viewMode: selectedViewMode) }).count
         let uniqueModelCount = Set(filteredRecords.flatMap(\.modelsUsed)).count
+        let modelUsageRows = makeModelUsageRows(from: filteredRecords)
+        let summary = makeSummary(
+            from: filteredRecords,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheCreationTokens: cacheCreationTokens,
+            cacheReadTokens: cacheReadTokens,
+            totalTokens: totalTokens,
+            totalCost: totalCost,
+            uniqueModelCount: uniqueModelCount,
+            modelUsageRows: modelUsageRows
+        )
         let modelCostRows = makeModelCostRows(from: filteredRecords)
         let modelCostSlices = makeModelCostSlices(from: modelCostRows)
         let tokenTrendRows = makeTokenTrendRows(
             from: filteredRecords,
             selectedSource: selectedSource,
-            selectedModels: selectedModels
+            selectedModels: selectedModels,
+            tokenTrendGroupBy: tokenTrendGroupBy
         )
         let tokenTrendColorDomain = Array(Set(tokenTrendRows.map(\.series))).sorted()
         let compositionRows = makeCompositionRows(from: filteredRecords, viewMode: selectedViewMode)
@@ -1719,14 +1715,22 @@ private struct TokenUsageDashboardData {
         let monthlyXAxisValues = makeMonthlyXAxisValues(rangeStart: rangeStart, rangeEnd: rangeEnd, calendar: calendar)
         let dailyXAxisValues = makeDailyXAxisValues(from: filteredRecords, rangeStart: rangeStart, rangeEnd: rangeEnd, calendar: calendar)
         let spansMultipleYears = Set(monthlyXAxisValues.map { calendar.component(.year, from: $0) }).count > 1
+        let heatmapDays = makeHeatmapDays(from: filteredRecords, days: dailyXAxisValues, calendar: calendar)
 
         return TokenUsageDashboardData(
             filteredRecords: filteredRecords,
             availableModels: availableModels,
             totalCost: totalCost,
             totalTokens: totalTokens,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheCreationTokens: cacheCreationTokens,
+            cacheReadTokens: cacheReadTokens,
             activePeriodCount: activePeriodCount,
             uniqueModelCount: uniqueModelCount,
+            summary: summary,
+            modelUsageRows: modelUsageRows,
+            heatmapDays: heatmapDays,
             modelCostRows: modelCostRows,
             modelCostSlices: modelCostSlices,
             modelCostTotalCost: modelCostRows.reduce(Decimal.zero) { $0 + $1.cost },
@@ -1741,6 +1745,143 @@ private struct TokenUsageDashboardData {
             dailyXAxisValues: dailyXAxisValues,
             spansMultipleYears: spansMultipleYears
         )
+    }
+
+    private static func makeSummary(
+        from records: [TokenUsageRecord],
+        inputTokens: Int,
+        outputTokens: Int,
+        cacheCreationTokens: Int,
+        cacheReadTokens: Int,
+        totalTokens: Int,
+        totalCost: Decimal,
+        uniqueModelCount: Int,
+        modelUsageRows: [TodayModelUsageRow]
+    ) -> TodaySummaryResponse {
+        let sourceRows = makeSummarySourceRows(from: records)
+        return TodaySummaryResponse(
+            date: "",
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheCreationTokens: cacheCreationTokens,
+            cacheReadTokens: cacheReadTokens,
+            totalTokens: totalTokens,
+            totalCost: totalCost.doubleValue,
+            activeSourceCount: sourceRows.count,
+            modelCount: uniqueModelCount,
+            sourceRows: sourceRows,
+            modelRows: modelUsageRows
+        )
+    }
+
+    private static func makeSummarySourceRows(from records: [TokenUsageRecord]) -> [TodaySourceUsageRow] {
+        let grouped = Dictionary(grouping: records, by: \.source)
+        var rows: [TodaySourceUsageRow] = []
+        for (source, sourceRecords) in grouped {
+            var input = 0
+            var output = 0
+            var cacheCreation = 0
+            var cacheRead = 0
+            var total = 0
+            var cost = Decimal.zero
+            var models = Set<String>()
+            for record in sourceRecords {
+                input += record.inputTokens
+                output += record.outputTokens
+                cacheCreation += record.cacheCreationTokens
+                cacheRead += record.cacheReadTokens
+                total += record.totalTokens
+                cost += record.totalCost
+                if record.modelsUsed.isEmpty {
+                    models.insert("Unknown")
+                } else {
+                    models.formUnion(record.modelsUsed)
+                }
+            }
+            rows.append(
+                TodaySourceUsageRow(
+                    source: source.usageSource,
+                    inputTokens: input,
+                    outputTokens: output,
+                    cacheCreationTokens: cacheCreation,
+                    cacheReadTokens: cacheRead,
+                    totalTokens: total,
+                    totalCost: cost.doubleValue,
+                    modelCount: models.count
+                )
+            )
+        }
+        return rows.sorted { $0.totalTokens > $1.totalTokens }
+    }
+
+    private static func makeModelUsageRows(from records: [TokenUsageRecord]) -> [TodayModelUsageRow] {
+        struct Key: Hashable {
+            let source: UsageSource
+            let model: String
+        }
+        struct Totals {
+            var input = 0
+            var output = 0
+            var cacheCreation = 0
+            var cacheRead = 0
+            var total = 0
+            var cost = Decimal.zero
+        }
+
+        var totals: [Key: Totals] = [:]
+        for record in records {
+            let source = record.source.usageSource
+            if record.modelBreakdowns.isEmpty {
+                let key = Key(source: source, model: record.modelsUsed.first ?? "Unknown")
+                var entry = totals[key] ?? Totals()
+                entry.input += record.inputTokens
+                entry.output += record.outputTokens
+                entry.cacheCreation += record.cacheCreationTokens
+                entry.cacheRead += record.cacheReadTokens
+                entry.total += record.totalTokens
+                entry.cost += record.totalCost
+                totals[key] = entry
+            } else {
+                for breakdown in record.modelBreakdowns {
+                    let key = Key(source: source, model: breakdown.modelName)
+                    var entry = totals[key] ?? Totals()
+                    entry.input += breakdown.inputTokens
+                    entry.output += breakdown.outputTokens
+                    entry.cacheCreation += breakdown.cacheCreationTokens
+                    entry.cacheRead += breakdown.cacheReadTokens
+                    entry.total += breakdown.totalTokens
+                    entry.cost += breakdown.cost
+                    totals[key] = entry
+                }
+            }
+        }
+
+        return totals.map { key, entry in
+            TodayModelUsageRow(
+                source: key.source,
+                modelName: key.model,
+                inputTokens: entry.input,
+                outputTokens: entry.output,
+                cacheCreationTokens: entry.cacheCreation,
+                cacheReadTokens: entry.cacheRead,
+                totalTokens: entry.total,
+                totalCost: entry.cost.doubleValue
+            )
+        }
+        .sorted { $0.totalCost > $1.totalCost }
+    }
+
+    private static func makeHeatmapDays(
+        from records: [TokenUsageRecord],
+        days: [Date],
+        calendar: Calendar
+    ) -> [DashboardHeatmapDay] {
+        let tokensByDay = records.reduce(into: [Date: Int]()) { totals, record in
+            totals[calendar.startOfDay(for: record.date), default: 0] += record.totalTokens
+        }
+        return days.map { day in
+            DashboardHeatmapDay(date: day, tokens: tokensByDay[calendar.startOfDay(for: day)] ?? 0)
+        }
     }
 
     private static func makeModelCostRows(from records: [TokenUsageRecord]) -> [ModelCostRow] {
@@ -1768,12 +1909,12 @@ private struct TokenUsageDashboardData {
         let total = visibleRows.reduce(0.0) { $0 + $1.cost.doubleValue }
         guard total > 0 else { return [] }
 
-        return visibleRows.enumerated().map { index, row in
+        return visibleRows.map { row in
             ModelCostSlice(
                 model: row.model,
                 cost: row.cost,
                 percent: row.cost.doubleValue / total,
-                color: allColorFamilies[index % allColorFamilies.count].primary
+                color: stableModelColor(for: row.model)
             )
         }
     }
@@ -1781,17 +1922,25 @@ private struct TokenUsageDashboardData {
     private static func makeTokenTrendRows(
         from records: [TokenUsageRecord],
         selectedSource: TokenUsageSource,
-        selectedModels: Set<String>
+        selectedModels: Set<String>,
+        tokenTrendGroupBy: TokenUsageTrendGroupBy
     ) -> [TokenTrendRow] {
         let rows: [TokenTrendRow]
 
         if selectedSource == .all {
-            rows = records.map { record in
-                TokenTrendRow(
-                    date: record.date,
-                    series: record.source.label,
-                    tokens: record.totalTokens
-                )
+            switch tokenTrendGroupBy {
+            case .cli:
+                rows = records.map { record in
+                    TokenTrendRow(
+                        date: record.date,
+                        series: record.source.label,
+                        tokens: record.totalTokens
+                    )
+                }
+            case .model:
+                rows = records.flatMap { record in
+                    tokenTrendRowsByModel(for: record, selectedModels: selectedModels)
+                }
             }
         } else {
             rows = records.flatMap { record in
@@ -2655,6 +2804,334 @@ private struct ModelListLabel: View {
             Text("-")
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct TodayTokenHeroView: View {
+    let totalTokens: Int
+    let modelCount: Int
+    let isRefreshing: Bool
+
+    @State private var displayedValue = 0
+    @State private var hasAppeared = false
+    @State private var wasRefreshing = false
+    @State private var animationTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("TODAY'S TOKENS")
+                .font(.caption.weight(.semibold))
+                .tracking(1.2)
+                .foregroundStyle(.secondary)
+
+            Text(displayedValue.fullTokenText)
+                .font(.system(size: 44, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [
+                            Color(nsColor: .labelColor),
+                            Color.accentColor.opacity(0.85),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .lineLimit(1)
+                .minimumScaleFactor(0.45)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentTransition(.numericText())
+
+            Text("\(modelCount) models")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 86, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.accentColor.opacity(0.10),
+                    Color(nsColor: .controlBackgroundColor).opacity(0.55),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.22), lineWidth: 1)
+        )
+        .onAppear {
+            wasRefreshing = isRefreshing
+            guard !hasAppeared else { return }
+            hasAppeared = true
+            if !isRefreshing {
+                animate(to: totalTokens, fromZero: true)
+            }
+        }
+        .onChange(of: totalTokens) { _, newValue in
+            guard !isRefreshing else { return }
+            animate(to: newValue, fromZero: false)
+        }
+        .onChange(of: isRefreshing) { _, refreshing in
+            if wasRefreshing && !refreshing {
+                animate(to: totalTokens, fromZero: true)
+            }
+            wasRefreshing = refreshing
+        }
+        .onDisappear {
+            animationTask?.cancel()
+            animationTask = nil
+        }
+    }
+
+    private func animate(to target: Int, fromZero: Bool) {
+        animationTask?.cancel()
+
+        let end = max(target, 0)
+        let start = fromZero ? 0 : displayedValue
+        guard start != end else {
+            displayedValue = end
+            return
+        }
+
+        animationTask = Task { @MainActor in
+            let duration = 0.85
+            let startedAt = Date()
+            displayedValue = start
+
+            while !Task.isCancelled {
+                let progress = min(Date().timeIntervalSince(startedAt) / duration, 1)
+                let eased = 1 - pow(1 - progress, 3)
+                let next = start + Int((Double(end - start) * eased).rounded())
+                if next != displayedValue {
+                    withAnimation(.linear(duration: 0.05)) {
+                        displayedValue = next
+                    }
+                }
+                if progress >= 1 {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+
+            if !Task.isCancelled {
+                displayedValue = end
+            }
+        }
+    }
+}
+
+private struct DashboardHeroView: View {
+    let totalTokens: Int
+    let costText: String
+    let isRefreshing: Bool
+
+    @State private var displayedValue = 0
+    @State private var hasAppeared = false
+    @State private var wasRefreshing = false
+    @State private var animationTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 10) {
+            Text("TOTAL TOKENS")
+                .font(.caption.weight(.semibold))
+                .tracking(1.2)
+                .foregroundStyle(.secondary)
+
+            Text(displayedValue.fullTokenText)
+                .font(.system(size: 48, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [
+                            Color(nsColor: .labelColor),
+                            Color.accentColor.opacity(0.85),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .lineLimit(1)
+                .minimumScaleFactor(0.4)
+                .frame(maxWidth: .infinity)
+                .contentTransition(.numericText())
+                .multilineTextAlignment(.center)
+
+            Text(costText)
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 20)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.accentColor.opacity(0.10),
+                    Color(nsColor: .controlBackgroundColor).opacity(0.55),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.22), lineWidth: 1)
+        )
+        .onAppear {
+            wasRefreshing = isRefreshing
+            guard !hasAppeared else { return }
+            hasAppeared = true
+            if !isRefreshing {
+                animate(to: totalTokens, fromZero: true)
+            }
+        }
+        .onChange(of: totalTokens) { _, newValue in
+            guard !isRefreshing else { return }
+            animate(to: newValue, fromZero: false)
+        }
+        .onChange(of: isRefreshing) { _, refreshing in
+            if wasRefreshing && !refreshing {
+                animate(to: totalTokens, fromZero: true)
+            }
+            wasRefreshing = refreshing
+        }
+        .onDisappear {
+            animationTask?.cancel()
+            animationTask = nil
+        }
+    }
+
+    private func animate(to target: Int, fromZero: Bool) {
+        animationTask?.cancel()
+
+        let end = max(target, 0)
+        let start = fromZero ? 0 : displayedValue
+        guard start != end else {
+            displayedValue = end
+            return
+        }
+
+        animationTask = Task { @MainActor in
+            let duration = 0.85
+            let startedAt = Date()
+            displayedValue = start
+
+            while !Task.isCancelled {
+                let progress = min(Date().timeIntervalSince(startedAt) / duration, 1)
+                let eased = 1 - pow(1 - progress, 3)
+                let next = start + Int((Double(end - start) * eased).rounded())
+                if next != displayedValue {
+                    withAnimation(.linear(duration: 0.05)) {
+                        displayedValue = next
+                    }
+                }
+                if progress >= 1 {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+
+            if !Task.isCancelled {
+                displayedValue = end
+            }
+        }
+    }
+}
+
+private struct DashboardHeatmapDay: Identifiable {
+    var id: Date { date }
+    let date: Date
+    let tokens: Int
+}
+
+private struct DashboardHeatmapView: View {
+    let days: [DashboardHeatmapDay]
+
+    private let cellSize: CGFloat = 13
+    private let cellSpacing: CGFloat = 3
+
+    private var maxTokens: Int {
+        days.map(\.tokens).max() ?? 0
+    }
+
+    private var weeks: [[DashboardHeatmapDay?]] {
+        let calendar = Calendar.current
+        guard let first = days.first else { return [] }
+        var result: [[DashboardHeatmapDay?]] = []
+        var current: [DashboardHeatmapDay?] = []
+        let leadingEmpty = calendar.component(.weekday, from: first.date) - 1
+        current.append(contentsOf: Array(repeating: nil, count: leadingEmpty))
+        for day in days {
+            current.append(day)
+            if current.count == 7 {
+                result.append(current)
+                current = []
+            }
+        }
+        if !current.isEmpty {
+            current.append(contentsOf: Array(repeating: nil, count: 7 - current.count))
+            result.append(current)
+        }
+        return result
+    }
+
+    var body: some View {
+        if days.allSatisfy({ $0.tokens == 0 }) {
+            VStack(spacing: 8) {
+                Image(systemName: "square.grid.3x3")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("No token usage in range")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+        } else {
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(alignment: .top, spacing: cellSpacing) {
+                    ForEach(Array(weeks.enumerated()), id: \.offset) { _, week in
+                        VStack(spacing: cellSpacing) {
+                            ForEach(Array(week.enumerated()), id: \.offset) { _, day in
+                                cell(for: day)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 8)
+            }
+            .frame(maxWidth: .infinity, minHeight: 7 * cellSize + 6 * cellSpacing + 16, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func cell(for day: DashboardHeatmapDay?) -> some View {
+        if let day {
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(color(for: day.tokens))
+                .frame(width: cellSize, height: cellSize)
+                .help("\(day.date.formatted(.dateTime.year().month().day())) — \(day.tokens.fullTokenText) tokens")
+        } else {
+            Color.clear
+                .frame(width: cellSize, height: cellSize)
+        }
+    }
+
+    private func color(for tokens: Int) -> Color {
+        guard tokens > 0, maxTokens > 0 else {
+            return Color(nsColor: .controlBackgroundColor)
+        }
+        let ratio = Double(tokens) / Double(maxTokens)
+        let intensity = 0.18 + 0.82 * pow(ratio, 0.5)
+        return Color.accentColor.opacity(intensity)
     }
 }
 
@@ -3522,13 +3999,12 @@ private extension TodaySummaryResponse {
                 }
                 return $0.tokens > $1.tokens
             }
-            .enumerated()
-            .map { index, row in
+            .map { row in
                 TodayModelTokenRow(
                     modelName: row.modelName,
                     tokens: row.tokens,
                     percent: Double(row.tokens) / Double(total),
-                    color: allColorFamilies[index % allColorFamilies.count].primary
+                    color: stableModelColor(for: row.modelName)
                 )
             }
     }
@@ -3647,12 +4123,25 @@ private struct TokenCompositionTotals {
     }
 }
 
+private let fullTokenCountFormatter: NumberFormatter = {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.locale = Locale(identifier: "en_US")
+    formatter.usesGroupingSeparator = true
+    formatter.groupingSeparator = ","
+    return formatter
+}()
+
 private extension Int {
     var tokenText: String {
         if self >= 1_000_000_000 { return String(format: "%.2fB", Double(self) / 1_000_000_000) }
         if self >= 1_000_000 { return String(format: "%.2fM", Double(self) / 1_000_000) }
         if self >= 1_000 { return String(format: "%.1fK", Double(self) / 1_000) }
         return formatted()
+    }
+
+    var fullTokenText: String {
+        fullTokenCountFormatter.string(from: NSNumber(value: self)) ?? formatted()
     }
 }
 
@@ -3712,6 +4201,12 @@ func displayModelName(_ modelName: String) -> String {
         displayName = "glm-5.2"
     } else if normalized.contains("step-3.7-flash") {
         displayName = "step-3.7-flash"
+    } else if normalized.contains("grok4.5")
+        || normalized.contains("grok-4.5")
+        || normalized.contains("grok-4-5") {
+        displayName = "grok4.5"
+    } else if normalized.contains("claude-fable-5") {
+        displayName = "claude-fable-5"
     } else if normalized.contains("composer-2.5-fast") || normalized.contains("composer-2-5-fast") {
         displayName = "composer-2.5-fast"
     } else if normalized.contains("grok-composer-2.5-fast") || normalized.contains("grok-composer-2-5-fast") {

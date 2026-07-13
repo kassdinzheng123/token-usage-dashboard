@@ -2,7 +2,7 @@ import Foundation
 
 @MainActor
 final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
-    @Published var selectedSource: TokenUsageSource = .claude
+    @Published var selectedSource: TokenUsageSource = .all
     @Published var selectedViewMode: TokenUsageViewMode = .daily
     @Published var startDate: Date
     @Published var endDate: Date
@@ -35,7 +35,7 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
         self.dashboardRecordsCache = DashboardRecordsCache(client: client)
         let today = Date()
         self.endDate = calendar.date(byAdding: .day, value: 1, to: today) ?? today
-        self.startDate = calendar.date(byAdding: .day, value: -14, to: today) ?? today
+        self.startDate = calendar.startOfDay(for: today)
         startDashboardCacheRefreshTimer()
         startBackendPoller()
     }

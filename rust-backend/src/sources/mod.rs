@@ -411,6 +411,13 @@ pub(crate) fn cluster_model_name(model_name: &str) -> String {
         "qwen3.6-plus"
     } else if stripped.contains("step-3.7-flash") {
         "step-3.7-flash"
+    } else if stripped.contains("grok4.5")
+        || stripped.contains("grok-4.5")
+        || stripped.contains("grok-4-5")
+    {
+        "grok4.5"
+    } else if stripped.contains("claude-fable-5") {
+        "claude-fable-5"
     } else if stripped.contains("composer-2.5-fast") || stripped.contains("composer-2-5-fast") {
         "composer-2.5-fast"
     } else if stripped.contains("composer-2.5") || stripped.contains("composer-2-5") {
@@ -479,6 +486,25 @@ mod tests {
         assert_eq!(
             cluster_model_name("anthropic/claude-sonnet-5"),
             "claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn cluster_model_name_merges_grok45_and_claude_fable_5_variants() {
+        assert_eq!(cluster_model_name("grok4.5"), "grok4.5");
+        assert_eq!(cluster_model_name("grok-4.5"), "grok4.5");
+        assert_eq!(cluster_model_name("grok-4-5"), "grok4.5");
+        assert_eq!(cluster_model_name("grok-4.5-latest"), "grok4.5");
+        assert_eq!(cluster_model_name("xai/grok-4.5"), "grok4.5");
+        assert_eq!(cluster_model_name("custom:grok4.5-high"), "grok4.5");
+        assert_eq!(cluster_model_name("claude-fable-5"), "claude-fable-5");
+        assert_eq!(
+            cluster_model_name("claude-fable-5-thinking-high"),
+            "claude-fable-5"
+        );
+        assert_eq!(
+            cluster_model_name("anthropic/claude-fable-5"),
+            "claude-fable-5"
         );
     }
 

@@ -115,6 +115,26 @@ fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
     if is_sonnet_5 {
         return Some(claude_sonnet_5_cost_usd(usage));
     }
+    let is_grok_45 = candidates.iter().any(|candidate| {
+        matches!(
+            candidate.as_str(),
+            "grok4.5" | "grok-4.5" | "grok-4-5" | "xai/grok-4.5" | "xai/grok4.5"
+        ) || candidate.contains("grok4.5")
+            || candidate.contains("grok-4.5")
+            || candidate.contains("grok-4-5")
+    });
+    if is_grok_45 {
+        return Some(grok_45_cost_usd(usage));
+    }
+    let is_claude_fable_5 = candidates.iter().any(|candidate| {
+        matches!(
+            candidate.as_str(),
+            "claude-fable-5" | "anthropic/claude-fable-5"
+        ) || candidate.contains("claude-fable-5")
+    });
+    if is_claude_fable_5 {
+        return Some(claude_fable_5_cost_usd(usage));
+    }
     None
 }
 
@@ -152,6 +172,24 @@ fn claude_sonnet_5_cost_usd(usage: TokenUsage) -> f64 {
         + usage.output_tokens.max(0) as f64 * output_rate
         + usage.cache_creation_tokens.max(0) as f64 * cache_write_rate
         + usage.cache_read_tokens.max(0) as f64 * cache_read_rate)
+        / MILLION
+}
+
+fn grok_45_cost_usd(usage: TokenUsage) -> f64 {
+    // SpaceXAI API: $2 input / $6 output / $0.50 cached input per 1M tokens.
+    (usage.input_tokens.max(0) as f64 * 2.0
+        + usage.output_tokens.max(0) as f64 * 6.0
+        + usage.cache_creation_tokens.max(0) as f64 * 2.0
+        + usage.cache_read_tokens.max(0) as f64 * 0.50)
+        / MILLION
+}
+
+fn claude_fable_5_cost_usd(usage: TokenUsage) -> f64 {
+    // Anthropic: $10 input / $50 output / $12.50 5m cache write / $1 cache read per 1M.
+    (usage.input_tokens.max(0) as f64 * 10.0
+        + usage.output_tokens.max(0) as f64 * 50.0
+        + usage.cache_creation_tokens.max(0) as f64 * 12.50
+        + usage.cache_read_tokens.max(0) as f64 * 1.0)
         / MILLION
 }
 
@@ -843,6 +881,15 @@ fn resolve_alias(model: &str) -> String {
     if normalized.contains("composer-2.5") || normalized.contains("composer-2-5") {
         return "composer-2.5".to_string();
     }
+    if normalized.contains("grok4.5")
+        || normalized.contains("grok-4.5")
+        || normalized.contains("grok-4-5")
+    {
+        return "grok4.5".to_string();
+    }
+    if normalized.contains("claude-fable-5") {
+        return "claude-fable-5".to_string();
+    }
     if normalized.contains("claude-sonnet-5") {
         return "claude-sonnet-5".to_string();
     }
@@ -1063,9 +1110,43 @@ mod tests {
     }
 
     #[test]
+    fn calculates_builtin_grok_45_cost() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        let cost = model_cost_usd("grok4.5", usage);
+        let expected =
+            (1_000_000.0 * 2.0 + 1_000_000.0 * 6.0 + 250_000.0 * 2.0 + 500_000.0 * 0.50) / MILLION;
+
+        assert!((cost - expected).abs() < 1e-12);
+        assert_eq!(model_cost_usd("grok-4.5", usage), cost);
+        assert_eq!(model_cost_usd("grok-4.5-latest", usage), cost);
+        assert_eq!(model_cost_usd("xai/grok-4-5", usage), cost);
+    }
+
+    #[test]
+    fn calculates_builtin_claude_fable_5_cost() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        let cost = model_cost_usd("claude-fable-5", usage);
+        let expected =
+            (1_000_000.0 * 10.0 + 1_000_000.0 * 50.0 + 250_000.0 * 12.50 + 500_000.0 * 1.0)
+                / MILLION;
+
+        assert!((cost - expected).abs() < 1e-12);
+        assert_eq!(model_cost_usd("claude-fable-5-thinking-high", usage), cost);
+        assert_eq!(model_cost_usd("anthropic/claude-fable-5", usage), cost);
+    }
+
+    #[test]
     fn resolves_claude_sonnet_5_alias() {
         let candidates = candidates_for("claude-sonnet-5-thinking-high");
         assert!(candidates.contains(&"claude-sonnet-5".to_string()));
+    }
+
+    #[test]
+    fn resolves_grok_45_and_claude_fable_5_aliases() {
+        let grok_candidates = candidates_for("grok-4.5-latest");
+        assert!(grok_candidates.contains(&"grok4.5".to_string()));
+        let fable_candidates = candidates_for("claude-fable-5-thinking-high");
+        assert!(fable_candidates.contains(&"claude-fable-5".to_string()));
     }
 
     #[test]
