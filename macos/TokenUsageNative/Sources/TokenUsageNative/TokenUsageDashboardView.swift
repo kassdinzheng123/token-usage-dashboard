@@ -52,7 +52,8 @@ private let maximumBarWidth: CGFloat = 96.0
 private let dailyUsagePlotHeight: CGFloat = 220
 private let dailyUsageContentHeight: CGFloat = 280
 private let tokenTrendLegendPageSize = 6
-private let modelDistributionLegendPageSize = 10
+private let modelDistributionLegendRowHeight: CGFloat = 32
+private let modelDistributionLegendRowSpacing: CGFloat = 10
 private let cliConsumptionPageSize = 5
 private let todayModelPageSize = 10
 private let allRangeBarPageSize = 60
@@ -303,6 +304,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var tokenTrendLegendPage = 0
     @State private var modelCostLegendPage = 0
     @State private var tokenMixLegendPage = 0
+    @State private var modelDistributionLegendCapacity = 1
     @State private var cliConsumptionPage = 0
     @State private var todayModelPage = 0
     @State private var allRangeChartPage = 0
@@ -1199,7 +1201,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private func tokenMixLegendPageCount(for rows: [TodayModelTokenRow]) -> Int {
-        max(Int(ceil(Double(rows.count) / Double(modelDistributionLegendPageSize))), 1)
+        max(Int(ceil(Double(rows.count) / Double(modelDistributionLegendCapacity))), 1)
     }
 
     private func clampedTokenMixLegendPage(for rows: [TodayModelTokenRow]) -> Int {
@@ -1208,9 +1210,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private func visibleTokenMixRows(from rows: [TodayModelTokenRow]) -> [TodayModelTokenRow] {
         let page = clampedTokenMixLegendPage(for: rows)
-        let start = page * modelDistributionLegendPageSize
+        let start = page * modelDistributionLegendCapacity
         guard start < rows.count else { return rows }
-        let end = min(start + modelDistributionLegendPageSize, rows.count)
+        let end = min(start + modelDistributionLegendCapacity, rows.count)
         return Array(rows[start..<end])
     }
 
@@ -1401,18 +1403,39 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                         }
                     }
                 } content: {
-                    switch modelCostMixPane {
-                    case .cost:
-                        modelCostChart
-                            .frame(maxWidth: .infinity, minHeight: paneHeight, maxHeight: paneHeight)
-                    case .mix:
-                        todayTokenMix(summary: dashboardSummary)
-                            .frame(maxWidth: .infinity, minHeight: paneHeight, maxHeight: paneHeight)
-                    }
+                    modelDistributionContent(summary: dashboardSummary)
                 }
                 .frame(height: paneHeight + 66, alignment: .top)
             }
         }
+    }
+
+    @ViewBuilder
+    private func modelDistributionContent(summary: TodaySummaryResponse) -> some View {
+        GeometryReader { geometry in
+            Group {
+                switch modelCostMixPane {
+                case .cost:
+                    modelCostChart
+                case .mix:
+                    todayTokenMix(summary: summary)
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .onAppear {
+                updateModelDistributionLegendCapacity(for: geometry.size.height)
+            }
+            .onChange(of: geometry.size.height) { _, height in
+                updateModelDistributionLegendCapacity(for: height)
+            }
+        }
+    }
+
+    private func updateModelDistributionLegendCapacity(for availableHeight: CGFloat) {
+        let stride = modelDistributionLegendRowHeight + modelDistributionLegendRowSpacing
+        let capacity = max(Int((availableHeight + modelDistributionLegendRowSpacing) / stride), 1)
+        guard capacity != modelDistributionLegendCapacity else { return }
+        modelDistributionLegendCapacity = capacity
     }
 
     private var dailyUsageCardHeight: CGFloat {
@@ -1622,7 +1645,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var modelCostLegendPageCount: Int {
-        max(Int(ceil(Double(modelCostSlices.count) / Double(modelDistributionLegendPageSize))), 1)
+        max(Int(ceil(Double(modelCostSlices.count) / Double(modelDistributionLegendCapacity))), 1)
     }
 
     private var clampedModelCostLegendPage: Int {
@@ -1630,9 +1653,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var visibleModelCostLegendSlices: [ModelCostSlice] {
-        let start = clampedModelCostLegendPage * modelDistributionLegendPageSize
+        let start = clampedModelCostLegendPage * modelDistributionLegendCapacity
         guard start < modelCostSlices.count else { return modelCostSlices }
-        let end = min(start + modelDistributionLegendPageSize, modelCostSlices.count)
+        let end = min(start + modelDistributionLegendCapacity, modelCostSlices.count)
         return Array(modelCostSlices[start..<end])
     }
 
@@ -4019,7 +4042,7 @@ private struct TokenMixLegend: View {
     let rows: [TodayModelTokenRow]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: modelDistributionLegendRowSpacing) {
             ForEach(rows) { row in
                 legendItem(row)
             }
@@ -4046,7 +4069,12 @@ private struct TokenMixLegend: View {
                     .foregroundStyle(.primary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: modelDistributionLegendRowHeight,
+            maxHeight: modelDistributionLegendRowHeight,
+            alignment: .leading
+        )
     }
 }
 
@@ -4608,7 +4636,7 @@ private struct ModelCostLegend: View {
     @ObservedObject var currencyController: TokenUsageBillingCurrencyController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: modelDistributionLegendRowSpacing) {
             ForEach(slices) { slice in
                 legendItem(slice)
             }
@@ -4635,7 +4663,12 @@ private struct ModelCostLegend: View {
                     .foregroundStyle(.primary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: modelDistributionLegendRowHeight,
+            maxHeight: modelDistributionLegendRowHeight,
+            alignment: .leading
+        )
     }
 }
 
