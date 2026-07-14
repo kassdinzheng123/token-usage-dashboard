@@ -51,7 +51,6 @@ private let chartTooltipHeight = 86.0
 private let maximumBarWidth: CGFloat = 96.0
 private let dailyUsagePlotHeight: CGFloat = 220
 private let dailyUsageContentHeight: CGFloat = 280
-private let dailyUsageCardHeight: CGFloat = dailyUsageContentHeight + 68
 private let tokenTrendLegendPageSize = 6
 private let modelCostLegendPageSize = 5
 private let cliConsumptionPageSize = 5
@@ -1415,6 +1414,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
+    private var dailyUsageCardHeight: CGFloat {
+        dailyUsageContentHeight + (selectedTimeRange == .all ? 92 : 68)
+    }
+
     private var dailyTokenUsageSection: some View {
         GeometryReader { geometry in
             let spacing: CGFloat = 20
@@ -1436,7 +1439,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 .frame(width: heatmapWidth, height: dailyUsageCardHeight)
 
                 ChartCard(title: "Daily Token Usage") {
-                    HStack(spacing: 10) {
+                    VStack(alignment: .trailing, spacing: 6) {
                         Picker("", selection: $dailyUsageAggregation) {
                             ForEach(DashboardDailyUsageAggregation.allCases) { aggregation in
                                 Text(aggregation.label).tag(aggregation)
