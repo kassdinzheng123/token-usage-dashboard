@@ -169,6 +169,27 @@ private enum DashboardModelCostMixPane: String, CaseIterable, Identifiable {
     }
 }
 
+private enum DashboardDailyUsageAggregation: String, CaseIterable, Identifiable {
+    case cli
+    case model
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .cli: "CLI"
+        case .model: "Model"
+        }
+    }
+
+    var seriesLabel: String {
+        switch self {
+        case .cli: "CLI"
+        case .model: "Model"
+        }
+    }
+}
+
 // Expanded stable model palette: primary/light/dark from every family.
 private let expandedModelPalette: [Color] = allColorFamilies.flatMap { [$0.primary, $0.light, $0.dark] }
 
@@ -295,6 +316,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var selectedTimeRange: DashboardTimeRange = .today
     @State private var cliCompositionPane: DashboardCLICompositionPane = .cli
     @State private var modelCostMixPane: DashboardModelCostMixPane = .cost
+    @State private var dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
     @State private var dashboardData: TokenUsageDashboardData
 
     init(store: Store, currencyController: TokenUsageBillingCurrencyController) {
@@ -387,6 +409,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 updateDashboardData()
                 tokenTrendLegendPage = 0
             }
+            .onChange(of: dailyUsageAggregation) {
+                updateDashboardData()
+                tokenTrendLegendPage = 0
+            }
             .onChange(of: tokenTrendColorDomain) {
                 tokenTrendLegendPage = 0
             }
@@ -420,7 +446,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private static func makeDashboardData(
         from store: Store,
-        timeRange: DashboardTimeRange = .today
+        timeRange: DashboardTimeRange = .today,
+        dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
     ) -> TokenUsageDashboardData {
         TokenUsageDashboardData.make(
             records: store.records,
@@ -429,14 +456,16 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             startDate: store.startDate,
             endDate: store.endDate,
             selectedModels: store.selectedModels,
-            timeRange: timeRange
+            timeRange: timeRange,
+            dailyUsageAggregation: dailyUsageAggregation
         )
     }
 
     private func updateDashboardData() {
         dashboardData = Self.makeDashboardData(
             from: store,
-            timeRange: selectedTimeRange
+            timeRange: selectedTimeRange,
+            dailyUsageAggregation: dailyUsageAggregation
         )
         clearChartInteractionState()
         modelCostLegendPage = 0
@@ -1407,7 +1436,18 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 .frame(width: heatmapWidth, height: dailyUsageCardHeight)
 
                 ChartCard(title: "Daily Token Usage") {
-                    allRangeBarPager
+                    HStack(spacing: 10) {
+                        Picker("", selection: $dailyUsageAggregation) {
+                            ForEach(DashboardDailyUsageAggregation.allCases) { aggregation in
+                                Text(aggregation.label).tag(aggregation)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 132)
+
+                        allRangeBarPager
+                    }
                 } content: {
                     tokenTrendChart
                         .frame(
@@ -1512,6 +1552,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 currentPage: clampedTokenTrendLegendPage,
                 pageCount: tokenTrendLegendPageCount,
                 totalCount: tokenTrendColorDomain.count,
+                usesCompactLayout: usesCLITokenTrendGrouping,
                 onPrevious: {
                     tokenTrendLegendPage = max(clampedTokenTrendLegendPage - 1, 0)
                 },
@@ -1610,11 +1651,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var tokenTrendSeriesLabel: String {
-        usesCLITokenTrendGrouping ? "Source" : "Model"
+        dailyUsageAggregation.seriesLabel
     }
 
     private var usesCLITokenTrendGrouping: Bool {
-        store.selectedSource == .all
+        dailyUsageAggregation == .cli
     }
 
     private var tokenTrendColorDomain: [String] {
@@ -1982,7 +2023,8 @@ private struct TokenUsageDashboardData {
         startDate: Date,
         endDate: Date,
         selectedModels: Set<String>,
-        timeRange: DashboardTimeRange = .today
+        timeRange: DashboardTimeRange = .today,
+        dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
     ) -> TokenUsageDashboardData {
         let calendar = Calendar.current
         let rangeStart = selectedViewMode == .monthly
@@ -2025,7 +2067,7 @@ private struct TokenUsageDashboardData {
         let modelCostSlices = makeModelCostSlices(from: modelCostRows)
         let tokenTrendRows = makeTokenTrendRows(
             from: filteredRecords,
-            selectedSource: selectedSource,
+            aggregation: dailyUsageAggregation,
             selectedModels: selectedModels
         )
         let tokenTrendColorDomain = Array(Set(tokenTrendRows.map(\.series))).sorted()
@@ -2294,20 +2336,17 @@ private struct TokenUsageDashboardData {
 
     private static func makeTokenTrendRows(
         from records: [TokenUsageRecord],
-        selectedSource: TokenUsageSource,
+        aggregation: DashboardDailyUsageAggregation,
         selectedModels: Set<String>
     ) -> [TokenTrendRow] {
         let rows: [TokenTrendRow]
 
-        if selectedSource == .all {
-            rows = records.map { record in
-                TokenTrendRow(
-                    date: record.date,
-                    series: record.source.label,
-                    tokens: record.totalTokens
-                )
+        switch aggregation {
+        case .cli:
+            rows = records.compactMap { record in
+                tokenTrendRowByCLI(for: record, selectedModels: selectedModels)
             }
-        } else {
+        case .model:
             rows = records.flatMap { record in
                 tokenTrendRowsByModel(for: record, selectedModels: selectedModels)
             }
@@ -2319,6 +2358,31 @@ private struct TokenUsageDashboardData {
             }
             return $0.date < $1.date
         }
+    }
+
+    private static func tokenTrendRowByCLI(
+        for record: TokenUsageRecord,
+        selectedModels: Set<String>
+    ) -> TokenTrendRow? {
+        let tokens: Int
+        if selectedModels.isEmpty {
+            tokens = record.totalTokens
+        } else if !record.modelBreakdowns.isEmpty {
+            tokens = record.modelBreakdowns
+                .filter { selectedModels.contains($0.modelName) }
+                .reduce(0) { $0 + $1.totalTokens }
+            guard tokens > 0 else { return nil }
+        } else {
+            let matchingModels = record.modelsUsed.filter { selectedModels.contains($0) }
+            guard matchingModels.count == 1 else { return nil }
+            tokens = record.totalTokens
+        }
+
+        return TokenTrendRow(
+            date: record.date,
+            series: record.source.label,
+            tokens: tokens
+        )
     }
 
     private static func tokenTrendRowsByModel(
@@ -4181,6 +4245,7 @@ private struct TokenTrendLegend: View {
     let currentPage: Int
     let pageCount: Int
     let totalCount: Int
+    let usesCompactLayout: Bool
     let onPrevious: () -> Void
     let onNext: () -> Void
 
@@ -4192,12 +4257,23 @@ private struct TokenTrendLegend: View {
             }
             .buttonStyle(.borderless)
             .disabled(currentPage == 0)
-            .help("Previous models")
+            .help(usesCompactLayout ? "Previous CLIs" : "Previous models")
 
-            ViewThatFits(in: .horizontal) {
-                legendGrid(columnCount: 3, itemWidth: 190)
-                legendGrid(columnCount: 2, itemWidth: 190)
-                legendGrid(columnCount: 1, itemWidth: 230)
+            Group {
+                if usesCompactLayout {
+                    ViewThatFits(in: .horizontal) {
+                        legendGrid(columnCount: 4, itemWidth: 124, horizontalSpacing: 8)
+                        legendGrid(columnCount: 3, itemWidth: 132, horizontalSpacing: 8)
+                        legendGrid(columnCount: 2, itemWidth: 154, horizontalSpacing: 10)
+                        legendGrid(columnCount: 1, itemWidth: 190, horizontalSpacing: 0)
+                    }
+                } else {
+                    ViewThatFits(in: .horizontal) {
+                        legendGrid(columnCount: 3, itemWidth: 190, horizontalSpacing: 18)
+                        legendGrid(columnCount: 2, itemWidth: 190, horizontalSpacing: 18)
+                        legendGrid(columnCount: 1, itemWidth: 230, horizontalSpacing: 0)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .center)
 
@@ -4205,7 +4281,7 @@ private struct TokenTrendLegend: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 42)
-                .help("\(totalCount) models")
+                .help("\(totalCount) \(usesCompactLayout ? "CLIs" : "models")")
 
             Button(action: onNext) {
                 Image(systemName: "chevron.right")
@@ -4213,15 +4289,19 @@ private struct TokenTrendLegend: View {
             }
             .buttonStyle(.borderless)
             .disabled(currentPage >= pageCount - 1)
-            .help("Next models")
+            .help(usesCompactLayout ? "Next CLIs" : "Next models")
         }
         .frame(maxWidth: .infinity, minHeight: 48, alignment: .center)
     }
 
-    private func legendGrid(columnCount: Int, itemWidth: CGFloat) -> some View {
-        VStack(alignment: .center, spacing: 8) {
+    private func legendGrid(
+        columnCount: Int,
+        itemWidth: CGFloat,
+        horizontalSpacing: CGFloat
+    ) -> some View {
+        VStack(alignment: .center, spacing: usesCompactLayout ? 6 : 8) {
             ForEach(Array(legendRows(columnCount: columnCount).enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 18) {
+                HStack(spacing: horizontalSpacing) {
                     ForEach(row) { entry in
                         legendItem(entry, width: itemWidth)
                     }
@@ -4234,18 +4314,18 @@ private struct TokenTrendLegend: View {
 
     private func legendItem(_ entry: TokenTrendLegendEntry, width: CGFloat) -> some View {
         let label = displayModelName(entry.label)
-        return HStack(spacing: 8) {
+        return HStack(spacing: usesCompactLayout ? 6 : 8) {
             Circle()
                 .fill(entry.color)
                 .frame(width: 9, height: 9)
-            LegendBadge(label: entry.label)
+            LegendBadge(label: entry.label, compact: usesCompactLayout)
             Text(label)
-                .font(.caption)
+                .font(usesCompactLayout ? .caption2 : .caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
-        .frame(width: width, alignment: .center)
+        .frame(width: width, alignment: usesCompactLayout ? .leading : .center)
     }
 
     private func legendRows(columnCount: Int) -> [[TokenTrendLegendEntry]] {
@@ -4258,10 +4338,13 @@ private struct TokenTrendLegend: View {
 
 private struct LegendBadge: View {
     let label: String
+    let compact: Bool
 
     var body: some View {
         if let source = UsageSource(label: label) {
             UsageSourceIconBadge(source: source)
+                .scaleEffect(compact ? 0.82 : 1)
+                .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
         } else {
             ProviderIconBadge(modelName: label)
         }
