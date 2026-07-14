@@ -3891,7 +3891,7 @@ private struct TokenMixDistributionChart: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 TokenMixLegend(rows: legendRows)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -4024,7 +4024,7 @@ private struct TokenMixLegend: View {
                 legendItem(row)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     private func legendItem(_ row: TodayModelTokenRow) -> some View {
@@ -4478,7 +4478,7 @@ private struct ModelCostDistributionChart: View {
                     slices: legendSlices,
                     currencyController: currencyController
                 )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -4613,7 +4613,7 @@ private struct ModelCostLegend: View {
                 legendItem(slice)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     private func legendItem(_ slice: ModelCostSlice) -> some View {
