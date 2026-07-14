@@ -1430,7 +1430,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     GeometryReader { heatmapGeometry in
                         DashboardHeatmapView(
                             days: visibleHeatmapDays,
-                            availableWidth: heatmapGeometry.size.width
+                            availableWidth: heatmapGeometry.size.width,
+                            costText: { currencyController.string(fromUSD: $0) }
                         )
                         .frame(width: heatmapGeometry.size.width, height: dailyUsageContentHeight)
                     }
@@ -1893,12 +1894,21 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         let tokensByDay = dashboardData.heatmapDays.reduce(into: [Date: Int]()) { totals, day in
             totals[calendar.startOfDay(for: day.date)] = day.tokens
         }
+        let costByDay = dashboardData.heatmapDays.reduce(into: [Date: Decimal]()) { totals, day in
+            totals[calendar.startOfDay(for: day.date)] = day.cost
+        }
 
         var days: [DashboardHeatmapDay] = []
         var date = calendar.startOfDay(for: round.start)
         let end = calendar.startOfDay(for: round.end)
         while date <= end {
-            days.append(DashboardHeatmapDay(date: date, tokens: tokensByDay[date] ?? 0))
+            days.append(
+                DashboardHeatmapDay(
+                    date: date,
+                    tokens: tokensByDay[date] ?? 0,
+                    cost: costByDay[date] ?? .zero
+                )
+            )
             guard let nextDate = calendar.date(byAdding: .day, value: 1, to: date) else {
                 break
             }
@@ -2263,8 +2273,16 @@ private struct TokenUsageDashboardData {
         let tokensByDay = records.reduce(into: [Date: Int]()) { totals, record in
             totals[calendar.startOfDay(for: record.date), default: 0] += record.totalTokens
         }
+        let costByDay = records.reduce(into: [Date: Decimal]()) { totals, record in
+            totals[calendar.startOfDay(for: record.date), default: .zero] += record.totalCost
+        }
         return days.map { day in
-            DashboardHeatmapDay(date: day, tokens: tokensByDay[calendar.startOfDay(for: day)] ?? 0)
+            let date = calendar.startOfDay(for: day)
+            return DashboardHeatmapDay(
+                date: day,
+                tokens: tokensByDay[date] ?? 0,
+                cost: costByDay[date] ?? .zero
+            )
         }
     }
 
@@ -3486,11 +3504,15 @@ private struct DashboardHeatmapDay: Identifiable {
     var id: Date { date }
     let date: Date
     let tokens: Int
+    let cost: Decimal
 }
 
 private struct DashboardHeatmapView: View {
     let days: [DashboardHeatmapDay]
     let availableWidth: CGFloat
+    let costText: (Decimal) -> String
+
+    @State private var hoveredDay: DashboardHeatmapDay?
 
     private let maximumCellSize: CGFloat = 30
     private let minimumCellSize: CGFloat = 16
@@ -3625,6 +3647,18 @@ private struct DashboardHeatmapView: View {
             .padding(.vertical, 8)
             .frame(width: heatmapWidth, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
+            .overlay(alignment: .topTrailing) {
+                if let hoveredDay {
+                    ChartTooltipPanel(
+                        title: hoveredDay.date.formatted(.dateTime.year().month().day()),
+                        rows: [
+                            (label: "Tokens", value: hoveredDay.tokens.fullTokenText),
+                            (label: "Cost", value: costText(hoveredDay.cost))
+                        ]
+                    )
+                    .padding(4)
+                }
+            }
         }
     }
 
@@ -3698,7 +3732,14 @@ private struct DashboardHeatmapView: View {
             RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(color(for: day.tokens))
                 .frame(width: cellSize, height: cellSize)
-                .help("\(day.date.formatted(.dateTime.year().month().day())) — \(day.tokens.fullTokenText) tokens")
+                .help("\(day.date.formatted(.dateTime.year().month().day()))\n\(day.tokens.fullTokenText) tokens\n\(costText(day.cost))")
+                .onHover { isHovering in
+                    if isHovering {
+                        hoveredDay = day
+                    } else if hoveredDay?.date == day.date {
+                        hoveredDay = nil
+                    }
+                }
         } else {
             RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(Color.clear)
@@ -4321,7 +4362,9 @@ private struct TokenTrendLegend: View {
             Circle()
                 .fill(entry.color)
                 .frame(width: 9, height: 9)
-            LegendBadge(label: entry.label, compact: usesCompactLayout)
+            if usesCompactLayout {
+                LegendBadge(label: entry.label, compact: true)
+            }
             Text(label)
                 .font(usesCompactLayout ? .caption2 : .caption)
                 .foregroundStyle(.secondary)
