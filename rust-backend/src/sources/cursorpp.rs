@@ -3,7 +3,7 @@ use crate::sources::{home_dir, LocalSession, SourceError};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -99,57 +99,74 @@ fn read_log_file(path: &Path) -> Result<Vec<LocalSession>, SourceError> {
     let reader = BufReader::new(file);
     let file_id = session_file_id(path);
 
-    let mut sessions = Vec::new();
-    let mut pending: Option<PendingRun> = None;
+    // Multi-pending architecture: each concurrent RunSSE gets its own PendingRun
+    // keyed by requestId. This prevents concurrent subagent sessions from
+    // prematurely finalizing each other's pending state.
+    let mut pending_by_request_id: HashMap<String, PendingRun> = HashMap::new();
+    let mut conversation_id_to_request_id: HashMap<String, String> = HashMap::new();
     let mut run_index = 0usize;
     let mut current_request_id: Option<String> = None;
+    let mut sessions = Vec::new();
 
     for line in reader.lines() {
         let line = line?;
+
+        // RunSSE started — register a new pending entry for this requestId.
         if let Some(request_id) = parse_run_request_id(&line) {
-            if let Some(session) = finalize_pending(&file_id, pending.take()) {
-                sessions.push(session);
-            }
-            current_request_id = Some(request_id);
-            continue;
-        }
-        if current_request_id.is_none() {
-            current_request_id = parse_embedded_request_id(&line);
-        }
-
-        if let Some((timestamp, model_name)) = parse_agent_start(&line) {
-            if let Some(session) = finalize_pending(&file_id, pending.take()) {
-                sessions.push(session);
-            }
-            pending = Some(PendingRun {
-                run_index,
-                timestamp: Some(timestamp),
-                request_id: current_request_id.clone(),
-                model_name: Some(model_name),
-                snapshot: None,
-            });
-            run_index += 1;
-            continue;
-        }
-
-        if let Some(model_name) = parse_oai_response_model(&line) {
-            let timestamp = parse_log_timestamp(&line);
-            let run = pending.get_or_insert_with(|| {
-                let index = run_index;
+            current_request_id = Some(request_id.clone());
+            pending_by_request_id.entry(request_id.clone()).or_insert_with(|| {
                 run_index += 1;
                 PendingRun {
-                    run_index: index,
-                    timestamp,
-                    request_id: current_request_id.clone(),
+                    run_index,
+                    timestamp: parse_log_timestamp(&line),
+                    request_id: Some(request_id),
                     model_name: None,
                     snapshot: None,
                 }
             });
-            if run.timestamp.is_none() {
-                run.timestamp = timestamp;
+            continue;
+        }
+
+        // Fallback: infer requestId from embedded JSON if we don't have one yet.
+        if current_request_id.is_none() {
+            current_request_id = parse_embedded_request_id(&line);
+        }
+
+        // Proactively map any conversationId seen in this line to the current
+        // requestId. This ensures that when usageTotals arrive later (possibly
+        // after current_request_id has switched to a concurrent session), we
+        // can still route them back to the correct pending run.
+        if let Some(request_id) = &current_request_id {
+            if let Some(conv_id) = parse_line_conversation_id(&line) {
+                conversation_id_to_request_id
+                    .entry(conv_id)
+                    .or_insert(request_id.clone());
             }
-            if run.request_id.is_none() {
-                run.request_id = current_request_id.clone();
+        }
+
+        // [AGENT] line provides the model name. Attach it to the pending run
+        // for the current requestId (or create one if missing).
+        if let Some((timestamp, model_name)) = parse_agent_start(&line) {
+            let request_id = resolve_request_id_for_agent_line(
+                &line,
+                &current_request_id,
+                &mut pending_by_request_id,
+                &mut run_index,
+            );
+            let run = pending_by_request_id
+                .entry(request_id.clone())
+                .or_insert_with(|| {
+                    run_index += 1;
+                    PendingRun {
+                        run_index,
+                        timestamp: Some(timestamp),
+                        request_id: Some(request_id),
+                        model_name: None,
+                        snapshot: None,
+                    }
+                });
+            if run.timestamp.is_none() {
+                run.timestamp = Some(timestamp);
             }
             if run.model_name.is_none() {
                 run.model_name = Some(model_name);
@@ -157,45 +174,80 @@ fn read_log_file(path: &Path) -> Result<Vec<LocalSession>, SourceError> {
             continue;
         }
 
-        if let Some(snapshot) = parse_usage_snapshot(&line) {
-            let timestamp = snapshot.timestamp;
-            let run = pending.get_or_insert_with(|| {
-                let index = run_index;
-                run_index += 1;
-                PendingRun {
-                    run_index: index,
-                    timestamp,
-                    request_id: current_request_id.clone(),
-                    model_name: None,
-                    snapshot: None,
+        // Prompt-cache lines provide model name + timestamp. Attach to the
+        // current requestId's pending run.
+        if let Some(model_name) = parse_prompt_cache_model(&line) {
+            let timestamp = parse_log_timestamp(&line);
+            if let Some(request_id) = &current_request_id {
+                let run = pending_by_request_id
+                    .entry(request_id.clone())
+                    .or_insert_with(|| {
+                        run_index += 1;
+                        PendingRun {
+                            run_index,
+                            timestamp,
+                            request_id: Some(request_id.clone()),
+                            model_name: None,
+                            snapshot: None,
+                        }
+                    });
+                if run.timestamp.is_none() {
+                    run.timestamp = timestamp;
                 }
-            });
+                if run.model_name.is_none() {
+                    run.model_name = Some(model_name);
+                }
+            }
+            continue;
+        }
+
+        // usageTotals snapshot — the key event that carries token counts.
+        // We need to route it to the correct pending run by conversationId
+        // (not all usageTotals lines contain a requestId).
+        if let Some(snapshot) = parse_usage_snapshot(&line) {
+            let request_id = resolve_request_id_for_snapshot(
+                &snapshot,
+                &current_request_id,
+                &mut conversation_id_to_request_id,
+                &mut pending_by_request_id,
+                &mut run_index,
+                &line,
+            );
+
+            let timestamp = snapshot.timestamp;
+            let run = pending_by_request_id
+                .entry(request_id.clone())
+                .or_insert_with(|| {
+                    run_index += 1;
+                    PendingRun {
+                        run_index,
+                        timestamp,
+                        request_id: Some(request_id.clone()),
+                        model_name: None,
+                        snapshot: None,
+                    }
+                });
             if run.timestamp.is_none() {
                 run.timestamp = timestamp;
             }
             if run.request_id.is_none() {
-                run.request_id = current_request_id.clone();
+                run.request_id = Some(request_id.clone());
             }
             run.snapshot = Some(snapshot);
         }
-
-        if is_run_end(&line) {
-            if let Some(session) = finalize_pending(&file_id, pending.take()) {
-                sessions.push(session);
-            }
-            current_request_id = None;
-        }
     }
 
-    if let Some(session) = finalize_pending(&file_id, pending) {
-        sessions.push(session);
+    // Finalize all remaining pending runs at end of file.
+    for (_, pending) in pending_by_request_id {
+        if let Some(session) = finalize_pending(&file_id, pending) {
+            sessions.push(session);
+        }
     }
 
     Ok(sessions)
 }
 
-fn finalize_pending(file_id: &str, pending: Option<PendingRun>) -> Option<LocalSession> {
-    let pending = pending?;
+fn finalize_pending(file_id: &str, pending: PendingRun) -> Option<LocalSession> {
     let snapshot = pending.snapshot.as_ref()?;
     let totals = snapshot.totals;
     if totals.total_tokens() <= 0 {
@@ -319,8 +371,104 @@ fn parse_embedded_request_id(line: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn is_run_end(line: &str) -> bool {
-    line.contains("AgentService/RunSSE \u{2192}")
+/// Extract conversationId from any log line that contains one in its JSON
+/// payload. Used to proactively build the conversationId -> requestId map
+/// so that later usageTotals lines can be routed to the correct pending run
+/// even when concurrent sessions interleave.
+fn parse_line_conversation_id(line: &str) -> Option<String> {
+    if !line.contains("\"conversationId\"") {
+        return None;
+    }
+    let value = parse_json_value_after(line)?;
+    value
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .filter(|conv_id| !conv_id.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Resolve which requestId an [AGENT] line belongs to. In most cases the
+/// current_request_id is the active session, but when subagents interleave,
+/// the AGENT line's embedded requestId (if any) takes precedence.
+fn resolve_request_id_for_agent_line(
+    line: &str,
+    current_request_id: &Option<String>,
+    pending_by_request_id: &mut HashMap<String, PendingRun>,
+    run_index: &mut usize,
+) -> String {
+    if let Some(embedded) = parse_embedded_request_id(line) {
+        return embedded;
+    }
+    if let Some(request_id) = current_request_id {
+        return request_id.clone();
+    }
+    // No requestId available — create a synthetic one.
+    let synthetic = format!("synthetic-agent-{}", *run_index);
+    *run_index += 1;
+    pending_by_request_id.insert(
+        synthetic.clone(),
+        PendingRun {
+            run_index: *run_index,
+            ..Default::default()
+        },
+    );
+    synthetic
+}
+
+/// Resolve which requestId a usageTotals snapshot belongs to. The snapshot
+/// carries a conversationId which we map to the requestId that was active
+/// when we first saw that conversationId. This handles interleaved concurrent
+/// sessions where usageTotals from session A arrive after session B has
+/// already started.
+fn resolve_request_id_for_snapshot(
+    snapshot: &UsageSnapshot,
+    current_request_id: &Option<String>,
+    conversation_id_to_request_id: &mut HashMap<String, String>,
+    pending_by_request_id: &mut HashMap<String, PendingRun>,
+    run_index: &mut usize,
+    line: &str,
+) -> String {
+    // 1. If the snapshot line itself contains a requestId, use it directly.
+    if let Some(embedded) = parse_embedded_request_id(line) {
+        if let Some(conv_id) = &snapshot.conversation_id {
+            conversation_id_to_request_id.insert(conv_id.clone(), embedded.clone());
+        }
+        return embedded;
+    }
+
+    // 2. If we've seen this conversationId before, route to the known requestId.
+    if let Some(conv_id) = &snapshot.conversation_id {
+        if let Some(request_id) = conversation_id_to_request_id.get(conv_id) {
+            return request_id.clone();
+        }
+    }
+
+    // 3. Fall back to the current requestId.
+    if let Some(request_id) = current_request_id {
+        if let Some(conv_id) = &snapshot.conversation_id {
+            conversation_id_to_request_id.insert(conv_id.clone(), request_id.clone());
+        }
+        return request_id.clone();
+    }
+
+    // 4. No requestId and no conversationId mapping — create a synthetic entry.
+    let conv_key = snapshot
+        .conversation_id
+        .as_deref()
+        .unwrap_or("unknown-conv");
+    let synthetic = format!("cursorpp-synthetic-{}", conv_key);
+    if let Some(conv_id) = &snapshot.conversation_id {
+        conversation_id_to_request_id.insert(conv_id.clone(), synthetic.clone());
+    }
+    pending_by_request_id.insert(
+        synthetic.clone(),
+        PendingRun {
+            run_index: *run_index,
+            ..Default::default()
+        },
+    );
+    *run_index += 1;
+    synthetic
 }
 
 fn parse_agent_start(line: &str) -> Option<(DateTime<Local>, String)> {
@@ -341,8 +489,8 @@ fn parse_agent_start(line: &str) -> Option<(DateTime<Local>, String)> {
     Some((timestamp, model_name.to_string()))
 }
 
-fn parse_oai_response_model(line: &str) -> Option<String> {
-    if !line.contains("[OAI_RESP] prompt cache") {
+fn parse_prompt_cache_model(line: &str) -> Option<String> {
+    if !line.contains("[OAI_RESP] prompt cache") && !line.contains("[ANTHROPIC] prompt cache") {
         return None;
     }
     let value = parse_json_value_after(line)?;
@@ -466,7 +614,7 @@ mod tests {
             }
         }
 
-        let session = finalize_pending("Cursor++.log", pending).unwrap();
+        let session = finalize_pending("Cursor++.log", pending.unwrap()).unwrap();
         assert_eq!(
             session.session_id,
             "cursorpp:7f0a8cf0-edc2-4bdd-949e-d01af6b5769e"
@@ -581,17 +729,106 @@ mod tests {
 
         let sessions = read_log_file(&log_path).unwrap();
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].session_id, "cursorpp:r1");
-        assert_eq!(sessions[0].model_name, "gpt-5.5");
-        assert_eq!(sessions[0].total_tokens(), 12);
-        assert_eq!(sessions[1].session_id, "cursorpp:r2");
-        assert_eq!(sessions[1].model_name, "deepseek-v4-flash");
-        assert_eq!(sessions[1].input_tokens, 19);
-        assert_eq!(sessions[1].output_tokens, 4);
-        assert_eq!(sessions[1].cache_creation_tokens, 6);
-        assert_eq!(sessions[1].cache_read_tokens, 5);
-        assert_eq!(sessions[1].total_tokens(), 34);
+
+        let r1 = sessions
+            .iter()
+            .find(|s| s.session_id == "cursorpp:r1")
+            .expect("r1 session should exist");
+        assert_eq!(r1.model_name, "gpt-5.5");
+        assert_eq!(r1.total_tokens(), 12);
+
+        let r2 = sessions
+            .iter()
+            .find(|s| s.session_id == "cursorpp:r2")
+            .expect("r2 session should exist");
+        assert_eq!(r2.model_name, "deepseek-v4-flash");
+        assert_eq!(r2.input_tokens, 19);
+        assert_eq!(r2.output_tokens, 4);
+        assert_eq!(r2.cache_creation_tokens, 6);
+        assert_eq!(r2.cache_read_tokens, 5);
+        assert_eq!(r2.total_tokens(), 34);
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn handles_concurrent_interleaved_sessions_without_unknown_model() {
+        // Simulates the real-world bug: two RunSSE sessions interleave their
+        // log lines. Session r1 starts, then r2 starts before r1's usageTotals
+        // arrive. With the old single-pending model, r1's model_name would be
+        // lost. The multi-pending HashMap architecture should preserve both.
+        let temp_root = std::env::temp_dir().join(format!(
+            "token-usage-cursorpp-concurrent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).unwrap();
+        let log_path = temp_root.join("Cursor++.concurrent.log");
+        fs::write(
+            &log_path,
+            [
+                // r1 starts
+                r#"2026-07-14 17:06:17.015 [info] [SVC] AgentService/RunSSE started {"requestId":"r1"}"#,
+                r#"2026-07-14 17:06:17.105 [info] [AGENT] → [anthropic/glm-5.2] "main agent" (3 msgs)"#,
+                // r1's conversationId appears in an appendMessage line before r2 starts
+                r#"2026-07-14 17:06:17.122 [info] [SESSION] appendMessage {"conversationId":"conv-1","keys":["runRequest"],"protoBytes":4599}"#,
+                // r2 starts BEFORE r1's usageTotals arrive (subagent)
+                r#"2026-07-14 17:06:27.505 [info] [SVC] AgentService/RunSSE started {"requestId":"r2"}"#,
+                r#"2026-07-14 17:06:27.608 [info] [AGENT] → [anthropic/glm-5.2] "subagent" (1 msgs)"#,
+                // r2's conversationId
+                r#"2026-07-14 17:06:27.631 [info] [SESSION] appendMessage {"conversationId":"conv-2","keys":["runRequest"],"protoBytes":81022}"#,
+                // r1's usageTotals arrive after r2 has already started
+                r#"2026-07-14 17:09:18.638 [info] [SESSION] round checkpoint update {"conversationId":"conv-1","round":0,"usageTotals":{"inputTokens":5000,"outputTokens":100,"cacheReadTokens":200,"cacheWriteTokens":0}}"#,
+                // r2's usageTotals
+                r#"2026-07-14 17:10:00.000 [info] [SESSION] round checkpoint update {"conversationId":"conv-2","round":0,"usageTotals":{"inputTokens":3000,"outputTokens":50,"cacheReadTokens":100,"cacheWriteTokens":0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = read_log_file(&log_path).unwrap();
+        assert_eq!(sessions.len(), 2, "should produce 2 sessions, not fewer");
+
+        let r1_session = sessions
+            .iter()
+            .find(|s| s.session_id == "cursorpp:r1")
+            .expect("r1 session should exist");
+        assert_eq!(
+            r1_session.model_name, "glm-5.2",
+            "r1 should have model name, not 'unknown'"
+        );
+
+        let r2_session = sessions
+            .iter()
+            .find(|s| s.session_id == "cursorpp:r2")
+            .expect("r2 session should exist");
+        assert_eq!(
+            r2_session.model_name, "glm-5.2",
+            "r2 should have model name, not 'unknown'"
+        );
+
+        assert!(
+            !sessions.iter().any(|s| s.model_name == "unknown"),
+            "no session should have 'unknown' model name"
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn parses_anthropic_prompt_cache_for_model_name() {
+        // The [ANTHROPIC] prompt cache line format used by Cursor++ logs
+        // when the model provider is Anthropic (e.g. glm-5.2 via Anthropic API).
+        let line = r#"2026-07-14 17:00:53.779 [info] [ANTHROPIC] prompt cache {"model":"glm-5.2","cacheRead":68864,"cacheWrite":0,"input":235}"#;
+        let model = parse_prompt_cache_model(line).unwrap();
+        assert_eq!(model, "glm-5.2");
+    }
+
+    #[test]
+    fn parses_oai_resp_prompt_cache_still_works() {
+        // Regression: the original [OAI_RESP] format should still be matched.
+        let line = r#"2026-06-07 13:20:18.662 [info] [OAI_RESP] prompt cache {"model":"gpt-5.5","cached":10,"input":20}"#;
+        let model = parse_prompt_cache_model(line).unwrap();
+        assert_eq!(model, "gpt-5.5");
     }
 }

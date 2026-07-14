@@ -763,7 +763,7 @@ private actor DashboardRecordsCache {
 }
 
 private extension TokenUsageSource {
-    static let apiSources: [TokenUsageSource] = [.claude, .codex, .opencode, .hermes, .openclaw, .pi, .grok, .cursor, .cherry, .claudeScience]
+    static let apiSources: [TokenUsageSource] = [.claude, .codex, .opencode, .hermes, .openclaw, .pi, .grok, .cursor, .cherry, .claudeScience, .zcode]
 
     var apiSource: UsageSource {
         switch self {
@@ -789,6 +789,8 @@ private extension TokenUsageSource {
             .cherry
         case .claudeScience:
             .claudeScience
+        case .zcode:
+            .zcode
         }
     }
 }

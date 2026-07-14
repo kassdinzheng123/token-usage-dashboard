@@ -10,6 +10,7 @@ pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
+pub mod zcode;
 
 use chrono::{DateTime, Local, TimeZone};
 use serde_json::{json, Value};
@@ -29,6 +30,7 @@ pub enum LocalSource {
     Cursor,
     Cherry,
     ClaudeScience,
+    Zcode,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -46,6 +48,7 @@ impl TryFrom<&str> for LocalSource {
             "cursor" | "cursorpp" => Ok(Self::Cursor),
             "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
             "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
+            "zcode" | "z-code" | "z_code" => Ok(Self::Zcode),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -196,7 +199,8 @@ pub fn load_local_source(
         | LocalSource::Grok
         | LocalSource::Cursor
         | LocalSource::Cherry
-        | LocalSource::ClaudeScience => {}
+        | LocalSource::ClaudeScience
+        | LocalSource::Zcode => {}
     }
 
     if view == SourceView::Blocks {
@@ -215,6 +219,7 @@ pub fn load_local_source(
         LocalSource::Cursor => cursor::load_sessions()?,
         LocalSource::Cherry => cherry::load_sessions()?,
         LocalSource::ClaudeScience => claude_science::load_sessions()?,
+        LocalSource::Zcode => zcode::load_sessions()?,
     };
 
     Ok(match view {
