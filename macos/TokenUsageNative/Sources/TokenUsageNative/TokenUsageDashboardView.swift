@@ -52,7 +52,7 @@ private let maximumBarWidth: CGFloat = 96.0
 private let dailyUsagePlotHeight: CGFloat = 220
 private let dailyUsageContentHeight: CGFloat = 280
 private let tokenTrendLegendPageSize = 6
-private let modelCostLegendPageSize = 5
+private let modelDistributionLegendPageSize = 10
 private let cliConsumptionPageSize = 5
 private let todayModelPageSize = 10
 private let allRangeBarPageSize = 60
@@ -163,7 +163,7 @@ private enum DashboardModelCostMixPane: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .cost: "Model Cost"
-        case .mix: "Token Mix"
+        case .mix: "Token Usage"
         }
     }
 }
@@ -1087,7 +1087,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     }
                     .frame(height: overviewContentHeight + 66, alignment: .top)
 
-                    ChartCard(title: "Token Mix") {
+                    ChartCard(title: "Token Usage") {
                         tokenMixLegendPager
                     } content: {
                         todayTokenMix(summary: summary)
@@ -1199,7 +1199,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private func tokenMixLegendPageCount(for rows: [TodayModelTokenRow]) -> Int {
-        max(Int(ceil(Double(rows.count) / Double(modelCostLegendPageSize))), 1)
+        max(Int(ceil(Double(rows.count) / Double(modelDistributionLegendPageSize))), 1)
     }
 
     private func clampedTokenMixLegendPage(for rows: [TodayModelTokenRow]) -> Int {
@@ -1208,9 +1208,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private func visibleTokenMixRows(from rows: [TodayModelTokenRow]) -> [TodayModelTokenRow] {
         let page = clampedTokenMixLegendPage(for: rows)
-        let start = page * modelCostLegendPageSize
+        let start = page * modelDistributionLegendPageSize
         guard start < rows.count else { return rows }
-        let end = min(start + modelCostLegendPageSize, rows.count)
+        let end = min(start + modelDistributionLegendPageSize, rows.count)
         return Array(rows[start..<end])
     }
 
@@ -1404,9 +1404,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                     switch modelCostMixPane {
                     case .cost:
                         modelCostChart
+                            .frame(maxWidth: .infinity, minHeight: paneHeight, maxHeight: paneHeight)
                     case .mix:
                         todayTokenMix(summary: dashboardSummary)
-                            .frame(height: 280)
+                            .frame(maxWidth: .infinity, minHeight: paneHeight, maxHeight: paneHeight)
                     }
                 }
                 .frame(height: paneHeight + 66, alignment: .top)
@@ -1593,7 +1594,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             totalCost: modelCostTotalCost,
             currencyController: currencyController
         )
-            .frame(height: 280)
     }
 
     @ViewBuilder
@@ -1622,7 +1622,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var modelCostLegendPageCount: Int {
-        max(Int(ceil(Double(modelCostSlices.count) / Double(modelCostLegendPageSize))), 1)
+        max(Int(ceil(Double(modelCostSlices.count) / Double(modelDistributionLegendPageSize))), 1)
     }
 
     private var clampedModelCostLegendPage: Int {
@@ -1630,9 +1630,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var visibleModelCostLegendSlices: [ModelCostSlice] {
-        let start = clampedModelCostLegendPage * modelCostLegendPageSize
+        let start = clampedModelCostLegendPage * modelDistributionLegendPageSize
         guard start < modelCostSlices.count else { return modelCostSlices }
-        let end = min(start + modelCostLegendPageSize, modelCostSlices.count)
+        let end = min(start + modelDistributionLegendPageSize, modelCostSlices.count)
         return Array(modelCostSlices[start..<end])
     }
 
@@ -3888,10 +3888,12 @@ private struct TokenMixDistributionChart: View {
                     .zIndex(0)
                 }
                 .frame(width: 220, height: 220)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 TokenMixLegend(rows: legendRows)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
@@ -4022,7 +4024,7 @@ private struct TokenMixLegend: View {
                 legendItem(row)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func legendItem(_ row: TodayModelTokenRow) -> some View {
@@ -4470,13 +4472,15 @@ private struct ModelCostDistributionChart: View {
                     .zIndex(0)
                 }
                 .frame(width: 220, height: 220)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 ModelCostLegend(
                     slices: legendSlices,
                     currencyController: currencyController
                 )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
@@ -4609,7 +4613,7 @@ private struct ModelCostLegend: View {
                 legendItem(slice)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func legendItem(_ slice: ModelCostSlice) -> some View {
