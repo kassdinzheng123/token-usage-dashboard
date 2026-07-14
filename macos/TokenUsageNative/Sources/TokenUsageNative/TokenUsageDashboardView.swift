@@ -1788,30 +1788,38 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         allRangeChartPage = max(allRangeChartPageCount - 1, 0)
     }
 
-    // MARK: - Heatmap pagination (All view: 2 calendar months per round)
+    // MARK: - Heatmap pagination (All view: sliding 2-calendar-month window)
 
-    /// All heatmap rounds, each covering exactly 2 calendar months.
-    /// Rounds are ordered chronologically (oldest first), so the last round is the latest.
+    /// All heatmap windows contain two consecutive calendar months and advance one month at a time.
+    /// The newest window is always the previous month plus the current month.
     private var heatmapRounds: [(start: Date, end: Date)] {
         guard selectedTimeRange == .all, let firstDay = dashboardData.heatmapDays.first else { return [] }
         let calendar = Calendar.current
         let firstMonthStart = monthStart(for: firstDay.date)
-        let lastDay = dashboardData.heatmapDays.last!
-        let lastMonthStart = monthStart(for: lastDay.date)
+        let currentMonthStart = monthStart(for: Date())
+        guard let latestWindowStart = calendar.date(byAdding: .month, value: -1, to: currentMonthStart) else {
+            return []
+        }
+
+        // Even if the available history starts this month, retain the required
+        // previous-month + current-month window and render missing days as zero.
+        guard firstMonthStart <= latestWindowStart else {
+            return [(start: latestWindowStart, end: monthEnd(for: currentMonthStart))]
+        }
 
         var rounds: [(Date, Date)] = []
         var cursor = firstMonthStart
-        while cursor <= lastMonthStart {
+        while cursor <= latestWindowStart {
             let roundStart = cursor
-            let secondMonthStart = calendar.date(byAdding: .month, value: 1, to: cursor) ?? cursor
-            let roundEnd: Date
-            if secondMonthStart <= lastMonthStart {
-                roundEnd = monthEnd(for: secondMonthStart)
-            } else {
-                roundEnd = monthEnd(for: cursor)
+            guard let secondMonthStart = calendar.date(byAdding: .month, value: 1, to: roundStart) else {
+                break
             }
-            rounds.append((roundStart, roundEnd))
-            cursor = calendar.date(byAdding: .month, value: 2, to: cursor) ?? lastMonthStart
+            rounds.append((roundStart, monthEnd(for: secondMonthStart)))
+
+            guard let nextWindowStart = calendar.date(byAdding: .month, value: 1, to: roundStart) else {
+                break
+            }
+            cursor = nextWindowStart
             if cursor <= roundStart { break }
         }
         return rounds
@@ -1830,11 +1838,32 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         case .month, .today:
             return dashboardData.heatmapDays
         case .all:
-            let allDays = dashboardData.heatmapDays
-            guard heatmapRoundCount > 1 else { return allDays }
-            let round = heatmapRounds[clampedHeatmapRound]
-            return allDays.filter { $0.date >= round.start && $0.date <= round.end }
+            guard heatmapRounds.indices.contains(clampedHeatmapRound) else {
+                return dashboardData.heatmapDays
+            }
+            return heatmapDays(in: heatmapRounds[clampedHeatmapRound])
         }
+    }
+
+    /// Supplies every day in a displayed All-view window so both months retain
+    /// their calendar geometry even when the current month is still in progress.
+    private func heatmapDays(in round: (start: Date, end: Date)) -> [DashboardHeatmapDay] {
+        let calendar = Calendar.current
+        let tokensByDay = dashboardData.heatmapDays.reduce(into: [Date: Int]()) { totals, day in
+            totals[calendar.startOfDay(for: day.date)] = day.tokens
+        }
+
+        var days: [DashboardHeatmapDay] = []
+        var date = calendar.startOfDay(for: round.start)
+        let end = calendar.startOfDay(for: round.end)
+        while date <= end {
+            days.append(DashboardHeatmapDay(date: date, tokens: tokensByDay[date] ?? 0))
+            guard let nextDate = calendar.date(byAdding: .day, value: 1, to: date) else {
+                break
+            }
+            date = nextDate
+        }
+        return days
     }
 
     private var heatmapRoundLabel: String {
@@ -3402,6 +3431,27 @@ private struct DashboardHeatmapView: View {
     private let cellSpacing: CGFloat = 3
     private let weekdayLabelWidth: CGFloat = 24
     private let monthLabelHeight: CGFloat = 16
+    private let dayOfMonthLabelHeight: CGFloat = 12
+
+    /// The weekday labels are fixed to Mon/Wed/Fri, so the grid must use the
+    /// same Monday-first calendar regardless of the system's locale setting.
+    private var calendar: Calendar {
+        var calendar = Calendar.current
+        calendar.firstWeekday = 2
+        return calendar
+    }
+
+    private var columnStride: CGFloat {
+        cellSize + cellSpacing
+    }
+
+    private var gridWidth: CGFloat {
+        CGFloat(weeks.count) * cellSize + CGFloat(max(weeks.count - 1, 0)) * cellSpacing
+    }
+
+    private var heatmapWidth: CGFloat {
+        weekdayLabelWidth + cellSpacing + gridWidth
+    }
 
     private var maxTokens: Int {
         days.map(\.tokens).max() ?? 0
@@ -3409,14 +3459,14 @@ private struct DashboardHeatmapView: View {
 
     /// Weeks arranged as columns (GitHub style): each column = one week, 7 rows = days of week.
     private var weeks: [[DashboardHeatmapDay?]] {
-        let calendar = Calendar.current
-        guard let first = days.first else { return [] }
+        let sortedDays = days.sorted { $0.date < $1.date }
+        guard let first = sortedDays.first else { return [] }
         var result: [[DashboardHeatmapDay?]] = []
         var current: [DashboardHeatmapDay?] = []
         let leadingEmpty = calendar.component(.weekday, from: first.date) - calendar.firstWeekday
         let normalizedLeading = (leadingEmpty + 7) % 7
         current.append(contentsOf: Array(repeating: nil, count: normalizedLeading))
-        for day in days {
+        for day in sortedDays {
             current.append(day)
             if current.count == 7 {
                 result.append(current)
@@ -3435,34 +3485,36 @@ private struct DashboardHeatmapView: View {
         0: "Mon", 2: "Wed", 4: "Fri"
     ]
 
-    /// Month labels computed from the weeks, positioned at the column where each month starts.
+    /// Month labels positioned at the precise week column where each month starts.
     private var monthLabels: [(text: String, weekIndex: Int)] {
-        let calendar = Calendar.current
         var labels: [(text: String, weekIndex: Int)] = []
-        var lastMonth = -1
+        var lastMonth: (month: Int, year: Int)?
         for (weekIndex, week) in weeks.enumerated() {
             for day in week {
                 guard let day else { continue }
                 let month = calendar.component(.month, from: day.date)
-                if month != lastMonth {
-                    let year = calendar.component(.year, from: day.date)
-                    let text: String
-                    if labels.isEmpty {
-                        text = day.date.formatted(.dateTime.month(.abbreviated).year())
-                    } else {
-                        // Check if year changed
-                        let prevYear = calendar.component(.year, from: weeks[labels.last!.weekIndex].compactMap { $0 }.first!.date)
-                        text = year != prevYear
-                            ? day.date.formatted(.dateTime.month(.abbreviated).year())
-                            : day.date.formatted(.dateTime.month(.abbreviated))
-                    }
-                    labels.append((text: text, weekIndex: weekIndex))
-                    lastMonth = month
-                }
-                break
+                let year = calendar.component(.year, from: day.date)
+                guard lastMonth?.month != month || lastMonth?.year != year else { continue }
+
+                let text = lastMonth == nil || lastMonth?.year != year
+                    ? day.date.formatted(.dateTime.month(.abbreviated).year())
+                    : day.date.formatted(.dateTime.month(.abbreviated))
+                labels.append((text: text, weekIndex: weekIndex))
+                lastMonth = (month, year)
             }
         }
         return labels
+    }
+
+    /// One date tick per week column prevents labels such as 1 and 5 from
+    /// occupying the same horizontal coordinate. Month starts take precedence.
+    private var dayOfMonthLabels: [(weekIndex: Int, text: String)] {
+        weeks.enumerated().compactMap { weekIndex, week in
+            let dates = week.compactMap { $0 }
+            guard let firstDay = dates.first else { return nil }
+            let tickDay = dates.first { calendar.component(.day, from: $0.date) == 1 } ?? firstDay
+            return (weekIndex, "\(calendar.component(.day, from: tickDay.date))")
+        }
     }
 
     var body: some View {
@@ -3478,27 +3530,34 @@ private struct DashboardHeatmapView: View {
             .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                monthLabelRow
+                HStack(spacing: cellSpacing) {
+                    Color.clear
+                        .frame(width: weekdayLabelWidth, height: monthLabelHeight)
+                    monthLabelRow
+                }
                 HStack(alignment: .top, spacing: cellSpacing) {
                     weekdayLabelColumn
                     heatmapGrid
                 }
-                dayOfMonthLabelRow
+                HStack(spacing: cellSpacing) {
+                    Color.clear
+                        .frame(width: weekdayLabelWidth, height: dayOfMonthLabelHeight)
+                    dayOfMonthLabelRow
+                }
             }
             .padding(.vertical, 8)
+            .frame(width: heatmapWidth, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
         }
     }
 
     /// Row of month labels aligned above the week columns.
     private var monthLabelRow: some View {
-        let totalWeeks = weeks.count
-        let gridWidth = CGFloat(totalWeeks) * cellSize + CGFloat(max(totalWeeks - 1, 0)) * cellSpacing
         return ZStack(alignment: .topLeading) {
             Color.clear
-                .frame(width: weekdayLabelWidth + cellSpacing + gridWidth, height: monthLabelHeight)
+                .frame(width: gridWidth, height: monthLabelHeight)
             ForEach(Array(monthLabels.enumerated()), id: \.offset) { _, label in
-                let xOffset = weekdayLabelWidth + cellSpacing + CGFloat(label.weekIndex) * (cellSize + cellSpacing)
+                let xOffset = CGFloat(label.weekIndex) * columnStride
                 Text(label.text)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -3506,7 +3565,6 @@ private struct DashboardHeatmapView: View {
                     .offset(x: xOffset)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .center)
     }
 
     /// Column of weekday labels (Mon, Wed, Fri) aligned with the heatmap rows.
@@ -3540,34 +3598,20 @@ private struct DashboardHeatmapView: View {
         }
     }
 
-    /// Row of day-of-month labels (1, 5, 10, 15, 20, 25) below the grid for precise date reading.
+    /// Row of non-overlapping date labels, one for each week column.
     private var dayOfMonthLabelRow: some View {
-        let totalWeeks = weeks.count
-        let gridWidth = CGFloat(totalWeeks) * cellSize + CGFloat(max(totalWeeks - 1, 0)) * cellSpacing
-        let calendar = Calendar.current
-        // Collect (weekIndex, dayLabel) for days that are 1, 5, 10, 15, 20, 25
-        let markedDays: [(weekIndex: Int, text: String)] = weeks.enumerated().flatMap { (weekIndex, week) in
-            week.compactMap { day in
-                guard let day else { return nil }
-                let dayOfMonth = calendar.component(.day, from: day.date)
-                let marks: Set<Int> = [1, 5, 10, 15, 20, 25]
-                guard marks.contains(dayOfMonth) else { return nil }
-                return (weekIndex, "\(dayOfMonth)")
-            }
-        }
         return ZStack(alignment: .topLeading) {
             Color.clear
-                .frame(width: weekdayLabelWidth + cellSpacing + gridWidth, height: 12)
-            ForEach(Array(markedDays.enumerated()), id: \.offset) { _, mark in
-                let xOffset = weekdayLabelWidth + cellSpacing + CGFloat(mark.weekIndex) * (cellSize + cellSpacing)
+                .frame(width: gridWidth, height: dayOfMonthLabelHeight)
+            ForEach(Array(dayOfMonthLabels.enumerated()), id: \.offset) { _, mark in
+                let xOffset = CGFloat(mark.weekIndex) * columnStride
                 Text(mark.text)
                     .font(.system(size: 8))
                     .foregroundStyle(.secondary)
-                    .frame(width: cellSize, height: 12, alignment: .center)
+                    .frame(width: cellSize, height: dayOfMonthLabelHeight, alignment: .center)
                     .offset(x: xOffset)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .center)
         .padding(.top, 2)
     }
 
