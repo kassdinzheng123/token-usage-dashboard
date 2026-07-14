@@ -1386,28 +1386,33 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var dailyTokenUsageSection: some View {
-        ChartCard(title: "Daily Token Usage") {
-            HStack(spacing: 16) {
-                allRangeBarPager
+        HStack(alignment: .top, spacing: 20) {
+            ChartCard(title: "Daily Heatmap") {
                 heatmapPager
-            }
-        } content: {
-            GeometryReader { geometry in
-                let spacing: CGFloat = 20
-                let heatmapWidth = max((geometry.size.width - spacing) / 3, 0)
-
-                HStack(alignment: .top, spacing: spacing) {
-                    tokenTrendChart
-                        .frame(width: heatmapWidth * 2, height: dailyUsageContentHeight)
-
+            } content: {
+                GeometryReader { geometry in
                     DashboardHeatmapView(
                         days: visibleHeatmapDays,
-                        availableWidth: heatmapWidth
+                        availableWidth: geometry.size.width
                     )
-                    .frame(width: heatmapWidth, height: dailyUsageContentHeight)
+                    .frame(width: geometry.size.width, height: dailyUsageContentHeight)
                 }
+                .frame(height: dailyUsageContentHeight)
             }
-            .frame(height: dailyUsageContentHeight)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+
+            ChartCard(title: "Daily Token Usage") {
+                allRangeBarPager
+            } content: {
+                tokenTrendChart
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: dailyUsageContentHeight,
+                        maxHeight: dailyUsageContentHeight,
+                        alignment: .topLeading
+                    )
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
 
@@ -3445,7 +3450,7 @@ private struct DashboardHeatmapView: View {
     }
 
     /// Keeps cells square while shrinking just enough for every week column to
-    /// fit in the heatmap's one-third panel.
+    /// fit in the heatmap card.
     private var cellSize: CGFloat {
         guard !weeks.isEmpty else { return maximumCellSize }
         let columnCount = CGFloat(weeks.count)
