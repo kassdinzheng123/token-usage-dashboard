@@ -168,20 +168,6 @@ private enum DashboardModelCostMixPane: String, CaseIterable, Identifiable {
     }
 }
 
-private enum DashboardDailyUsagePane: String, CaseIterable, Identifiable {
-    case bar
-    case heatmap
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .bar: "Bar"
-        case .heatmap: "Heatmap"
-        }
-    }
-}
-
 // Expanded stable model palette: primary/light/dark from every family.
 private let expandedModelPalette: [Color] = allColorFamilies.flatMap { [$0.primary, $0.light, $0.dark] }
 
@@ -308,7 +294,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var selectedTimeRange: DashboardTimeRange = .today
     @State private var cliCompositionPane: DashboardCLICompositionPane = .cli
     @State private var modelCostMixPane: DashboardModelCostMixPane = .cost
-    @State private var dailyUsagePane: DashboardDailyUsagePane = .bar
     @State private var dashboardData: TokenUsageDashboardData
 
     init(store: Store, currencyController: TokenUsageBillingCurrencyController) {
@@ -1402,31 +1387,27 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var dailyTokenUsageSection: some View {
         ChartCard(title: "Daily Token Usage") {
-            HStack(spacing: 10) {
-                Picker("", selection: $dailyUsagePane) {
-                    ForEach(DashboardDailyUsagePane.allCases) { pane in
-                        Text(pane.label).tag(pane)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 160)
-
-                if dailyUsagePane == .bar {
-                    allRangeBarPager
-                } else {
-                    heatmapPager
-                }
+            HStack(spacing: 16) {
+                allRangeBarPager
+                heatmapPager
             }
         } content: {
-            switch dailyUsagePane {
-            case .bar:
-                tokenTrendChart
-                    .frame(height: dailyUsageContentHeight)
-            case .heatmap:
-                DashboardHeatmapView(days: visibleHeatmapDays)
-                    .frame(height: dailyUsageContentHeight)
+            GeometryReader { geometry in
+                let spacing: CGFloat = 20
+                let heatmapWidth = max((geometry.size.width - spacing) / 3, 0)
+
+                HStack(alignment: .top, spacing: spacing) {
+                    tokenTrendChart
+                        .frame(width: heatmapWidth * 2, height: dailyUsageContentHeight)
+
+                    DashboardHeatmapView(
+                        days: visibleHeatmapDays,
+                        availableWidth: heatmapWidth
+                    )
+                    .frame(width: heatmapWidth, height: dailyUsageContentHeight)
+                }
             }
+            .frame(height: dailyUsageContentHeight)
         }
     }
 
@@ -3430,12 +3411,12 @@ private struct DashboardHeatmapDay: Identifiable {
 
 private struct DashboardHeatmapView: View {
     let days: [DashboardHeatmapDay]
+    let availableWidth: CGFloat
 
-    // Wide, shallow cells make the weekly calendar read as a horizontal heatmap.
-    private let cellWidth: CGFloat = 80
-    private let cellHeight: CGFloat = 18
-    private let cellSpacing: CGFloat = 4
-    private let weekdayLabelWidth: CGFloat = 28
+    private let maximumCellSize: CGFloat = 30
+    private let minimumCellSize: CGFloat = 16
+    private let cellSpacing: CGFloat = 3
+    private let weekdayLabelWidth: CGFloat = 24
     private let monthLabelHeight: CGFloat = 16
     private let dayOfMonthLabelHeight: CGFloat = 12
 
@@ -3448,11 +3429,11 @@ private struct DashboardHeatmapView: View {
     }
 
     private var columnStride: CGFloat {
-        cellWidth + cellSpacing
+        cellSize + cellSpacing
     }
 
     private var gridWidth: CGFloat {
-        CGFloat(weeks.count) * cellWidth + CGFloat(max(weeks.count - 1, 0)) * cellSpacing
+        CGFloat(weeks.count) * cellSize + CGFloat(max(weeks.count - 1, 0)) * cellSpacing
     }
 
     private var heatmapWidth: CGFloat {
@@ -3461,6 +3442,17 @@ private struct DashboardHeatmapView: View {
 
     private var maxTokens: Int {
         days.map(\.tokens).max() ?? 0
+    }
+
+    /// Keeps cells square while shrinking just enough for every week column to
+    /// fit in the heatmap's one-third panel.
+    private var cellSize: CGFloat {
+        guard !weeks.isEmpty else { return maximumCellSize }
+        let columnCount = CGFloat(weeks.count)
+        let gridAvailableWidth = max(availableWidth - weekdayLabelWidth - cellSpacing, 0)
+        let totalSpacing = CGFloat(max(weeks.count - 1, 0)) * cellSpacing
+        let widthLimitedSize = (gridAvailableWidth - totalSpacing) / columnCount
+        return min(maximumCellSize, max(widthLimitedSize, minimumCellSize))
     }
 
     /// Weeks arranged as columns (GitHub style): each column = one week, 7 rows = days of week.
@@ -3567,7 +3559,7 @@ private struct DashboardHeatmapView: View {
                 Text(label.text)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .frame(width: cellWidth, height: monthLabelHeight, alignment: .leading)
+                    .frame(width: max(cellSize * 2, 50), height: monthLabelHeight, alignment: .leading)
                     .offset(x: xOffset)
             }
         }
@@ -3586,7 +3578,7 @@ private struct DashboardHeatmapView: View {
                         Color.clear
                     }
                 }
-                .frame(width: weekdayLabelWidth, height: cellHeight, alignment: .trailing)
+                .frame(width: weekdayLabelWidth, height: cellSize, alignment: .trailing)
             }
         }
     }
@@ -3614,7 +3606,7 @@ private struct DashboardHeatmapView: View {
                 Text(mark.text)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .frame(width: cellWidth, height: dayOfMonthLabelHeight, alignment: .center)
+                    .frame(width: cellSize, height: dayOfMonthLabelHeight, alignment: .center)
                     .offset(x: xOffset)
             }
         }
@@ -3624,14 +3616,14 @@ private struct DashboardHeatmapView: View {
     @ViewBuilder
     private func cell(for day: DashboardHeatmapDay?) -> some View {
         if let day {
-            RoundedRectangle(cornerRadius: 4, style: .continuous)
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(color(for: day.tokens))
-                .frame(width: cellWidth, height: cellHeight)
+                .frame(width: cellSize, height: cellSize)
                 .help("\(day.date.formatted(.dateTime.year().month().day())) — \(day.tokens.fullTokenText) tokens")
         } else {
-            RoundedRectangle(cornerRadius: 4, style: .continuous)
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(Color.clear)
-                .frame(width: cellWidth, height: cellHeight)
+                .frame(width: cellSize, height: cellSize)
         }
     }
 
