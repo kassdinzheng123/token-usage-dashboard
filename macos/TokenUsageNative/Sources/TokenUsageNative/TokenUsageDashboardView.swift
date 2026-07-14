@@ -49,6 +49,8 @@ private let modelCostPalette: [Color] = allColorFamilies.flatMap { [$0.primary, 
 private let chartTooltipWidth = 190.0
 private let chartTooltipHeight = 86.0
 private let maximumBarWidth: CGFloat = 96.0
+private let dailyUsagePlotHeight: CGFloat = 220
+private let dailyUsageContentHeight: CGFloat = 280
 private let tokenTrendLegendPageSize = 6
 private let modelCostLegendPageSize = 5
 private let cliConsumptionPageSize = 5
@@ -1420,8 +1422,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             switch dailyUsagePane {
             case .bar:
                 tokenTrendChart
+                    .frame(height: dailyUsageContentHeight)
             case .heatmap:
                 DashboardHeatmapView(days: visibleHeatmapDays)
+                    .frame(height: dailyUsageContentHeight)
             }
         }
     }
@@ -2661,7 +2665,7 @@ private struct TokenTrendChartView: View {
             }
         }
         .chartYAxisLabel("Tokens")
-        .frame(height: 220)
+        .frame(height: dailyUsagePlotHeight)
     }
 
     @AxisContentBuilder
@@ -3427,7 +3431,9 @@ private struct DashboardHeatmapDay: Identifiable {
 private struct DashboardHeatmapView: View {
     let days: [DashboardHeatmapDay]
 
-    private let cellSize: CGFloat = 13
+    // Seven rows of cells plus the heatmap labels fill the same content height
+    // as the bar chart and its legend.
+    private let cellSize: CGFloat = 30
     private let cellSpacing: CGFloat = 3
     private let weekdayLabelWidth: CGFloat = 24
     private let monthLabelHeight: CGFloat = 16
@@ -3606,7 +3612,7 @@ private struct DashboardHeatmapView: View {
             ForEach(Array(dayOfMonthLabels.enumerated()), id: \.offset) { _, mark in
                 let xOffset = CGFloat(mark.weekIndex) * columnStride
                 Text(mark.text)
-                    .font(.system(size: 8))
+                    .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .frame(width: cellSize, height: dayOfMonthLabelHeight, alignment: .center)
                     .offset(x: xOffset)
