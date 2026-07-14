@@ -3431,11 +3431,11 @@ private struct DashboardHeatmapDay: Identifiable {
 private struct DashboardHeatmapView: View {
     let days: [DashboardHeatmapDay]
 
-    // Seven rows of cells plus the heatmap labels fill the same content height
-    // as the bar chart and its legend.
-    private let cellSize: CGFloat = 30
-    private let cellSpacing: CGFloat = 3
-    private let weekdayLabelWidth: CGFloat = 24
+    // Wide, shallow cells make the weekly calendar read as a horizontal heatmap.
+    private let cellWidth: CGFloat = 80
+    private let cellHeight: CGFloat = 18
+    private let cellSpacing: CGFloat = 4
+    private let weekdayLabelWidth: CGFloat = 28
     private let monthLabelHeight: CGFloat = 16
     private let dayOfMonthLabelHeight: CGFloat = 12
 
@@ -3448,11 +3448,11 @@ private struct DashboardHeatmapView: View {
     }
 
     private var columnStride: CGFloat {
-        cellSize + cellSpacing
+        cellWidth + cellSpacing
     }
 
     private var gridWidth: CGFloat {
-        CGFloat(weeks.count) * cellSize + CGFloat(max(weeks.count - 1, 0)) * cellSpacing
+        CGFloat(weeks.count) * cellWidth + CGFloat(max(weeks.count - 1, 0)) * cellSpacing
     }
 
     private var heatmapWidth: CGFloat {
@@ -3567,7 +3567,7 @@ private struct DashboardHeatmapView: View {
                 Text(label.text)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .frame(width: max(cellSize * 4, 50), height: monthLabelHeight, alignment: .leading)
+                    .frame(width: cellWidth, height: monthLabelHeight, alignment: .leading)
                     .offset(x: xOffset)
             }
         }
@@ -3586,7 +3586,7 @@ private struct DashboardHeatmapView: View {
                         Color.clear
                     }
                 }
-                .frame(width: weekdayLabelWidth, height: cellSize, alignment: .trailing)
+                .frame(width: weekdayLabelWidth, height: cellHeight, alignment: .trailing)
             }
         }
     }
@@ -3614,7 +3614,7 @@ private struct DashboardHeatmapView: View {
                 Text(mark.text)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .frame(width: cellSize, height: dayOfMonthLabelHeight, alignment: .center)
+                    .frame(width: cellWidth, height: dayOfMonthLabelHeight, alignment: .center)
                     .offset(x: xOffset)
             }
         }
@@ -3624,14 +3624,14 @@ private struct DashboardHeatmapView: View {
     @ViewBuilder
     private func cell(for day: DashboardHeatmapDay?) -> some View {
         if let day {
-            RoundedRectangle(cornerRadius: 3, style: .continuous)
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
                 .fill(color(for: day.tokens))
-                .frame(width: cellSize, height: cellSize)
+                .frame(width: cellWidth, height: cellHeight)
                 .help("\(day.date.formatted(.dateTime.year().month().day())) — \(day.tokens.fullTokenText) tokens")
         } else {
-            RoundedRectangle(cornerRadius: 3, style: .continuous)
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
                 .fill(Color.clear)
-                .frame(width: cellSize, height: cellSize)
+                .frame(width: cellWidth, height: cellHeight)
         }
     }
 
