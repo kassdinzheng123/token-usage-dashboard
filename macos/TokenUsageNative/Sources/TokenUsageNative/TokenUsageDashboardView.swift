@@ -1556,7 +1556,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 currentPage: clampedTokenTrendLegendPage,
                 pageCount: tokenTrendLegendPageCount,
                 totalCount: tokenTrendColorDomain.count,
-                usesCompactLayout: usesCLITokenTrendGrouping,
+                usesCompactLayout: true,
+                isCLIGrouping: usesCLITokenTrendGrouping,
                 onPrevious: {
                     tokenTrendLegendPage = max(clampedTokenTrendLegendPage - 1, 0)
                 },
@@ -4290,6 +4291,7 @@ private struct TokenTrendLegend: View {
     let pageCount: Int
     let totalCount: Int
     let usesCompactLayout: Bool
+    let isCLIGrouping: Bool
     let onPrevious: () -> Void
     let onNext: () -> Void
 
@@ -4301,7 +4303,7 @@ private struct TokenTrendLegend: View {
             }
             .buttonStyle(.borderless)
             .disabled(currentPage == 0)
-            .help(usesCompactLayout ? "Previous CLIs" : "Previous models")
+            .help(isCLIGrouping ? "Previous CLIs" : "Previous models")
 
             Group {
                 if usesCompactLayout {
@@ -4325,7 +4327,7 @@ private struct TokenTrendLegend: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 42)
-                .help("\(totalCount) \(usesCompactLayout ? "CLIs" : "models")")
+                .help("\(totalCount) \(isCLIGrouping ? "CLIs" : "models")")
 
             Button(action: onNext) {
                 Image(systemName: "chevron.right")
@@ -4333,7 +4335,7 @@ private struct TokenTrendLegend: View {
             }
             .buttonStyle(.borderless)
             .disabled(currentPage >= pageCount - 1)
-            .help(usesCompactLayout ? "Next CLIs" : "Next models")
+            .help(isCLIGrouping ? "Next CLIs" : "Next models")
         }
         .frame(maxWidth: .infinity, minHeight: 48, alignment: .center)
     }
@@ -4362,9 +4364,7 @@ private struct TokenTrendLegend: View {
             Circle()
                 .fill(entry.color)
                 .frame(width: 9, height: 9)
-            if usesCompactLayout {
-                LegendBadge(label: entry.label, compact: true)
-            }
+            LegendBadge(label: entry.label, compact: usesCompactLayout)
             Text(label)
                 .font(usesCompactLayout ? .caption2 : .caption)
                 .foregroundStyle(.secondary)
@@ -4393,6 +4393,8 @@ private struct LegendBadge: View {
                 .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
         } else {
             ProviderIconBadge(modelName: label)
+                .scaleEffect(compact ? 0.82 : 1)
+                .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
         }
     }
 }
