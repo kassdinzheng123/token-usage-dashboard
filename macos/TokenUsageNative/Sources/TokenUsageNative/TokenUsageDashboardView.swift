@@ -51,6 +51,7 @@ private let chartTooltipHeight = 86.0
 private let maximumBarWidth: CGFloat = 96.0
 private let dailyUsagePlotHeight: CGFloat = 220
 private let dailyUsageContentHeight: CGFloat = 280
+private let dailyUsageCardHeight: CGFloat = dailyUsageContentHeight + 68
 private let tokenTrendLegendPageSize = 6
 private let modelCostLegendPageSize = 5
 private let cliConsumptionPageSize = 5
@@ -1386,34 +1387,40 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var dailyTokenUsageSection: some View {
-        HStack(alignment: .top, spacing: 20) {
-            ChartCard(title: "Daily Heatmap") {
-                heatmapPager
-            } content: {
-                GeometryReader { geometry in
-                    DashboardHeatmapView(
-                        days: visibleHeatmapDays,
-                        availableWidth: geometry.size.width
-                    )
-                    .frame(width: geometry.size.width, height: dailyUsageContentHeight)
-                }
-                .frame(height: dailyUsageContentHeight)
-            }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+        GeometryReader { geometry in
+            let spacing: CGFloat = 20
+            let heatmapWidth = max((geometry.size.width - spacing) / 3, 0)
 
-            ChartCard(title: "Daily Token Usage") {
-                allRangeBarPager
-            } content: {
-                tokenTrendChart
-                    .frame(
-                        maxWidth: .infinity,
-                        minHeight: dailyUsageContentHeight,
-                        maxHeight: dailyUsageContentHeight,
-                        alignment: .topLeading
-                    )
+            HStack(alignment: .top, spacing: spacing) {
+                ChartCard(title: "Daily Heatmap") {
+                    heatmapPager
+                } content: {
+                    GeometryReader { heatmapGeometry in
+                        DashboardHeatmapView(
+                            days: visibleHeatmapDays,
+                            availableWidth: heatmapGeometry.size.width
+                        )
+                        .frame(width: heatmapGeometry.size.width, height: dailyUsageContentHeight)
+                    }
+                    .frame(height: dailyUsageContentHeight)
+                }
+                .frame(width: heatmapWidth, height: dailyUsageCardHeight)
+
+                ChartCard(title: "Daily Token Usage") {
+                    allRangeBarPager
+                } content: {
+                    tokenTrendChart
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: dailyUsageContentHeight,
+                            maxHeight: dailyUsageContentHeight,
+                            alignment: .topLeading
+                        )
+                }
+                .frame(width: heatmapWidth * 2, height: dailyUsageCardHeight)
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .frame(height: dailyUsageCardHeight)
     }
 
     private var modelConsumptionSection: some View {
