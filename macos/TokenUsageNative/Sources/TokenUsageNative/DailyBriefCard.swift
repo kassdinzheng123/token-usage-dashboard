@@ -27,9 +27,14 @@ struct DailyBriefCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             panelHeader
-            hourlyTimeline
-            boardContent
-                .frame(maxWidth: .infinity, minHeight: 360, alignment: .topLeading)
+            // Timeline and kanban board share one neutral grouped surface.
+            VStack(alignment: .leading, spacing: 14) {
+                hourlyTimeline
+                boardContent
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .appGroupedSurface(cornerRadius: 14)
         }
         .padding(16)
         .appCard()
@@ -267,7 +272,7 @@ struct DailyBriefCard: View {
         }
         guard let brief else {
             return isToday
-                ? "尚未生成今日 Brief。可手动生成，或等待本地 10:00 自动生成。"
+                ? "尚未生成今日 Brief。可手动生成，或等待北京时间 8:00 自动初始化。"
                 : "该日尚未生成 Brief，可手动生成。"
         }
         switch brief.status {
@@ -355,27 +360,9 @@ struct DailyBriefCard: View {
                         .frame(maxWidth: .infinity, minHeight: 200, alignment: .center)
                 } else {
                     ScrollView(.horizontal, showsIndicators: true) {
-                        HStack(alignment: .top, spacing: 14) {
-                            ForEach(orderedCLIGroups) { group in
-                                cliColumn(group)
-                                    .opacity(draggingSourceID == group.id ? 0.55 : 1)
-                                    .onDrag {
-                                        draggingSourceID = group.id
-                                        return NSItemProvider(object: group.id as NSString)
-                                    }
-                                    .onDrop(
-                                        of: [UTType.text],
-                                        delegate: BriefSourceDropDelegate(
-                                            targetSource: group.id,
-                                            sourceOrder: $sourceOrder,
-                                            draggingSourceID: $draggingSourceID,
-                                            onReorder: persistOrder
-                                        )
-                                    )
-                            }
-                        }
-                        .padding(.bottom, 4)
+                        boardColumns
                     }
+                    .fixedSize(horizontal: false, vertical: true)
 
                     if let error = brief.error, !error.isEmpty {
                         Text(error)
@@ -400,13 +387,42 @@ struct DailyBriefCard: View {
         } else {
             Text(
                 isToday
-                    ? "尚未生成今日 Brief。可手动生成，或等待本地 10:00 自动生成。"
+                    ? "尚未生成今日 Brief。可手动生成，或等待北京时间 8:00 自动初始化。"
                     : "该日尚未生成 Brief，可手动生成。"
             )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 200, alignment: .center)
         }
+    }
+
+    /// The kanban columns remain transparent inside the board's shared
+    /// grouped surface, while each project card keeps an opaque background.
+    private var boardColumns: some View {
+        HStack(alignment: .top, spacing: 14) {
+            ForEach(orderedCLIGroups) { group in
+                cliColumn(group)
+                    .opacity(draggingSourceID == group.id ? 0.55 : 1)
+                    .animation(.easeOut(duration: 0.15), value: draggingSourceID)
+                    .onDrag {
+                        draggingSourceID = group.id
+                        return NSItemProvider(object: group.id as NSString)
+                    }
+                    .onDrop(
+                        of: [UTType.text],
+                        delegate: BriefSourceDropDelegate(
+                            targetSource: group.id,
+                            sourceOrder: $sourceOrder,
+                            draggingSourceID: $draggingSourceID,
+                            onReorder: persistOrder
+                        )
+                    )
+            }
+        }
+        // Keep the surface edge and horizontal scrollbar clear of the cards.
+        .padding(.top, 2)
+        .padding(.horizontal, 2)
+        .padding(.bottom, 8)
     }
 
     private func cliColumn(_ group: BriefCLIGroup) -> some View {
@@ -434,6 +450,7 @@ struct DailyBriefCard: View {
                 ForEach(group.projects) { card in
                     projectKanbanCard(card)
                         .opacity(draggingProjectID == card.id ? 0.5 : 1)
+                        .animation(.easeOut(duration: 0.15), value: draggingProjectID)
                         .onDrag {
                             draggingProjectID = card.id
                             return NSItemProvider(object: card.id as NSString)
@@ -451,9 +468,7 @@ struct DailyBriefCard: View {
                 }
             }
         }
-        .padding(12)
         .frame(width: 260, alignment: .topLeading)
-        .appGlassCard(cornerRadius: 12)
     }
 
     private func projectKanbanCard(_ card: TodayBriefCardItem) -> some View {
@@ -533,7 +548,7 @@ struct DailyBriefCard: View {
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .appGlassCard(cornerRadius: 10)
+        .appCard()
     }
 
     private var orderedCLIGroups: [BriefCLIGroup] {
@@ -657,7 +672,7 @@ private struct BriefSourceDropDelegate: DropDelegate {
               let from = sourceOrder.firstIndex(of: fromID),
               let to = sourceOrder.firstIndex(of: targetSource)
         else { return }
-        withAnimation(.easeInOut(duration: 0.15)) {
+        withAnimation(.spring(duration: 0.35, bounce: 0.2)) {
             sourceOrder.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
         }
     }
@@ -688,7 +703,7 @@ private struct BriefProjectDropDelegate: DropDelegate {
         guard let from = order.firstIndex(of: draggingID),
               let to = order.firstIndex(of: targetProjectID)
         else { return }
-        withAnimation(.easeInOut(duration: 0.15)) {
+        withAnimation(.spring(duration: 0.35, bounce: 0.2)) {
             order.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
             projectOrderBySource[source] = order
         }

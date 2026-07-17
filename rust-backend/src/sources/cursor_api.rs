@@ -520,6 +520,7 @@ fn usage_to_sessions(usage: &UsageSnapshot) -> Vec<LocalSession> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn invoice_to_sessions(year: i32, month: u32, items: &[InvoiceItem]) -> Vec<LocalSession> {
     let date = month_anchor_date(year, month);
     items
@@ -561,6 +562,7 @@ fn usage_bucket_model_name(bucket: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn parse_invoice_description(description: &str) -> Option<(i64, String)> {
     if let Some(captures) = regex_token_based(description) {
         return Some((captures.0, captures.1));
@@ -583,6 +585,7 @@ fn parse_invoice_description(description: &str) -> Option<(i64, String)> {
     Some((count, model))
 }
 
+#[allow(dead_code)]
 fn regex_token_based(description: &str) -> Option<(i64, String)> {
     let mut parts = description.splitn(2, ' ');
     let count = parts.next()?.parse::<i64>().ok()?;
@@ -599,6 +602,7 @@ fn regex_token_based(description: &str) -> Option<(i64, String)> {
     Some((count, format!("cursor-{model}")))
 }
 
+#[allow(dead_code)]
 fn regex_model_name(description: &str) -> Option<String> {
     for token in [
         "claude-4-sonnet-thinking",
@@ -646,11 +650,13 @@ fn previous_month(date: NaiveDate) -> NaiveDate {
     }
 }
 
+#[allow(dead_code)]
 fn month_anchor_date(year: i32, month: u32) -> String {
     let last_day = last_day_of_month(year, month);
     format!("{year:04}-{month:02}-{last_day:02}")
 }
 
+#[allow(dead_code)]
 fn last_day_of_month(year: i32, month: u32) -> u32 {
     let (next_year, next_month) = if month == 12 {
         (year + 1, 1)
@@ -696,7 +702,7 @@ mod tests {
     use super::{
         invoice_to_sessions, parse_invoice_description, parse_usage_event_row,
         usage_bucket_model_name, usage_events_to_sessions, usage_to_sessions, InvoiceItem,
-        UsageBucket, UsageEventRecord, UsageSnapshot,
+        UsageBucket, UsageSnapshot,
     };
 
     #[test]

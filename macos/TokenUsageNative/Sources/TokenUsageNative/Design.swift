@@ -8,7 +8,69 @@ import SwiftUI
 enum AppDesign {
     static let cardCornerRadius: CGFloat = 10
     static let cardBackground = Color(nsColor: .controlBackgroundColor)
+    static let groupedBackground = Color(nsColor: .windowBackgroundColor)
     static let hairline = Color(nsColor: .separatorColor)
+}
+
+private struct AppGroupedSurfaceModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        content
+            .background(AppDesign.groupedBackground, in: shape)
+            .overlay(
+                shape
+                    .stroke(AppDesign.hairline.opacity(0.35), lineWidth: 1)
+                    .allowsHitTesting(false)
+            )
+    }
+}
+
+private struct FloatingOverlaySurfaceModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular, in: shape)
+        } else if reduceTransparency {
+            content
+                .background(AppDesign.cardBackground, in: shape)
+                .overlay(shape.stroke(AppDesign.hairline.opacity(0.55), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.10), radius: 8, y: 4)
+        } else {
+            content
+                .background(.regularMaterial, in: shape)
+                .overlay(shape.stroke(AppDesign.hairline.opacity(0.35), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.12), radius: 8, y: 4)
+        }
+    }
+}
+
+private struct InteractiveGlassControlModifier<ControlShape: InsettableShape>: ViewModifier {
+    let shape: ControlShape
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: shape)
+        } else if reduceTransparency {
+            content
+                .background(AppDesign.cardBackground, in: shape)
+                .overlay(shape.stroke(AppDesign.hairline.opacity(0.55), lineWidth: 1))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: shape)
+                .overlay(shape.stroke(Color.primary.opacity(0.10), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.06), radius: 3, y: 1)
+        }
+    }
 }
 
 private struct AppCardModifier: ViewModifier {
@@ -19,20 +81,9 @@ private struct AppCardModifier: ViewModifier {
                 in: RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
             )
             .overlay(
-                // Glass-like top sheen: a soft vertical highlight that fades
-                // into the card, plus the hairline separator stroke.
-                RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color.white.opacity(0.06), Color.clear],
-                            startPoint: .top,
-                            endPoint: UnitPoint(x: 0.5, y: 0.25)
-                        )
-                    )
-            )
-            .overlay(
                 RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
                     .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
+                    .allowsHitTesting(false)
             )
     }
 }
@@ -43,46 +94,22 @@ extension View {
         modifier(AppCardModifier())
     }
 
-    /// Floating overlay surface for chart hover panels. Uses Liquid Glass on
-    /// macOS 26+, falling back to a material background on older systems.
-    @ViewBuilder
+    /// Floating functional layer for chart hover panels.
     func appFloatingOverlaySurface(cornerRadius: CGFloat = 10) -> some View {
-        if #available(macOS 26.0, *) {
-            glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-        } else {
-            background(
-                .regularMaterial,
-                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-            )
-            .shadow(color: Color.black.opacity(0.12), radius: 8, y: 4)
-        }
+        modifier(FloatingOverlaySurfaceModifier(cornerRadius: cornerRadius))
     }
 
-    /// Small interactive glass surface for chips, pickers, and inline
-    /// controls. Liquid Glass on macOS 26+, thin material fallback before it.
-    @ViewBuilder
-    func appGlassChip<S: InsettableShape>(in shape: S = Capsule()) -> some View {
-        if #available(macOS 26.0, *) {
-            glassEffect(.regular.interactive(), in: shape)
-        } else {
-            background(.ultraThinMaterial, in: shape)
-                .overlay(
-                    shape.stroke(Color.primary.opacity(0.10), lineWidth: 1)
-                )
-                .shadow(color: Color.black.opacity(0.06), radius: 3, y: 1)
-        }
+    /// Custom interactive control group that floats above content.
+    func appInteractiveGlassControl<S: InsettableShape>(in shape: S = Capsule()) -> some View {
+        modifier(InteractiveGlassControlModifier(shape: shape))
     }
 
-    /// Glass surface for content cards the user interacts with (kanban cards,
-    /// month cards). Liquid Glass on macOS 26+; grouped-inset card before it.
-    @ViewBuilder
-    func appGlassCard(cornerRadius: CGFloat = AppDesign.cardCornerRadius) -> some View {
-        if #available(macOS 26.0, *) {
-            glassEffect(.regular.interactive(), in: .rect(cornerRadius: cornerRadius))
-        } else {
-            appCard()
-        }
+    /// Opaque grouped surface for dense content. It follows the content's
+    /// intrinsic height and keeps backdrop colors from bleeding into cards.
+    func appGroupedSurface(cornerRadius: CGFloat) -> some View {
+        modifier(AppGroupedSurfaceModifier(cornerRadius: cornerRadius))
     }
+
 }
 
 // MARK: - AppPalette

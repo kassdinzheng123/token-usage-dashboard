@@ -266,6 +266,10 @@ private struct BriefMonthView: View {
         let intensity = projects.map { max(0.12, sqrt(Double($0) / Double(maxProjects))) } ?? 0
         let isToday = date == BriefDateHelper.todayString
         let isFuture = date > BriefDateHelper.todayString
+        let cellShape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        let fillColor = intensity > 0
+            ? Color.accentColor.opacity(intensity * 0.55)
+            : Color.primary.opacity(isFuture ? 0.015 : 0.04)
 
         return Button {
             onSelectDate(date)
@@ -307,20 +311,11 @@ private struct BriefMonthView: View {
             }
             .padding(8)
             .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
-            .background {
-                if intensity > 0 {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.accentColor.opacity(intensity * 0.55))
-                } else {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.primary.opacity(isFuture ? 0.015 : 0.04))
-                }
-            }
+            .background(fillColor, in: cellShape)
             .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(isToday ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                cellShape.stroke(isToday ? Color.accentColor : Color.clear, lineWidth: 1.5)
             )
-            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .contentShape(cellShape)
         }
         .buttonStyle(.plain)
         .help(dayTooltip(date: date, entry: entry))
@@ -348,11 +343,43 @@ private struct BriefMonthView: View {
 
 // MARK: - All view
 
-/// Left-to-right timeline of month cards. Tapping a month opens its month view.
+/// Vertical timeline of months, newest first, grouped by year. The rail node
+/// size and tint encode each month's token volume relative to the busiest
+/// month; tapping a row opens its month view.
 private struct BriefAllView: View {
     let months: [BriefMonthEntry]
     @ObservedObject var currencyController: TokenUsageBillingCurrencyController
     let onSelectMonth: (String) -> Void
+
+    private enum Item: Identifiable {
+        case year(String)
+        case month(BriefMonthEntry)
+
+        var id: String {
+            switch self {
+            case .year(let year): "year-\(year)"
+            case .month(let month): month.id
+            }
+        }
+    }
+
+    private var maxTokens: Int {
+        max(months.map(\.totalTokens).max() ?? 0, 1)
+    }
+
+    private var items: [Item] {
+        var result: [Item] = []
+        var currentYear = ""
+        for month in months.sorted(by: { $0.month > $1.month }) {
+            let year = String(month.month.prefix(4))
+            if year != currentYear {
+                currentYear = year
+                result.append(.year(year))
+            }
+            result.append(.month(month))
+        }
+        return result
+    }
 
     var body: some View {
         if months.isEmpty {
@@ -361,85 +388,228 @@ private struct BriefAllView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 200)
         } else {
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: true) {
-                    HStack(alignment: .top, spacing: 14) {
-                        ForEach(months) { month in
-                            monthCard(month)
-                                .id(month.id)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                .onAppear {
-                    if let last = months.last {
-                        proxy.scrollTo(last.id, anchor: .trailing)
+            let items = self.items
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    let showsTopLine = index > 0
+                    let showsBottomLine = index < items.count - 1
+                    switch item {
+                    case .year(let year):
+                        BriefTimelineYearRow(
+                            year: year,
+                            showsTopLine: showsTopLine,
+                            showsBottomLine: showsBottomLine
+                        )
+                    case .month(let month):
+                        BriefTimelineMonthRow(
+                            month: month,
+                            maxTokens: maxTokens,
+                            currencyController: currencyController,
+                            showsTopLine: showsTopLine,
+                            showsBottomLine: showsBottomLine,
+                            onSelect: { onSelectMonth(month.month) }
+                        )
                     }
                 }
             }
+            .padding(.vertical, 8)
+            .appCard()
         }
     }
+}
 
-    private func monthCard(_ month: BriefMonthEntry) -> some View {
-        Button {
-            onSelectMonth(month.month)
-        } label: {
-            VStack(alignment: .leading, spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(BriefDateHelper.monthLabel(month.month))
-                        .font(.headline)
-                    Text(month.month)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+/// The vertical rail: a continuous 2pt spine with a node centered on the row.
+private struct BriefTimelineRail: View {
+    let nodeSize: CGFloat
+    let nodeOpacity: Double
+    let isCurrent: Bool
+    let showsTopLine: Bool
+    let showsBottomLine: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            spine.opacity(showsTopLine ? 1 : 0)
+            ZStack {
+                if isCurrent {
+                    Circle()
+                        .strokeBorder(Color.accentColor.opacity(0.3), lineWidth: 3)
+                        .frame(width: nodeSize + 9, height: nodeSize + 9)
                 }
+                Circle()
+                    .fill(Color.accentColor.opacity(nodeOpacity))
+                    .frame(width: nodeSize, height: nodeSize)
+            }
+            .frame(width: 26, height: max(nodeSize + 9, 20))
+            spine.opacity(showsBottomLine ? 1 : 0)
+        }
+        .frame(width: 26)
+    }
 
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(month.totalTokens.briefDayTokenText)
-                            .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                        Text("tokens")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(currencyController.string(fromUSD: Decimal(month.totalCost)))
-                            .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                        Text("cost")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+    private var spine: some View {
+        RoundedRectangle(cornerRadius: 1, style: .continuous)
+            .fill(Color.accentColor.opacity(0.16))
+            .frame(width: 2)
+            .frame(maxHeight: .infinity)
+    }
+}
+
+/// Year separator on the timeline.
+private struct BriefTimelineYearRow: View {
+    let year: String
+    let showsTopLine: Bool
+    let showsBottomLine: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            BriefTimelineRail(
+                nodeSize: 6,
+                nodeOpacity: 0.35,
+                isCurrent: false,
+                showsTopLine: showsTopLine,
+                showsBottomLine: showsBottomLine
+            )
+            Text(year)
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+/// One month on the timeline: node, label, stats, usage bar, and the CLI
+/// source icons (SVG marks) that were active that month.
+private struct BriefTimelineMonthRow: View {
+    let month: BriefMonthEntry
+    let maxTokens: Int
+    @ObservedObject var currencyController: TokenUsageBillingCurrencyController
+    let showsTopLine: Bool
+    let showsBottomLine: Bool
+    let onSelect: () -> Void
+
+    @State private var isHovering = false
+
+    private var isCurrent: Bool {
+        month.month == BriefDateHelper.currentMonthString
+    }
+
+    private var fraction: Double {
+        min(1, max(0.04, Double(month.totalTokens) / Double(maxTokens)))
+    }
+
+    private var nodeSize: CGFloat {
+        9 + 6 * CGFloat(sqrt(fraction))
+    }
+
+    private var knownSources: [UsageSource] {
+        month.sources.compactMap(UsageSource.init(rawValue:))
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(alignment: .top, spacing: 14) {
+                BriefTimelineRail(
+                    nodeSize: nodeSize,
+                    nodeOpacity: 0.4 + 0.6 * fraction,
+                    isCurrent: isCurrent,
+                    showsTopLine: showsTopLine,
+                    showsBottomLine: showsBottomLine
+                )
+
+                VStack(alignment: .leading, spacing: 7) {
+                    header
+                    stats
+                    usageBar
+                    footer
                 }
-
-                Text("\(month.activeDays) 活跃天 · \(month.projects) 项目")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                if !month.topProjects.isEmpty {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(month.topProjects, id: \.self) { project in
-                            HStack(spacing: 5) {
-                                Circle()
-                                    .fill(Color.accentColor.opacity(0.7))
-                                    .frame(width: 4, height: 4)
-                                Text(project)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                        }
-                    }
-                }
+                .padding(.vertical, 10)
 
                 Spacer(minLength: 0)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 14)
             }
-            .padding(14)
-            .frame(width: 220)
-            .frame(minHeight: 180, alignment: .topLeading)
+            .padding(.trailing, 12)
+            .background(
+                Color.primary.opacity(isHovering ? 0.045 : 0),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
             .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
-        .appGlassCard(cornerRadius: 12)
+        .onHover { isHovering = $0 }
+        .help("查看 \(BriefDateHelper.monthLabel(month.month)) 的月视图")
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text(BriefDateHelper.shortMonthLabel(month.month))
+                .font(.headline)
+            if isCurrent {
+                Text("本月")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+            }
+            Spacer(minLength: 0)
+            Text(month.totalTokens.briefDayTokenText)
+                .font(.system(.subheadline, design: .monospaced).weight(.semibold))
+            Text(currencyController.string(fromUSD: Decimal(month.totalCost)))
+                .font(.system(.subheadline, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var stats: some View {
+        HStack(spacing: 12) {
+            Label("\(month.activeDays) 活跃天", systemImage: "calendar")
+            Label("\(month.projects) 项目", systemImage: "folder")
+            Label("\(month.sessions) 次会话", systemImage: "terminal")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .imageScale(.small)
+    }
+
+    private var usageBar: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.06))
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.accentColor.opacity(0.55), Color.accentColor],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(4, proxy.size.width * fraction))
+            }
+        }
+        .frame(height: 4)
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        if !knownSources.isEmpty || !month.topProjects.isEmpty {
+            HStack(spacing: 6) {
+                ForEach(knownSources) { source in
+                    UsageSourceIconBadge(source: source, size: 18)
+                }
+                if !month.topProjects.isEmpty {
+                    Text(month.topProjects.joined(separator: "  ·  "))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        }
     }
 }
 
@@ -508,6 +678,13 @@ enum BriefDateHelper {
         return monthLabelFormatter.string(from: value)
     }
 
+    /// Short month label without the year ("7月"), used in the timeline where
+    /// a year header already provides the year context.
+    static func shortMonthLabel(_ month: String) -> String {
+        guard let value = monthDayFormatter.date(from: "\(month)-01") else { return month }
+        return shortMonthLabelFormatter.string(from: value)
+    }
+
     private static let mondayCalendar: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
         calendar.firstWeekday = 2
@@ -545,6 +722,14 @@ enum BriefDateHelper {
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.dateFormat = "yyyy年M月"
+        return formatter
+    }()
+
+    private static let shortMonthLabelFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M月"
         return formatter
     }()
 }

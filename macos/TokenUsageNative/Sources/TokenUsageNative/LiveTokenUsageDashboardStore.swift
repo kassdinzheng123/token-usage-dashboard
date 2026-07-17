@@ -27,6 +27,14 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     private let serverProcess: LocalServerProcess
     private let preferences: TokenUsagePreferencesController
     private let calendar = Calendar.current
+    /// Schedule wall-clock for auto brief generation. The day/hour slots are
+    /// defined in Beijing time per product requirement, independent of the
+    /// Mac's local timezone.
+    private let beijingCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        return calendar
+    }()
     private var activeLoadCount = 0
     private var isDashboardRefreshInFlight = false
     private var isTodayRefreshInFlight = false
@@ -38,8 +46,17 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     private var briefSchedulerTask: Task<Void, Never>?
     private var activeDashboardRequest: DashboardRecordRequest?
     private let dashboardRecordsCache: DashboardRecordsCache
-    private var lastAutoBriefAttemptDate: String?
     private var nextAutoBriefAttempt: Date?
+
+    /// Day-level brief slots in Beijing time: 8:00 initializes today's brief,
+    /// 12:00 / 18:00 / 23:00 force-refresh it.
+    private static let dayBriefSlots = [8, 12, 18, 23]
+    /// UserDefaults keys persisting which auto slots already ran, so app
+    /// restarts neither re-fire a slot nor miss one silently. Entries are
+    /// keyed "yyyy-MM-dd@slot" (day) / "yyyy-MM-dd#hour" (hour) and pruned
+    /// to the current day on write.
+    private static let autoDaySlotsKey = "TokenUsage.briefAutoDaySlots"
+    private static let autoHourSlotsKey = "TokenUsage.briefAutoHourSlots"
 
     init(
         client: TokenUsageAPIClient = TokenUsageAPIClient(),
@@ -341,33 +358,20 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
         }
     }
 
+    /// Auto schedule (Beijing time):
+    /// - Day level: 8:00 initializes today's brief (keeps an existing one);
+    ///   12:00 / 18:00 / 23:00 force-refresh it. Missed slots catch up by
+    ///   running only the latest due slot.
+    /// - Hour level: two minutes after each hour completes, that hour's entry
+    ///   inside today's brief is (re)generated.
     private func maybeAutoGenerateBrief() async {
         let now = Date()
         let today = localDateString(for: now)
+        let beijingHour = beijingCalendar.component(.hour, from: now)
+        let beijingMinute = beijingCalendar.component(.minute, from: now)
 
-        if todayBrief?.date == today && todayBrief?.status == "ok" {
-            return
-        }
-
-        if lastAutoBriefAttemptDate == today {
-            if let nextAutoBriefAttempt, now >= nextAutoBriefAttempt {
-                // Retry after backoff.
-            } else {
-                return
-            }
-        }
-
-        let hour = calendar.component(.hour, from: now)
-        guard hour >= 10 else {
-            return
-        }
-
-        if todayBrief == nil || todayBrief?.date != today {
-            await refreshTodayBrief()
-            if todayBrief?.date == today && todayBrief?.status == "ok" {
-                return
-            }
-        } else if todayBrief?.status == "ok" {
+        // Global backoff after a failed auto attempt.
+        if let nextAutoBriefAttempt, now < nextAutoBriefAttempt {
             return
         }
 
@@ -375,8 +379,98 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
             return
         }
 
-        lastAutoBriefAttemptDate = today
-        await generateTodayBrief(force: false, trigger: "auto")
+        // Day-level slots.
+        if let dueSlot = Self.dayBriefSlots.last(where: { $0 <= beijingHour }) {
+            let slotKey = "\(today)@\(dueSlot)"
+            if !completedAutoSlots(forKey: Self.autoDaySlotsKey).contains(slotKey) {
+                if todayBrief?.date != today {
+                    await refreshTodayBrief()
+                }
+                let briefReady = todayBrief?.date == today && todayBrief?.status == "ok"
+                let initialize = dueSlot == Self.dayBriefSlots.first
+                if initialize && briefReady {
+                    markAutoSlotComplete(slotKey, forKey: Self.autoDaySlotsKey)
+                } else {
+                    await generateTodayBrief(force: !initialize, trigger: "auto")
+                    if todayBrief?.date == today && todayBrief?.status == "ok" {
+                        markAutoSlotComplete(slotKey, forKey: Self.autoDaySlotsKey)
+                    }
+                }
+                return
+            }
+        }
+
+        // Hour-level: the just-completed hour, merged into today's brief.
+        // Requires the day brief to exist (the 8:00 slot creates it and
+        // covers hours 0-7).
+        let completedHour = beijingHour - 1
+        guard beijingMinute >= 2, completedHour >= 0 else {
+            return
+        }
+        let hourKey = "\(today)#\(completedHour)"
+        guard !completedAutoSlots(forKey: Self.autoHourSlotsKey).contains(hourKey) else {
+            return
+        }
+        guard todayBrief?.date == today, todayBrief?.status == "ok" else {
+            return
+        }
+        await generateAutoHourBrief(date: today, hour: completedHour)
+        if todayBrief?.date == today && todayBrief?.status == "ok" {
+            markAutoSlotComplete(hourKey, forKey: Self.autoHourSlotsKey)
+        }
+    }
+
+    private func generateAutoHourBrief(date: String, hour: Int) async {
+        guard !isGeneratingBrief else { return }
+        isGeneratingBrief = true
+        briefErrorMessage = nil
+        defer { isGeneratingBrief = false }
+
+        // Hour regeneration reuses the CLI set the brief was built with.
+        let sources = todayBrief?.enabledSources
+            ?? preferences.briefSupportedEnabledSources.map(\.rawValue)
+        let model = BriefModelConfig(
+            baseUrl: preferences.briefBaseURL,
+            apiKey: preferences.resolvedBriefApiKey,
+            modelId: preferences.briefModelId
+        )
+
+        do {
+            try await serverProcess.ensureRunning()
+            let brief = try await client.generateTodayBrief(
+                force: true,
+                trigger: "auto",
+                sources: sources,
+                model: model,
+                date: date,
+                hours: [hour]
+            )
+            briefCache[date] = brief
+            if date == localDateString(for: Date()) {
+                todayBrief = brief
+                if brief.status == "ok" {
+                    nextAutoBriefAttempt = nil
+                } else {
+                    briefErrorMessage = brief.error
+                    nextAutoBriefAttempt = Date().addingTimeInterval(15 * 60)
+                }
+            }
+        } catch {
+            briefErrorMessage = error.localizedDescription
+            nextAutoBriefAttempt = Date().addingTimeInterval(15 * 60)
+        }
+    }
+
+    private func completedAutoSlots(forKey defaultsKey: String) -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [])
+    }
+
+    private func markAutoSlotComplete(_ slotKey: String, forKey defaultsKey: String) {
+        // Keep only today's entries (keys start with the yyyy-MM-dd prefix).
+        let dayPrefix = String(slotKey.prefix(10))
+        var slots = completedAutoSlots(forKey: defaultsKey).filter { $0.hasPrefix(dayPrefix) }
+        slots.insert(slotKey)
+        UserDefaults.standard.set(Array(slots), forKey: defaultsKey)
     }
 
     private func localDateString(for date: Date) -> String {

@@ -565,10 +565,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         ScrollView(.vertical) {
             LazyVStack(alignment: .leading, spacing: 20) {
                 if store.records.isEmpty {
-                    if focusedDay != nil && !store.isLoading {
-                        emptyTodayState(text: "No usage recorded for this day")
-                    } else {
+                    if store.isLoading {
                         dashboardLoadingView
+                    } else {
+                        emptyTodayState(text: "No usage recorded for this day")
                     }
                 } else {
                     heroMetricsRow
@@ -596,7 +596,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                         todayTimelineSection
                     }
                 } else if store.records.isEmpty {
-                    dashboardLoadingView
+                    if store.isLoading {
+                        dashboardLoadingView
+                    } else {
+                        emptyTodayState(text: "No usage recorded for this day")
+                    }
                 } else {
                     dailyTokenUsageSection
                     activityInsightsSection
@@ -653,12 +657,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     private var modelsPage: some View {
         ScrollView(.vertical) {
             LazyVStack(alignment: .leading, spacing: 20) {
-                if store.records.isEmpty {
-                    if focusedDay != nil && !store.isLoading {
-                        emptyTodayState(text: "No usage recorded for this day")
-                    } else {
-                        dashboardLoadingView
-                    }
+                if store.isLoading && store.records.isEmpty {
+                    dashboardLoadingView
                 } else {
                     modelConsumptionSection
                 }
@@ -941,7 +941,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .foregroundStyle(Color.accentColor)
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .appGlassChip()
+        .appInteractiveGlassControl()
         .help("Day view — click × to return")
     }
 
@@ -1478,7 +1478,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .appGlassChip()
+        .background(
+            Color(nsColor: .textBackgroundColor),
+            in: Capsule()
+        )
+        .overlay(
+            Capsule()
+                .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
+                .allowsHitTesting(false)
+        )
         .frame(width: 170)
     }
 
@@ -3988,7 +3996,6 @@ struct ProviderIconBadge: View {
             )
             .frame(width: size, height: size)
             .background(metadata.color.opacity(0.10), in: shape)
-            .background(.ultraThinMaterial, in: shape)
             .overlay(shape.stroke(metadata.color.opacity(0.18), lineWidth: 0.5))
         } else {
             Text(metadata.abbreviation)
@@ -4021,7 +4028,6 @@ struct UsageSourceIconBadge: View {
             BundledIconImage(imageAssetName: imageAssetName, padding: 1)
                 .frame(width: size, height: size)
                 .background(source.iconBadgeBackgroundColor, in: shape)
-                .background(.ultraThinMaterial, in: shape)
                 .overlay(shape.stroke(source.tintColor.opacity(0.16), lineWidth: 0.5))
         } else {
             Image(systemName: source.systemImage)
@@ -5284,7 +5290,7 @@ private struct LegendPageControls: View {
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 4)
-        .appGlassChip()
+        .appInteractiveGlassControl()
         .fixedSize()
     }
 }
