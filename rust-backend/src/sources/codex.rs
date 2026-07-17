@@ -13,6 +13,10 @@ use std::{
 const UNKNOWN_MODEL: &str = "unknown";
 const FALLBACK_PRICING_MODEL: &str = "gpt-5";
 const CODEX_HOMES_ENV: &str = "TOKEN_USAGE_CODEX_HOMES";
+/// Max inter-row gap (ms) still treated as part of a forked rollout's replay
+/// burst. Mirrors TokenTracker (`CODEX_FORK_REPLAY_GAP_MS`): replay flush spaces
+/// rows sub-ms to a few ms apart, while live turns arrive multi-second apart.
+const CODEX_FORK_REPLAY_GAP_MS: i64 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceView {
@@ -20,6 +24,7 @@ enum SourceView {
     Monthly,
     Sessions,
     Blocks,
+    Messages,
 }
 
 impl TryFrom<&str> for SourceView {
@@ -31,6 +36,7 @@ impl TryFrom<&str> for SourceView {
             "monthly" => Ok(Self::Monthly),
             "sessions" => Ok(Self::Sessions),
             "blocks" => Ok(Self::Blocks),
+            "messages" => Ok(Self::Messages),
             other => Err(format!("unsupported view: {other}")),
         }
     }
@@ -104,19 +110,23 @@ struct SessionFile {
 }
 
 pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String> {
-    let _ = refresh;
+    load_source_view_since(view, refresh, None)
+}
+
+pub fn load_source_view_since(
+    view: &str,
+    _refresh: bool,
+    watermark_ms: Option<i64>,
+) -> Result<Vec<Value>, String> {
     let view = SourceView::try_from(view)?;
 
-    if view == SourceView::Blocks {
-        return Ok(Vec::new());
-    }
-
-    let events = load_events()?;
+    let events = load_events(watermark_ms)?;
     Ok(match view {
         SourceView::Daily => events_to_period_rows(&events, PeriodView::Daily),
         SourceView::Monthly => events_to_period_rows(&events, PeriodView::Monthly),
         SourceView::Sessions => events_to_sessions(&events),
-        SourceView::Blocks => Vec::new(),
+        SourceView::Blocks => events_to_blocks(&events),
+        SourceView::Messages => events_to_messages(&events),
     })
 }
 
@@ -129,7 +139,7 @@ pub fn load_daily_for_date(date: &str, refresh: bool) -> Result<Vec<Value>, Stri
         .collect())
 }
 
-fn load_events() -> Result<Vec<TokenUsageEvent>, String> {
+fn load_events(watermark_ms: Option<i64>) -> Result<Vec<TokenUsageEvent>, String> {
     let mut files = collect_session_files()?;
     let include_home_in_session_id = files
         .iter()
@@ -140,6 +150,11 @@ fn load_events() -> Result<Vec<TokenUsageEvent>, String> {
 
     let mut events = Vec::new();
     for session_file in files.drain(..) {
+        if let Some(watermark) = watermark_ms {
+            if !super::file_modified_after(&session_file.file, watermark) {
+                continue;
+            }
+        }
         append_events_from_file(&session_file, include_home_in_session_id, &mut events)?;
     }
 
@@ -152,7 +167,7 @@ fn load_events_for_date(date: &str) -> Result<Vec<TokenUsageEvent>, String> {
         return Ok(Vec::new());
     }
 
-    let mut events = load_events()?;
+    let mut events = load_events(None)?;
     events.retain(|event| event.date == date);
     Ok(events)
 }
@@ -311,9 +326,16 @@ fn append_events_from_file(
     };
 
     let session_id = session_id_for(session_file, include_home_in_session_id);
+    let rollout_date = rollout_date_from_path(&session_file.file);
     let mut previous_totals_by_scope = BTreeMap::new();
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
+    let mut current_date: Option<String> = None;
+    let mut is_forked_rollout = false;
+    // Replay prefix only exists at the head of a freshly-forked file. Latch off
+    // permanently at the first multi-second gap (TokenTracker issue #169).
+    let mut replay_prefix_active = true;
+    let mut prev_forked_token_ms: Option<i64> = None;
     let mut pending_without_model = Vec::new();
 
     for line in BufReader::new(file).lines() {
@@ -336,12 +358,27 @@ fn append_events_from_file(
             if let Some(provider) = extract_provider(payload) {
                 current_provider = Some(provider);
             }
+            if payload
+                .get("forked_from_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|id| !id.is_empty())
+            {
+                is_forked_rollout = true;
+            }
             continue;
         }
 
         if entry.get("type").and_then(Value::as_str) == Some("turn_context") {
             if let Some(provider) = extract_provider(payload) {
                 current_provider = Some(provider);
+            }
+            if let Some(date) = payload
+                .get("current_date")
+                .and_then(Value::as_str)
+                .and_then(normalize_iso_date)
+            {
+                current_date = Some(date);
             }
             if let Some(model) = extract_model(payload) {
                 current_model = Some(model.clone());
@@ -406,6 +443,21 @@ fn append_events_from_file(
         let Some((date, time, timestamp_millis)) = timestamp_parts(timestamp) else {
             continue;
         };
+
+        // Forked Codex rollouts replay the parent session's token history into
+        // the child file at spawn time. Skip that replay (TokenTracker #169).
+        // Totals above are still advanced so total-delta chains stay intact.
+        let forked_replay_skip = forked_replay_burst_skip(
+            is_forked_rollout,
+            &mut replay_prefix_active,
+            &mut prev_forked_token_ms,
+            timestamp_millis,
+        );
+        if forked_replay_skip
+            || is_forked_replay_token(is_forked_rollout, rollout_date.as_deref(), current_date.as_deref())
+        {
+            continue;
+        }
 
         if let Some(model) = extracted_model.as_ref() {
             current_model = Some(model.clone());
@@ -530,6 +582,52 @@ fn events_to_sessions(events: &[TokenUsageEvent]) -> Vec<Value> {
                 "totalCost": group.total_cost,
                 "modelsUsed": models_used(&group),
                 "modelBreakdowns": model_breakdowns(&group),
+            })
+        })
+        .collect()
+}
+
+fn events_to_blocks(events: &[TokenUsageEvent]) -> Vec<Value> {
+    events
+        .iter()
+        .map(|event| {
+            let block_id = format!("{}-{}", event.session_id, event.timestamp_millis);
+            json!({
+                "blockId": block_id,
+                "sessionId": event.session_id,
+                "modelName": super::cluster_model_name(&event.model_name),
+                "timestamp": event.timestamp_millis,
+                "date": event.date,
+                "time": event.time,
+                "inputTokens": event.input_tokens,
+                "outputTokens": event.output_tokens,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": event.cache_read_tokens,
+                "totalTokens": event.total_tokens,
+                "cost": event.cost,
+            })
+        })
+        .collect()
+}
+
+/// One row per token-usage event. Ids mirror the blocks view
+/// (`session_id-timestamp_millis`) so ledger upserts stay idempotent.
+fn events_to_messages(events: &[TokenUsageEvent]) -> Vec<Value> {
+    events
+        .iter()
+        .map(|event| {
+            let message_id = format!("{}-{}", event.session_id, event.timestamp_millis);
+            json!({
+                "messageId": message_id,
+                "sessionId": event.session_id,
+                "date": event.date,
+                "time": event.time,
+                "inputTokens": event.input_tokens,
+                "outputTokens": event.output_tokens,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": event.cache_read_tokens,
+                "totalTokens": event.total_tokens,
+                "cost": event.cost,
             })
         })
         .collect()
@@ -805,6 +903,83 @@ fn timestamp_parts(timestamp: &str) -> Option<(String, String, i64)> {
     ))
 }
 
+/// Extract `YYYY-MM-DD` from Codex rollout filenames like
+/// `rollout-2026-06-09T20-46-23-<uuid>.jsonl` (TokenTracker `rolloutDateFromPath`).
+fn rollout_date_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("rollout-")?;
+    if rest.len() < 10 {
+        return None;
+    }
+    let date = &rest[..10];
+    if date.as_bytes().get(4) != Some(&b'-') || date.as_bytes().get(7) != Some(&b'-') {
+        return None;
+    }
+    if !rest.as_bytes().get(10).is_some_and(|b| *b == b'T') {
+        return None;
+    }
+    if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return None;
+    }
+    Some(date.to_string())
+}
+
+fn normalize_iso_date(value: &str) -> Option<String> {
+    let raw = value.trim();
+    if raw.len() < 10 {
+        return None;
+    }
+    let date = &raw[..10];
+    if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return None;
+    }
+    Some(date.to_string())
+}
+
+/// Cross-day fork guard: replayed history carries an older `current_date` than
+/// the child rollout's filename date.
+fn is_forked_replay_token(
+    is_forked_rollout: bool,
+    rollout_date: Option<&str>,
+    current_date: Option<&str>,
+) -> bool {
+    matches!(
+        (is_forked_rollout, rollout_date, current_date),
+        (true, Some(rollout), Some(current)) if current < rollout
+    )
+}
+
+/// Same-day fork burst detector. Skips the *leading* densely-spaced
+/// `token_count` rows in a forked rollout; latches off at the first gap ≥
+/// `CODEX_FORK_REPLAY_GAP_MS`. The first row of the burst is still counted
+/// (no lookahead); backwards/unparseable clocks fail open.
+fn forked_replay_burst_skip(
+    is_forked_rollout: bool,
+    replay_prefix_active: &mut bool,
+    prev_forked_token_ms: &mut Option<i64>,
+    token_ms: i64,
+) -> bool {
+    if !is_forked_rollout || !*replay_prefix_active {
+        return false;
+    }
+
+    if let Some(prev) = *prev_forked_token_ms {
+        if token_ms < prev {
+            // Fail open on backwards clock steps.
+            *replay_prefix_active = false;
+            return false;
+        }
+        if token_ms - prev >= CODEX_FORK_REPLAY_GAP_MS {
+            *replay_prefix_active = false;
+        }
+    }
+
+    let skip = *replay_prefix_active
+        && prev_forked_token_ms.is_some_and(|prev| token_ms - prev < CODEX_FORK_REPLAY_GAP_MS);
+    *prev_forked_token_ms = Some(token_ms);
+    skip
+}
+
 fn session_id_for(session_file: &SessionFile, include_home: bool) -> String {
     let relative = session_file
         .file
@@ -973,14 +1148,69 @@ fn to_f64(value: &Value) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::{
         sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn watermark_skips_unchanged_files_and_rereads_newer_ones() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        fixture.write_session(
+            "project/session-a.jsonl",
+            &[json!({
+                "timestamp": "2025-09-11T18:25:40.670Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "model_name": "gpt-5-codex",
+                        "total_token_usage": {
+                            "input_tokens": 120,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 50,
+                            "total_tokens": 170
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 120,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 50,
+                            "total_tokens": 170
+                        }
+                    }
+                }
+            })],
+        );
+        let session_file = fixture.root.join("sessions").join("project/session-a.jsonl");
+        let mtime_ms = file_mtime_ms(&session_file);
+
+        // First run (no watermark): full scan.
+        assert_eq!(
+            load_source_view_since("sessions", true, None).unwrap().len(),
+            1
+        );
+        // Unchanged file (mtime at the watermark): skipped.
+        assert!(load_source_view_since("sessions", true, Some(mtime_ms))
+            .unwrap()
+            .is_empty());
+        // File newer than the watermark: re-read.
+        assert_eq!(
+            load_source_view_since("sessions", true, Some(mtime_ms - 1))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn file_mtime_ms(path: &Path) -> i64 {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        i64::try_from(modified.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
+    }
 
     #[test]
     fn loads_daily_with_last_usage_and_total_usage_delta() {
@@ -1636,7 +1866,388 @@ mod tests {
         fixture.write_session("ignored.jsonl", &[]);
 
         let rows = load_source_view("blocks", true).unwrap();
-        assert!(rows.is_empty());
+        assert!(rows.is_empty(), "blocks from empty session should be empty");
+    }
+
+    #[test]
+    fn blocks_view_returns_per_event_rows_with_event_dates() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        fixture.write_session(
+            "cross-day.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-01T12:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "model_name": "gpt-5-codex",
+                            "total_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 10,
+                                "total_tokens": 110
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 10,
+                                "total_tokens": 110
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-02T12:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "model_name": "gpt-5-codex",
+                            "total_token_usage": {
+                                "input_tokens": 200,
+                                "cached_input_tokens": 40,
+                                "output_tokens": 20,
+                                "total_tokens": 220
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let rows = load_source_view("blocks", true).unwrap();
+        assert_eq!(rows.len(), 2, "should have one block per token_count event");
+
+        let first = &rows[0];
+        assert_eq!(first["date"], "2026-06-01", "first block date should be event date");
+        assert_eq!(first["totalTokens"], 110);
+        assert_eq!(first["cacheReadTokens"], 20);
+        assert_eq!(first["inputTokens"], 80);
+
+        let second = &rows[1];
+        assert_eq!(second["date"], "2026-06-02", "second block date should be event date");
+        // Second event has no last_token_usage, so delta is computed from total:
+        // delta_input = 200 - 100 = 100, delta_cached = 40 - 20 = 20
+        // cache_read = min(20, 100) = 20, input = 100 - 20 = 80
+        assert_eq!(second["totalTokens"], 110);
+        assert_eq!(second["cacheReadTokens"], 20);
+        assert_eq!(second["inputTokens"], 80);
+    }
+
+    #[test]
+    fn skips_historical_replay_tokens_in_cross_day_forked_rollouts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let replay = json!({
+            "input_tokens": 100,
+            "cached_input_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 110
+        });
+        let live = json!({
+            "input_tokens": 7,
+            "cached_input_tokens": 0,
+            "output_tokens": 3,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 10
+        });
+        let live_totals = json!({
+            "input_tokens": 107,
+            "cached_input_tokens": 0,
+            "output_tokens": 13,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 120
+        });
+
+        fixture.write_session(
+            "2026/06/09/rollout-2026-06-09T20-46-23-fork.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-09T20:46:23.000Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "forked_from_id": "019e095c-c041-7b40-b7cb-43ddb153086c",
+                        "model": "gpt-5.5"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-09T20:46:23.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5",
+                        "current_date": "2026-05-08"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-09T20:46:26.530Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": replay,
+                            "total_token_usage": replay
+                        }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-09T20:47:00.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-5.5",
+                        "current_date": "2026-06-09"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-06-09T20:47:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": live,
+                            "total_token_usage": live_totals
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        assert_eq!(rows.len(), 1, "cross-day replay row must be skipped");
+        assert_eq!(rows[0]["inputTokens"], 7);
+        assert_eq!(rows[0]["outputTokens"], 3);
+        assert_eq!(rows[0]["totalTokens"], 10);
+    }
+
+    #[test]
+    fn skips_same_day_forked_replay_burst() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        // Three replay rows ~1ms apart, then one live turn 30s later.
+        // current_date matches rollout date so only the burst detector applies.
+        let r0 = usage(100, 10);
+        let r1 = usage(200, 20);
+        let r2 = usage(300, 30);
+        let live = usage(7, 3);
+
+        fixture.write_session(
+            "rollout-2026-06-09T20-46-23-fork.jsonl",
+            &[
+                session_meta_forked("gpt-5.5"),
+                turn_context("gpt-5.5", "2026-06-09"),
+                token_count("2026-06-09T20:46:23.100Z", &r0, &cum(&[&r0])),
+                token_count("2026-06-09T20:46:23.101Z", &r1, &cum(&[&r0, &r1])),
+                token_count("2026-06-09T20:46:23.102Z", &r2, &cum(&[&r0, &r1, &r2])),
+                token_count(
+                    "2026-06-09T20:46:53.102Z",
+                    &live,
+                    &cum(&[&r0, &r1, &r2, &live]),
+                ),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        // First-of-burst counted (no lookahead) + live; middle burst skipped.
+        assert_eq!(rows.len(), 2);
+        let total: i64 = rows
+            .iter()
+            .map(|row| row["totalTokens"].as_i64().unwrap_or(0))
+            .sum();
+        assert_eq!(total, 110 + 10);
+    }
+
+    #[test]
+    fn latches_off_after_replay_burst_keeping_fast_live_turns() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let r0 = usage(100, 10);
+        let r1 = usage(200, 20);
+        let l0 = usage(5, 5);
+        let l1 = usage(6, 6); // 120ms after l0 — must NOT be dropped
+
+        fixture.write_session(
+            "rollout-2026-06-09T20-46-23-fork.jsonl",
+            &[
+                session_meta_forked("gpt-5.5"),
+                turn_context("gpt-5.5", "2026-06-09"),
+                token_count("2026-06-09T20:46:23.100Z", &r0, &cum(&[&r0])),
+                token_count("2026-06-09T20:46:23.101Z", &r1, &cum(&[&r0, &r1])),
+                token_count("2026-06-09T20:46:53.000Z", &l0, &cum(&[&r0, &r1, &l0])),
+                token_count(
+                    "2026-06-09T20:46:53.120Z",
+                    &l1,
+                    &cum(&[&r0, &r1, &l0, &l1]),
+                ),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        assert_eq!(rows.len(), 3);
+        let total: i64 = rows
+            .iter()
+            .map(|row| row["totalTokens"].as_i64().unwrap_or(0))
+            .sum();
+        assert_eq!(total, 110 + 10 + 12);
+    }
+
+    #[test]
+    fn fails_open_when_forked_timestamps_step_backwards() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let r0 = usage(100, 10);
+        let l0 = usage(5, 5);
+        let l1 = usage(6, 6);
+
+        fixture.write_session(
+            "rollout-2026-06-09T20-46-23-fork.jsonl",
+            &[
+                session_meta_forked("gpt-5.5"),
+                turn_context("gpt-5.5", "2026-06-09"),
+                token_count("2026-06-09T20:46:23.100Z", &r0, &cum(&[&r0])),
+                token_count("2026-06-09T20:46:22.900Z", &l0, &cum(&[&r0, &l0])),
+                token_count("2026-06-09T20:46:23.000Z", &l1, &cum(&[&r0, &l0, &l1])),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        assert_eq!(rows.len(), 3, "backwards clock must fail open and count all rows");
+    }
+
+    #[test]
+    fn never_drops_genuine_turns_in_replay_free_fork() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let a = usage(50, 5);
+        let b = usage(60, 6);
+
+        fixture.write_session(
+            "rollout-2026-06-09T20-46-23-fork.jsonl",
+            &[
+                session_meta_forked("gpt-5.5"),
+                turn_context("gpt-5.5", "2026-06-09"),
+                token_count("2026-06-09T20:46:28.000Z", &a, &a),
+                token_count(
+                    "2026-06-09T20:46:33.000Z",
+                    &b,
+                    &json!({
+                        "input_tokens": 110,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 11,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 121
+                    }),
+                ),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        assert_eq!(rows.len(), 2);
+        let total: i64 = rows
+            .iter()
+            .map(|row| row["totalTokens"].as_i64().unwrap_or(0))
+            .sum();
+        assert_eq!(total, 55 + 66);
+    }
+
+    #[test]
+    fn non_forked_sessions_are_unaffected_by_burst_detector() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let a = usage(50, 5);
+        let b = usage(60, 6);
+
+        fixture.write_session(
+            "rollout-2026-06-09T20-46-23-main.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-06-09T20:46:23.000Z",
+                    "type": "session_meta",
+                    "payload": { "model": "gpt-5.5" }
+                }),
+                turn_context("gpt-5.5", "2026-06-09"),
+                token_count("2026-06-09T20:46:23.100Z", &a, &a),
+                token_count(
+                    "2026-06-09T20:46:23.101Z",
+                    &b,
+                    &json!({
+                        "input_tokens": 110,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 11,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 121
+                    }),
+                ),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        assert_eq!(rows.len(), 2, "non-forked dense rows must all be counted");
+    }
+
+    fn usage(input: i64, output: i64) -> Value {
+        json!({
+            "input_tokens": input,
+            "cached_input_tokens": 0,
+            "output_tokens": output,
+            "reasoning_output_tokens": 0,
+            "total_tokens": input + output
+        })
+    }
+
+    fn cum(parts: &[&Value]) -> Value {
+        let mut input = 0i64;
+        let mut output = 0i64;
+        let mut total = 0i64;
+        for part in parts {
+            input += part["input_tokens"].as_i64().unwrap_or(0);
+            output += part["output_tokens"].as_i64().unwrap_or(0);
+            total += part["total_tokens"].as_i64().unwrap_or(0);
+        }
+        json!({
+            "input_tokens": input,
+            "cached_input_tokens": 0,
+            "output_tokens": output,
+            "reasoning_output_tokens": 0,
+            "total_tokens": total
+        })
+    }
+
+    fn session_meta_forked(model: &str) -> Value {
+        json!({
+            "timestamp": "2026-06-09T20:46:23.000Z",
+            "type": "session_meta",
+            "payload": {
+                "forked_from_id": "019e095c-c041-7b40-b7cb-43ddb153086c",
+                "model": model
+            }
+        })
+    }
+
+    fn turn_context(model: &str, current_date: &str) -> Value {
+        json!({
+            "timestamp": "2026-06-09T20:46:23.000Z",
+            "type": "turn_context",
+            "payload": {
+                "model": model,
+                "current_date": current_date
+            }
+        })
+    }
+
+    fn token_count(ts: &str, last: &Value, total: &Value) -> Value {
+        json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": last,
+                    "total_token_usage": total
+                }
+            }
+        })
     }
 
     struct TestCodexHome {

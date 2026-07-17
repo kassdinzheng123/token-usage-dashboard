@@ -1,8 +1,10 @@
 use crate::{
+    brief,
     cache::UsageCache,
     ledger::UsageLedger,
     protocol::{
-        RefreshResponse, Source, TodayModelRow, TodayResponse, TodaySourceRow, View, ALL_TASKS,
+        BriefGenerateRequest, HourlyResponse, HourlyRow, RefreshResponse, Source, TodayModelRow,
+        TodayResponse, TodaySourceRow, View, ALL_TASKS,
     },
     sources,
 };
@@ -88,25 +90,9 @@ impl SourceProvider for LocalSourceProvider {
         let source = self.source;
         let ledger_path = self.ledger_path.clone();
         Box::pin(async move {
-            if uses_direct_period_rows(source, view) {
-                return tokio::task::spawn_blocking(move || {
-                    sources::load_source_view(&source.to_string(), &view.to_string(), refresh)
-                        .map_err(|err| err.to_string())
-                })
-                .await
-                .map_err(|err| err.to_string())?;
-            }
-
             tokio::task::spawn_blocking(move || {
                 let ledger = open_usage_ledger(ledger_path)?;
-                let _ = refresh;
-                if let Err(err) = ingest_source_into_ledger(&ledger, source) {
-                    warn!(
-                        source = %source,
-                        error = %err,
-                        "ledger ingest failed; serving persisted rows"
-                    );
-                }
+                maybe_ingest_source_into_ledger(&ledger, source, refresh)?;
                 ledger.load_view(source, view)
             })
             .await
@@ -119,24 +105,9 @@ impl SourceProvider for LocalSourceProvider {
         let ledger_path = self.ledger_path.clone();
         let date = date.to_owned();
         Box::pin(async move {
-            if source == Source::Codex {
-                return tokio::task::spawn_blocking(move || {
-                    sources::codex::load_daily_for_date(&date, refresh)
-                })
-                .await
-                .map_err(|err| err.to_string())?;
-            }
-
             let rows = tokio::task::spawn_blocking(move || {
                 let ledger = open_usage_ledger(ledger_path)?;
-                let _ = refresh;
-                if let Err(err) = ingest_source_into_ledger(&ledger, source) {
-                    warn!(
-                        source = %source,
-                        error = %err,
-                        "ledger ingest failed; serving persisted rows"
-                    );
-                }
+                maybe_ingest_source_into_ledger(&ledger, source, refresh)?;
                 Ok::<Vec<Value>, String>(
                     ledger
                         .load_view(source, View::Daily)?
@@ -154,10 +125,6 @@ impl SourceProvider for LocalSourceProvider {
     }
 }
 
-fn uses_direct_period_rows(source: Source, view: View) -> bool {
-    source == Source::Codex && matches!(view, View::Daily | View::Monthly)
-}
-
 fn open_usage_ledger(path: Option<PathBuf>) -> Result<UsageLedger, String> {
     match path {
         Some(path) => UsageLedger::new(path),
@@ -165,19 +132,66 @@ fn open_usage_ledger(path: Option<PathBuf>) -> Result<UsageLedger, String> {
     }
 }
 
+fn maybe_ingest_source_into_ledger(
+    ledger: &UsageLedger,
+    source: Source,
+    refresh: bool,
+) -> Result<(), String> {
+    let has_rows = ledger.has_source_rows(source).unwrap_or(false);
+    if !refresh && has_rows {
+        return Ok(());
+    }
+
+    if let Err(err) = ingest_source_into_ledger(ledger, source) {
+        if has_rows {
+            warn!(
+                source = %source,
+                error = %err,
+                "ledger ingest failed; serving persisted rows"
+            );
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn ingest_source_into_ledger(ledger: &UsageLedger, source: Source) -> Result<(), String> {
     let source_name = source.to_string();
+    // Watermark the scan by its START: files written during the scan have
+    // mtimes after the watermark and are re-read next time (upserts are
+    // idempotent, so overlap is safe).
+    let scan_started_at_ms = now_epoch_millis();
+    let watermark_ms = ledger.ingest_watermark(source).unwrap_or(None);
+
     let sessions =
-        sources::load_source_view(&source_name, "sessions", true).map_err(|err| err.to_string())?;
+        sources::load_source_view_since(&source_name, "sessions", true, watermark_ms)
+            .map_err(|err| err.to_string())?;
     ledger.ingest_live_sessions(source, &sessions)?;
 
-    if source == Source::Claude {
-        let blocks = sources::load_source_view(&source_name, "blocks", true)
+    if source == Source::Claude || source == Source::Codex {
+        let blocks = sources::load_source_view_since(&source_name, "blocks", true, watermark_ms)
             .map_err(|err| err.to_string())?;
         ledger.ingest_live_blocks(source, &blocks)?;
     }
 
+    // Message-level rows power hourly aggregation; sources without them emit
+    // an empty view and keep session-level hourly attribution.
+    let messages =
+        sources::load_source_view_since(&source_name, "messages", true, watermark_ms)
+            .map_err(|err| err.to_string())?;
+    ledger.ingest_live_messages(source, &messages)?;
+
+    ledger.record_ingest_watermark(source, scan_started_at_ms)?;
     Ok(())
+}
+
+fn now_epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 #[derive(Clone)]
@@ -234,15 +248,17 @@ impl AppState {
         self.today_cache.lock().await.clear();
 
         if visible {
-            self.cache.begin_warm(ALL_TASKS.len()).await;
+            self.cache.begin_warm(Source::ALL.len()).await;
         }
 
+        // Fill missing warm keys without force-reingesting every source/view.
+        // Explicit per-request `refresh=true` still forces a fresh ingest.
         self.refresh_tasks_concurrently(
             ALL_TASKS
                 .into_iter()
                 .map(|task| (task.key, task.source, task.view))
                 .collect(),
-            true,
+            false,
             visible,
             visible,
         )
@@ -375,8 +391,10 @@ impl AppState {
 
         let mut refreshed_dates = BTreeSet::new();
         let mut updates = Vec::new();
+        let mut ingest = true;
         for date in dates {
-            match provider.load_today_daily(&date, true).await {
+            // Ingest at most once for the range; later dates read ledger/cache.
+            match provider.load_today_daily(&date, ingest).await {
                 Ok(mut rows) => {
                     refreshed_dates.insert(date);
                     updates.append(&mut rows);
@@ -386,6 +404,7 @@ impl AppState {
                     return true;
                 }
             }
+            ingest = false;
         }
 
         if !refreshed_dates.is_empty() {
@@ -422,7 +441,7 @@ impl AppState {
             return;
         }
 
-        self.refresh_task(key, source, view, count_progress, update_current)
+        self.refresh_task(key, source, view, force, count_progress, update_current)
             .await;
     }
 
@@ -436,6 +455,7 @@ impl AppState {
         key: &'static str,
         source: Source,
         view: View,
+        force: bool,
         count_progress: bool,
         update_current: bool,
     ) {
@@ -454,7 +474,7 @@ impl AppState {
             .cloned()
             .unwrap_or_else(|| Arc::new(EmptyProvider) as Arc<dyn SourceProvider>);
 
-        match provider.load(view, true).await {
+        match provider.load(view, force).await {
             Ok(data) => {
                 info!(key, entries = data.len(), "loaded usage view");
                 self.cache.store_success(key, data).await;
@@ -543,6 +563,11 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/refresh", get(refresh_handler))
         .route("/api/today", get(today_handler))
+        .route("/api/hourly", get(hourly_handler))
+        .route(
+            "/api/today/brief",
+            get(today_brief_get_handler).post(today_brief_post_handler),
+        )
         .route("/api/{source}/{view}", get(source_view_handler))
         .layer(CompressionLayer::new())
         .with_state(state)
@@ -591,7 +616,9 @@ async fn shutdown_signal() {
 }
 
 async fn health_handler(State(state): State<AppState>) -> Json<crate::protocol::HealthResponse> {
-    Json(state.cache.health(ALL_TASKS.len()).await)
+    // Startup only warms daily views; keep expected aligned so clients don't
+    // trigger a full ALL_TASKS force warm when daily cache is already hot.
+    Json(state.cache.health(Source::ALL.len()).await)
 }
 
 async fn refresh_handler(State(state): State<AppState>) -> Json<RefreshResponse> {
@@ -609,6 +636,64 @@ async fn today_handler(
 ) -> Json<TodayResponse> {
     let force = query.refresh.as_deref() == Some("true");
     Json(state.today_summary(force).await)
+}
+
+#[derive(Debug, Deserialize)]
+struct HourlyQuery {
+    date: Option<String>,
+    refresh: Option<String>,
+}
+
+async fn hourly_handler(
+    State(state): State<AppState>,
+    Query(query): Query<HourlyQuery>,
+) -> Json<HourlyResponse> {
+    let force = query.refresh.as_deref() == Some("true");
+    let date = query
+        .date
+        .filter(|date| !date.is_empty())
+        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    Json(state.hourly_usage(&date, force).await)
+}
+
+async fn today_brief_get_handler() -> Response {
+    match tokio::task::spawn_blocking(brief::load_today_brief).await {
+        Ok(Ok(Some(brief))) => (StatusCode::OK, Json(brief)).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "missing",
+                "date": brief::local_today(),
+            })),
+        )
+            .into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn today_brief_post_handler(Json(request): Json<BriefGenerateRequest>) -> Response {
+    match tokio::task::spawn_blocking(move || brief::generate_today_brief(request)).await {
+        Ok(Ok(brief)) => (StatusCode::OK, Json(brief)).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -694,6 +779,7 @@ fn today_task_key(source: Source) -> Option<&'static str> {
         Source::Cherry => Some("cherry:today"),
         Source::ClaudeScience => Some("claude-science:today"),
         Source::Zcode => Some("zcode:today"),
+        Source::Kimi => Some("kimi:today"),
     }
 }
 
@@ -893,6 +979,49 @@ impl AppState {
             model_count: all_models.len(),
             source_rows,
             model_rows,
+        }
+    }
+
+    /// Hourly breakdown for a single day across all sources. Reads the ledger
+    /// directly (no warm cache); `force` re-ingests source files first, mirroring
+    /// the today summary's refresh semantics.
+    pub async fn hourly_usage(&self, date: &str, force: bool) -> HourlyResponse {
+        let mut handles = Vec::new();
+        for source in Source::ALL {
+            let date = date.to_owned();
+            handles.push(tokio::spawn(async move {
+                let rows = tokio::task::spawn_blocking(move || {
+                    let ledger = open_usage_ledger(None)?;
+                    maybe_ingest_source_into_ledger(&ledger, source, force)?;
+                    ledger.load_hourly(source, &date)
+                })
+                .await
+                .map_err(|err| err.to_string())??;
+                Ok::<Vec<Value>, String>(rows)
+            }));
+        }
+
+        let mut hours = Vec::new();
+        for handle in handles {
+            let Ok(Ok(rows)) = handle.await else {
+                continue;
+            };
+            for row in rows {
+                match serde_json::from_value::<HourlyRow>(row) {
+                    Ok(hourly_row) => hours.push(hourly_row),
+                    Err(err) => warn!(error = %err, "skipping malformed hourly row"),
+                }
+            }
+        }
+        hours.sort_by(|left, right| {
+            left.hour
+                .cmp(&right.hour)
+                .then_with(|| left.source.cmp(&right.source))
+        });
+
+        HourlyResponse {
+            date: date.to_owned(),
+            hours,
         }
     }
 }
@@ -1334,7 +1463,7 @@ mod tests {
 
         assert_eq!(value["status"], "ok");
         assert_eq!(value["cached"], json!(0));
-        assert_eq!(value["expected"], json!(ALL_TASKS.len()));
+        assert_eq!(value["expected"], json!(Source::ALL.len()));
         assert!(value["keys"].as_array().unwrap().is_empty());
         assert!(value["errors"].as_object().unwrap().is_empty());
         assert_eq!(value["warm"]["warming"], json!(false));
@@ -1801,8 +1930,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_codex_daily_bypasses_session_ledger_rollup() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    async fn local_codex_daily_uses_ledger_for_historical_persistence() {
+        let _server_guard = ENV_LOCK.lock().unwrap();
+        let _codex_guard = crate::sources::codex::tests::ENV_LOCK.lock().unwrap();
         let codex_home = temp_codex_home();
         let sessions_dir = codex_home.join("sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
@@ -1856,28 +1986,91 @@ mod tests {
 
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         let previous_codex_homes = std::env::var_os("TOKEN_USAGE_CODEX_HOMES");
+        let previous_ledger_path = std::env::var_os("TOKEN_USAGE_LEDGER_PATH");
+        let ledger_path = temp_ledger_path();
         std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("TOKEN_USAGE_LEDGER_PATH", &ledger_path);
         std::env::remove_var("TOKEN_USAGE_CODEX_HOMES");
 
         let provider = LocalSourceProvider {
             source: Source::Codex,
-            ledger_path: Some(temp_ledger_path()),
+            ledger_path: Some(ledger_path.clone()),
         };
         let daily = provider.load(View::Daily, true).await.unwrap();
-        let second_day = provider.load_today_daily("2026-06-02", true).await.unwrap();
 
-        restore_env("CODEX_HOME", previous_codex_home);
-        restore_env("TOKEN_USAGE_CODEX_HOMES", previous_codex_homes);
-        let _ = fs::remove_dir_all(&codex_home);
-
-        assert_eq!(daily.len(), 2);
+        // Codex daily now goes through the ledger with block-level dates.
+        // Each token_count event becomes a block with its own event date,
+        // so a cross-day session produces one daily row per day.
+        assert_eq!(daily.len(), 2, "should have one row per day");
         assert_eq!(daily[0]["date"], "2026-06-01");
         assert_eq!(daily[0]["totalTokens"], 170);
         assert_eq!(daily[1]["date"], "2026-06-02");
         assert_eq!(daily[1]["totalTokens"], 110);
-        assert_eq!(second_day.len(), 1);
-        assert_eq!(second_day[0]["date"], "2026-06-02");
-        assert_eq!(second_day[0]["totalTokens"], 110);
+
+        // After removing the source file, the ledger still serves the
+        // previously ingested data -- this is the key fix for data loss.
+        let _ = fs::remove_file(sessions_dir.join("cross-day.jsonl"));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        let provider_after = LocalSourceProvider {
+            source: Source::Codex,
+            ledger_path: Some(ledger_path),
+        };
+        // refresh=false must serve ledger rows without requiring source files.
+        let daily_after = provider_after.load(View::Daily, false).await.unwrap();
+
+        assert_eq!(daily_after.len(), 2, "ledger should persist after source removal");
+        assert_eq!(daily_after[0]["date"], "2026-06-01");
+        assert_eq!(daily_after[0]["totalTokens"], 170);
+        assert_eq!(daily_after[1]["date"], "2026-06-02");
+        assert_eq!(daily_after[1]["totalTokens"], 110);
+
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("TOKEN_USAGE_CODEX_HOMES", previous_codex_homes);
+        restore_env("TOKEN_USAGE_LEDGER_PATH", previous_ledger_path);
+    }
+
+    #[tokio::test]
+    async fn local_provider_skips_ingest_when_ledger_has_rows_and_not_refreshing() {
+        let ledger_path = temp_ledger_path();
+        let ledger = UsageLedger::new(ledger_path.clone()).unwrap();
+        let source = Source::Grok;
+
+        ledger
+            .upsert_view_rows(
+                source,
+                View::Sessions,
+                &[json!({
+                    "sessionId": "grok-1",
+                    "date": "2026-07-01",
+                    "time": "10:00",
+                    "inputTokens": 10,
+                    "outputTokens": 5,
+                    "cacheCreationTokens": 0,
+                    "cacheReadTokens": 0,
+                    "totalTokens": 15,
+                    "totalCost": 0.01,
+                    "modelsUsed": ["grok"],
+                    "modelBreakdowns": [{
+                        "modelName": "grok",
+                        "inputTokens": 10,
+                        "outputTokens": 5,
+                        "cacheCreationTokens": 0,
+                        "cacheReadTokens": 0,
+                        "cost": 0.01
+                    }]
+                })],
+            )
+            .unwrap();
+
+        let provider = LocalSourceProvider {
+            source,
+            ledger_path: Some(ledger_path),
+        };
+        let daily = provider.load(View::Daily, false).await.unwrap();
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0]["date"], "2026-07-01");
+        assert_eq!(daily[0]["totalTokens"], 15);
     }
 
     #[test]

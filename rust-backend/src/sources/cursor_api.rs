@@ -26,8 +26,9 @@ pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
         .build()
         .map_err(|err| SourceError::Source(err.to_string()))?;
 
-    let mut sessions = Vec::new();
-
+    // Prefer fine-grained usage events. Buckets and invoices describe the same
+    // billing cycle at coarser grain (and invoice rows misuse request counts as
+    // tokens), so stacking them on top of events double/triple-counts.
     if let Ok(summary) = fetch_usage_summary(&client, &session_token) {
         if let Ok(events) = fetch_filtered_usage_events(
             &client,
@@ -35,21 +36,15 @@ pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
             summary.billing_cycle_start_ms,
             summary.billing_cycle_end_ms,
         ) {
-            sessions.extend(usage_events_to_sessions(&events));
+            let event_sessions = usage_events_to_sessions(&events);
+            if !event_sessions.is_empty() {
+                return Ok(event_sessions);
+            }
         }
     }
 
     let usage = fetch_usage(&client, &user_id, &session_token)?;
-    sessions.extend(usage_to_sessions(&usage));
-
-    let periods = invoice_periods(&usage.start_of_month);
-    for (year, month) in periods {
-        if let Ok(invoice) = fetch_monthly_invoice(&client, &session_token, year, month) {
-            sessions.extend(invoice_to_sessions(year, month, &invoice));
-        }
-    }
-
-    Ok(sessions)
+    Ok(usage_to_sessions(&usage))
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +61,7 @@ struct UsageBucket {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct InvoiceItem {
     description: String,
     cents: f64,
@@ -431,6 +427,7 @@ fn epoch_millis_to_date_time(milliseconds: i64) -> (String, String) {
     })
 }
 
+#[allow(dead_code)] // retained for tests and as fallback documentation of the invoice shape
 fn fetch_monthly_invoice(
     client: &Client,
     session_token: &str,
@@ -630,6 +627,7 @@ fn regex_model_name(description: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn invoice_periods(start_of_month: &str) -> Vec<(i32, u32)> {
     let current = iso_to_naive_date(start_of_month).unwrap_or_else(|| Utc::now().date_naive());
     let previous = previous_month(current);
@@ -639,6 +637,7 @@ fn invoice_periods(start_of_month: &str) -> Vec<(i32, u32)> {
     ]
 }
 
+#[allow(dead_code)]
 fn previous_month(date: NaiveDate) -> NaiveDate {
     if date.month() == 1 {
         NaiveDate::from_ymd_opt(date.year() - 1, 12, 1).unwrap_or(date)
@@ -677,6 +676,7 @@ fn iso_to_naive_date(raw: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()
 }
 
+#[allow(dead_code)]
 fn value_to_f64(value: &Value) -> Option<f64> {
     value
         .as_f64()

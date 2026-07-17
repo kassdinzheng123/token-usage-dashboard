@@ -37,6 +37,51 @@ actor TokenUsageAPIClient {
         try await fetch("today", queryItems: refreshQueryItems(refresh: refresh))
     }
 
+    func fetchHourly(date: String? = nil, refresh: Bool = false) async throws -> HourlyUsageResponse {
+        var queryItems = refreshQueryItems(refresh: refresh)
+        if let date {
+            queryItems.append(URLQueryItem(name: "date", value: date))
+        }
+        return try await fetch("hourly", queryItems: queryItems)
+    }
+
+    func fetchTodayBrief() async throws -> TodayBriefResponse? {
+        let url = try makeURL(path: "today/brief", queryItems: [])
+        let (data, response) = try await session.data(from: url)
+        if let httpResponse = response as? HTTPURLResponse {
+            if httpResponse.statusCode == 404 {
+                return nil
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                throw ClientError.unexpectedStatus(httpResponse.statusCode)
+            }
+        }
+        return try decoder.decode(TodayBriefResponse.self, from: data)
+    }
+
+    func generateTodayBrief(
+        force: Bool,
+        trigger: String,
+        sources: [String],
+        model: BriefModelConfig
+    ) async throws -> TodayBriefResponse {
+        let requestBody = BriefGenerateRequest(
+            force: force,
+            trigger: trigger,
+            sources: sources,
+            model: model
+        )
+        let url = try makeURL(path: "today/brief", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(requestBody)
+
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response)
+        return try decoder.decode(TodayBriefResponse.self, from: data)
+    }
+
     func warmDashboardCache() async throws {
         try await fetchIgnoringBody("refresh")
     }

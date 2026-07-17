@@ -59,7 +59,7 @@ public final class TokenUsageBillingCurrencyController: ObservableObject {
     public func string(fromUSD amount: Decimal) -> String {
         let displayAmount = amountInSelectedCurrency(fromUSD: amount)
         let value = NSDecimalNumber(decimal: displayAmount)
-        return formatter(for: selectedCurrency).string(from: value) ?? fallbackText
+        return formatterForSelectedCurrency().string(from: value) ?? fallbackText
     }
 
     public func refreshExchangeRateIfNeeded(force: Bool = false) async {
@@ -110,7 +110,20 @@ public final class TokenUsageBillingCurrencyController: ObservableObject {
         }
     }
 
-    private func formatter(for currency: TokenUsageBillingCurrency) -> NumberFormatter {
+    /// NumberFormatters are expensive to create; cache one per currency since
+    /// `string(fromUSD:)` is called for every row, legend entry, and tooltip.
+    private var cachedFormatters: [TokenUsageBillingCurrency: NumberFormatter] = [:]
+
+    private func formatterForSelectedCurrency() -> NumberFormatter {
+        if let cached = cachedFormatters[selectedCurrency] {
+            return cached
+        }
+        let formatter = makeFormatter(for: selectedCurrency)
+        cachedFormatters[selectedCurrency] = formatter
+        return formatter
+    }
+
+    private func makeFormatter(for currency: TokenUsageBillingCurrency) -> NumberFormatter {
         let formatter = NumberFormatter()
         formatter.numberStyle = .currency
         formatter.currencyCode = currency.currencyCode

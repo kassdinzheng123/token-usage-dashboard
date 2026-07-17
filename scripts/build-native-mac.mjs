@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const nativeRoot = join(repoRoot, 'macos', 'TokenUsageNative');
-const productName = 'Token Usage Dashboard';
+const productName = 'Token Usage';
 const version = '1.0.1';
 const appId = 'com.tokenusage.dashboard.native';
 const minimumMacOSVersion = '14.0';
@@ -102,7 +102,7 @@ async function writeInfoPlist() {
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Token Usage Dashboard starts a local server on 127.0.0.1 to read usage records.</string>
+  <string>Token Usage starts a local server on 127.0.0.1 to read usage records.</string>
 </dict>
 </plist>
 `;

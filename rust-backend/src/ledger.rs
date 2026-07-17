@@ -70,6 +70,41 @@ impl UsageLedger {
         })
     }
 
+    /// Watermark (epoch millis) of the scan START of the last successful
+    /// ingest for `source`. `None` when the source was never ingested.
+    pub fn ingest_watermark(&self, source: Source) -> Result<Option<i64>, String> {
+        self.with_connection(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT last_ingest_at FROM ingest_state WHERE source = ?1",
+                    params![source.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?)
+        })
+    }
+
+    /// Records the scan START of a successful ingest. Monotonic: a slower
+    /// concurrent ingest that started earlier must not regress the watermark.
+    pub fn record_ingest_watermark(
+        &self,
+        source: Source,
+        scan_started_at_ms: i64,
+    ) -> Result<(), String> {
+        self.with_connection(|connection| {
+            connection.execute(
+                r#"
+                INSERT INTO ingest_state (source, last_ingest_at)
+                VALUES (?1, ?2)
+                ON CONFLICT(source) DO UPDATE SET
+                    last_ingest_at = MAX(last_ingest_at, excluded.last_ingest_at)
+                "#,
+                params![source.to_string(), scan_started_at_ms],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn ingest_live_sessions(&self, source: Source, rows: &[Value]) -> Result<(), String> {
         let source_name = source.to_string();
         let lock = ingest_lock(&source_name);
@@ -86,6 +121,15 @@ impl UsageLedger {
             .lock()
             .map_err(|err| format!("ledger ingest lock poisoned: {err}"))?;
         self.upsert_view_rows(source, View::Blocks, rows)
+    }
+
+    pub fn ingest_live_messages(&self, source: Source, rows: &[Value]) -> Result<(), String> {
+        let source_name = source.to_string();
+        let lock = ingest_lock(&source_name);
+        let _guard = lock
+            .lock()
+            .map_err(|err| format!("ledger ingest lock poisoned: {err}"))?;
+        self.upsert_message_rows(source, rows)
     }
 
     pub fn upsert_view_rows(
@@ -108,6 +152,65 @@ impl UsageLedger {
             View::Sessions => self.load_sessions(source),
             View::Blocks => self.load_blocks(source),
         }
+    }
+
+    /// Hourly usage for a single day, grouped by the local hour of each row's
+    /// `time` ("HH:MM"). Prefers message-level rows (`usage_messages`) so a
+    /// session's tokens are spread across the hours its messages actually
+    /// happened; sources without message rows fall back to session-level
+    /// attribution (whole session lands in the bucket of its recorded time).
+    pub fn load_hourly(&self, source: Source, date: &str) -> Result<Vec<Value>, String> {
+        self.with_connection(|connection| {
+            let source_name = source.to_string();
+            let has_messages: bool = connection
+                .query_row(
+                    "SELECT 1 FROM usage_messages WHERE source = ?1 LIMIT 1",
+                    params![&source_name],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+
+            let (table, cost_column) = if has_messages {
+                ("usage_messages", "cost")
+            } else {
+                ("usage_sessions", "total_cost")
+            };
+            let sql = format!(
+                r#"
+                SELECT CAST(substr(time, 1, 2) AS INTEGER) AS hour,
+                       SUM(input_tokens),
+                       SUM(output_tokens),
+                       SUM(cache_creation_tokens),
+                       SUM(cache_read_tokens),
+                       SUM(total_tokens),
+                       SUM({cost_column})
+                FROM {table}
+                WHERE source = ?1 AND date = ?2 AND length(time) >= 2
+                GROUP BY hour
+                ORDER BY hour
+                "#
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params![&source_name, date], |row| {
+                Ok(json!({
+                    "hour": row.get::<_, i64>(0)?,
+                    "source": source_name.as_str(),
+                    "inputTokens": row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                    "outputTokens": row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
+                    "cacheCreationTokens": row.get::<_, Option<i64>>(3)?.unwrap_or_default(),
+                    "cacheReadTokens": row.get::<_, Option<i64>>(4)?.unwrap_or_default(),
+                    "totalTokens": row.get::<_, Option<i64>>(5)?.unwrap_or_default(),
+                    "totalCost": row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
+                }))
+            })?;
+
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row?);
+            }
+            Ok(result)
+        })
     }
 
     fn upsert_session_rows(&self, source: Source, rows: &[Value]) -> Result<(), String> {
@@ -244,6 +347,65 @@ impl UsageLedger {
         })
     }
 
+    fn upsert_message_rows(&self, source: Source, rows: &[Value]) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.with_connection(|connection| {
+            let tx = connection.transaction()?;
+            let now = now_iso();
+            for row in rows {
+                let Some(message_id) = row.get("messageId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let date = row.get("date").and_then(Value::as_str).unwrap_or_default();
+                if date.is_empty() {
+                    continue;
+                }
+                tx.execute(
+                    r#"
+                    INSERT INTO usage_messages (
+                        source, message_id, session_id, date, time,
+                        input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+                        total_tokens, cost, first_seen_at, last_seen_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                    ON CONFLICT(source, message_id) DO UPDATE SET
+                        session_id = excluded.session_id,
+                        date = excluded.date,
+                        time = excluded.time,
+                        input_tokens = excluded.input_tokens,
+                        output_tokens = excluded.output_tokens,
+                        cache_creation_tokens = excluded.cache_creation_tokens,
+                        cache_read_tokens = excluded.cache_read_tokens,
+                        total_tokens = excluded.total_tokens,
+                        cost = excluded.cost,
+                        last_seen_at = excluded.last_seen_at
+                    WHERE excluded.total_tokens >= usage_messages.total_tokens
+                    "#,
+                    params![
+                        source.to_string(),
+                        message_id,
+                        row.get("sessionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        date,
+                        row.get("time").and_then(Value::as_str).unwrap_or_default(),
+                        number_i64(row, "inputTokens"),
+                        number_i64(row, "outputTokens"),
+                        number_i64(row, "cacheCreationTokens"),
+                        number_i64(row, "cacheReadTokens"),
+                        number_i64(row, "totalTokens"),
+                        number_f64(row, "cost"),
+                        now,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     fn load_sessions(&self, source: Source) -> Result<Vec<Value>, String> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
@@ -278,10 +440,26 @@ impl UsageLedger {
     fn load_period(&self, source: Source, period: Period) -> Result<Vec<Value>, String> {
         self.with_connection(|connection| {
             let source_name = source.to_string();
+            let has_blocks: bool = connection
+                .query_row(
+                    "SELECT 1 FROM usage_blocks WHERE source = ?1 LIMIT 1",
+                    params![&source_name],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+
             let select_key = match period {
                 Period::Daily => "date",
                 Period::Monthly => "substr(date, 1, 7)",
             };
+
+            let (table, cost_column, model_source) = if has_blocks {
+                ("usage_blocks", "cost", ModelBreakdownSource::Blocks)
+            } else {
+                ("usage_sessions", "total_cost", ModelBreakdownSource::Sessions)
+            };
+
             let sql = format!(
                 r#"
                 SELECT {select_key} AS period_key,
@@ -290,8 +468,8 @@ impl UsageLedger {
                        SUM(cache_creation_tokens),
                        SUM(cache_read_tokens),
                        SUM(total_tokens),
-                       SUM(total_cost)
-                FROM usage_sessions
+                       SUM({cost_column})
+                FROM {table}
                 WHERE source = ?1
                 GROUP BY period_key
                 ORDER BY period_key
@@ -313,8 +491,13 @@ impl UsageLedger {
             let mut rows = Vec::new();
             for group in groups {
                 let group = group?;
-                let model_breakdowns =
-                    self.period_model_breakdowns(connection, source, period, &group.key)?;
+                let model_breakdowns = self.period_model_breakdowns(
+                    connection,
+                    source,
+                    period,
+                    &group.key,
+                    model_source,
+                )?;
                 let models_used = models_used(&model_breakdowns);
                 rows.push(match period {
                     Period::Daily => json!({
@@ -351,37 +534,74 @@ impl UsageLedger {
         source: Source,
         period: Period,
         key: &str,
+        model_source: ModelBreakdownSource,
     ) -> Result<Vec<Value>, rusqlite::Error> {
         let source_name = source.to_string();
         let (predicate, key_param) = match period {
             Period::Daily => ("date = ?2", key.to_owned()),
             Period::Monthly => ("substr(date, 1, 7) = ?2", key.to_owned()),
         };
-        let sql = format!(
-            "SELECT model_breakdowns_json FROM usage_sessions WHERE source = ?1 AND {predicate}"
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(params![source_name, key_param], |row| {
-            row.get::<_, String>(0)
-        })?;
 
         let mut models = BTreeMap::<String, ModelTotals>::new();
-        for row in rows {
-            let raw = row?;
-            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-                continue;
-            };
-            let Some(items) = value.as_array() else {
-                continue;
-            };
-            for item in items {
-                let model_name = item
-                    .get("modelName")
-                    .and_then(Value::as_str)
-                    .filter(|model| !model.is_empty())
-                    .unwrap_or("unknown");
-                let clustered = sources::cluster_model_name(model_name);
-                models.entry(clustered).or_default().add_breakdown(item);
+
+        match model_source {
+            ModelBreakdownSource::Blocks => {
+                let sql = format!(
+                    r#"
+                    SELECT model_name, input_tokens, output_tokens,
+                           cache_creation_tokens, cache_read_tokens, cost
+                    FROM usage_blocks
+                    WHERE source = ?1 AND {predicate}
+                    "#,
+                );
+                let mut statement = connection.prepare(&sql)?;
+                let rows = statement.query_map(params![source_name, key_param], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, f64>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (raw_model, input, output, cache_creation, cache_read, cost) = row?;
+                    let clustered = sources::cluster_model_name(&raw_model);
+                    let entry = models.entry(clustered).or_default();
+                    entry.input_tokens += input;
+                    entry.output_tokens += output;
+                    entry.cache_creation_tokens += cache_creation;
+                    entry.cache_read_tokens += cache_read;
+                    entry.cost += cost;
+                }
+            }
+            ModelBreakdownSource::Sessions => {
+                let sql = format!(
+                    "SELECT model_breakdowns_json FROM usage_sessions WHERE source = ?1 AND {predicate}"
+                );
+                let mut statement = connection.prepare(&sql)?;
+                let rows = statement.query_map(params![source_name, key_param], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                for row in rows {
+                    let raw = row?;
+                    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                        continue;
+                    };
+                    let Some(items) = value.as_array() else {
+                        continue;
+                    };
+                    for item in items {
+                        let model_name = item
+                            .get("modelName")
+                            .and_then(Value::as_str)
+                            .filter(|model| !model.is_empty())
+                            .unwrap_or("unknown");
+                        let clustered = sources::cluster_model_name(model_name);
+                        models.entry(clustered).or_default().add_breakdown(item);
+                    }
+                }
             }
         }
 
@@ -476,6 +696,7 @@ fn is_sqlite_transient_error(err: &rusqlite::Error) -> bool {
                 && message.as_deref().is_some_and(|text| {
                     text.contains("usage_sessions.source, usage_sessions.session_id")
                         || text.contains("usage_blocks.source, usage_blocks.block_id")
+                        || text.contains("usage_messages.source, usage_messages.message_id")
                 })
     )
 }
@@ -484,6 +705,12 @@ fn is_sqlite_transient_error(err: &rusqlite::Error) -> bool {
 enum Period {
     Daily,
     Monthly,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ModelBreakdownSource {
+    Sessions,
+    Blocks,
 }
 
 #[derive(Default)]
@@ -574,17 +801,72 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS idx_usage_blocks_source_date
             ON usage_blocks(source, date, time);
+
+        CREATE TABLE IF NOT EXISTS usage_messages (
+            source TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            date TEXT NOT NULL,
+            time TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            cost REAL NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (source, message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_messages_source_date
+            ON usage_messages(source, date, time);
+
+        CREATE TABLE IF NOT EXISTS ingest_state (
+            source TEXT PRIMARY KEY,
+            last_ingest_at INTEGER NOT NULL
+        );
         "#,
     )?;
     migrate_legacy_cursor_source(connection)?;
+    migrate_message_level_hourly(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '2')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '3')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Schema v3 added `usage_messages` for message-level hourly aggregation.
+/// Clear the ingest watermarks of the sources that emit message rows so the
+/// next ingest re-scans their (local, file-based) history once and backfills
+/// the table. Without this, incremental ingests would only cover changed
+/// files and hourly buckets would be silently partial.
+fn migrate_message_level_hourly(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 3 {
+        return Ok(());
+    }
+    connection.execute(
+        r#"
+        DELETE FROM ingest_state
+        WHERE source IN ('claude', 'codex', 'opencode', 'pi', 'openclaw', 'kimi')
+        "#,
         [],
     )?;
     Ok(())
 }
 
 fn migrate_legacy_cursor_source(connection: &Connection) -> Result<(), rusqlite::Error> {
+    // Historical: Cursor++ used source='cursorpp'. Fold into unified `cursor`.
     connection.execute(
         r#"
         DELETE FROM usage_sessions
@@ -639,6 +921,18 @@ fn migrate_legacy_cursor_source(connection: &Connection) -> Result<(), rusqlite:
     )?;
     connection.execute(
         "UPDATE usage_blocks SET source = 'cursor' WHERE source = 'cursorpp'",
+        [],
+    )?;
+    // Drop coarse Dashboard bucket/invoice rows that double-count with usage events.
+    connection.execute(
+        r#"
+        DELETE FROM usage_sessions
+        WHERE source = 'cursor'
+          AND (
+                session_id LIKE 'cursor:api:usage:%'
+             OR session_id LIKE 'cursor:api:invoice:%'
+          )
+        "#,
         [],
     )?;
     Ok(())
@@ -974,6 +1268,121 @@ mod tests {
         assert_eq!(sessions[0]["sessionId"], stable_session_id);
         assert_eq!(sessions[0]["inputTokens"], 28245);
         assert_eq!(sessions[0]["totalTokens"], 103895);
+    }
+
+    #[test]
+    fn ingest_watermark_round_trips_and_stays_monotonic() {
+        let ledger = test_ledger();
+        let source = Source::Codex;
+
+        assert_eq!(ledger.ingest_watermark(source).unwrap(), None);
+
+        ledger.record_ingest_watermark(source, 1_000).unwrap();
+        assert_eq!(ledger.ingest_watermark(source).unwrap(), Some(1_000));
+
+        // A slower concurrent ingest that started earlier must not regress it.
+        ledger.record_ingest_watermark(source, 500).unwrap();
+        assert_eq!(ledger.ingest_watermark(source).unwrap(), Some(1_000));
+
+        ledger.record_ingest_watermark(source, 2_000).unwrap();
+        assert_eq!(ledger.ingest_watermark(source).unwrap(), Some(2_000));
+    }
+
+    #[test]
+    fn hourly_falls_back_to_sessions_until_messages_arrive() {
+        let ledger = test_ledger();
+        let source = Source::Claude;
+        ledger
+            .upsert_view_rows(
+                source,
+                View::Sessions,
+                &[json!({
+                    "sessionId": "s1",
+                    "date": "2026-07-17",
+                    "time": "16:30",
+                    "inputTokens": 100,
+                    "outputTokens": 50,
+                    "cacheCreationTokens": 0,
+                    "cacheReadTokens": 0,
+                    "totalTokens": 150,
+                    "totalCost": 0.2,
+                })],
+            )
+            .unwrap();
+
+        // Session-level attribution: the whole session lands in hour 16.
+        let hourly = ledger.load_hourly(source, "2026-07-17").unwrap();
+        assert_eq!(hourly.len(), 1);
+        assert_eq!(hourly[0]["hour"], 16);
+        assert_eq!(hourly[0]["totalTokens"], 150);
+
+        // Message-level attribution splits the session across message hours.
+        ledger
+            .ingest_live_messages(
+                source,
+                &[
+                    json!({
+                        "messageId": "m1",
+                        "sessionId": "s1",
+                        "date": "2026-07-17",
+                        "time": "14:05",
+                        "inputTokens": 60,
+                        "outputTokens": 30,
+                        "cacheCreationTokens": 0,
+                        "cacheReadTokens": 0,
+                        "totalTokens": 90,
+                        "cost": 0.1,
+                    }),
+                    json!({
+                        "messageId": "m2",
+                        "sessionId": "s1",
+                        "date": "2026-07-17",
+                        "time": "16:20",
+                        "inputTokens": 40,
+                        "outputTokens": 20,
+                        "cacheCreationTokens": 0,
+                        "cacheReadTokens": 0,
+                        "totalTokens": 60,
+                        "cost": 0.1,
+                    }),
+                ],
+            )
+            .unwrap();
+
+        let hourly = ledger.load_hourly(source, "2026-07-17").unwrap();
+        assert_eq!(hourly.len(), 2);
+        assert_eq!(hourly[0]["hour"], 14);
+        assert_eq!(hourly[0]["totalTokens"], 90);
+        assert_eq!(hourly[0]["totalCost"], 0.1);
+        assert_eq!(hourly[1]["hour"], 16);
+        assert_eq!(hourly[1]["totalTokens"], 60);
+    }
+
+    #[test]
+    fn message_upsert_is_idempotent_across_rescans() {
+        let ledger = test_ledger();
+        let source = Source::Pi;
+        let row = json!({
+            "messageId": "pi:proj:s1:m1",
+            "sessionId": "s1",
+            "date": "2026-07-17",
+            "time": "09:15",
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "cacheCreationTokens": 1,
+            "cacheReadTokens": 2,
+            "totalTokens": 18,
+            "cost": 0.01,
+        });
+
+        ledger.ingest_live_messages(source, &[row.clone()]).unwrap();
+        ledger.ingest_live_messages(source, &[row]).unwrap();
+
+        let hourly = ledger.load_hourly(source, "2026-07-17").unwrap();
+        assert_eq!(hourly.len(), 1);
+        assert_eq!(hourly[0]["hour"], 9);
+        assert_eq!(hourly[0]["totalTokens"], 18);
+        assert_eq!(hourly[0]["cacheReadTokens"], 2);
     }
 
     fn test_ledger() -> UsageLedger {

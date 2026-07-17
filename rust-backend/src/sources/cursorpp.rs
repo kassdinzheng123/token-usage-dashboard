@@ -42,7 +42,7 @@ impl UsageTotals {
     }
 }
 
-pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
+pub fn load_sessions(watermark_ms: Option<i64>) -> Result<Vec<LocalSession>, SourceError> {
     let Some(root) = discover_log_root() else {
         return Ok(Vec::new());
     };
@@ -56,6 +56,11 @@ pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
 
     let mut sessions = Vec::new();
     for path in files {
+        if let Some(watermark) = watermark_ms {
+            if !super::file_modified_after(&path, watermark) {
+                continue;
+            }
+        }
         sessions.extend(read_log_file(&path)?);
     }
     let mut sessions = dedupe_sessions(sessions);

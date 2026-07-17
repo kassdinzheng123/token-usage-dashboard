@@ -7,6 +7,7 @@ pub mod cursor_api;
 pub mod cursorpp;
 pub mod grok;
 pub mod hermes;
+pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
@@ -31,6 +32,7 @@ pub enum LocalSource {
     Cherry,
     ClaudeScience,
     Zcode,
+    Kimi,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -49,6 +51,7 @@ impl TryFrom<&str> for LocalSource {
             "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
             "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
             "zcode" | "z-code" | "z_code" => Ok(Self::Zcode),
+            "kimi" | "kimi-code" | "kimi-work" | "kimicode" | "kimiwork" => Ok(Self::Kimi),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -60,6 +63,7 @@ pub enum SourceView {
     Monthly,
     Sessions,
     Blocks,
+    Messages,
 }
 
 impl TryFrom<&str> for SourceView {
@@ -71,6 +75,7 @@ impl TryFrom<&str> for SourceView {
             "monthly" => Ok(Self::Monthly),
             "sessions" => Ok(Self::Sessions),
             "blocks" => Ok(Self::Blocks),
+            "messages" => Ok(Self::Messages),
             other => Err(SourceError::UnsupportedView(other.to_string())),
         }
     }
@@ -162,48 +167,91 @@ pub fn load_source_view(
     view: &str,
     refresh: bool,
 ) -> Result<Vec<Value>, SourceError> {
+    load_source_view_since(source, view, refresh, None)
+}
+
+/// Incremental variant of [`load_source_view`]: file-walking adapters skip
+/// files whose mtime is at or before `watermark_ms` (epoch millis of the
+/// previous successful scan's start). Rows from skipped files stay in the
+/// ledger from earlier ingests. `TOKEN_USAGE_FULL_RESCAN=1` forces a full
+/// scan regardless of the watermark.
+pub fn load_source_view_since(
+    source: &str,
+    view: &str,
+    refresh: bool,
+    watermark_ms: Option<i64>,
+) -> Result<Vec<Value>, SourceError> {
     let source = LocalSource::try_from(source)?;
     let view = SourceView::try_from(view)?;
-    load_local_source(source, view, refresh)
+    load_local_source_since(source, view, refresh, watermark_ms)
 }
 
 pub fn load_local_source(
     source: LocalSource,
     view: SourceView,
-    _refresh: bool,
+    refresh: bool,
 ) -> Result<Vec<Value>, SourceError> {
+    load_local_source_since(source, view, refresh, None)
+}
+
+pub fn load_local_source_since(
+    source: LocalSource,
+    view: SourceView,
+    _refresh: bool,
+    watermark_ms: Option<i64>,
+) -> Result<Vec<Value>, SourceError> {
+    let watermark_ms = if full_rescan_requested() {
+        None
+    } else {
+        watermark_ms
+    };
+
     let view_name = match view {
         SourceView::Daily => "daily",
         SourceView::Monthly => "monthly",
         SourceView::Sessions => "sessions",
         SourceView::Blocks => "blocks",
+        SourceView::Messages => "messages",
     };
 
     match source {
         LocalSource::Claude => {
-            return claude::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+            return claude::load_source_view_since(view_name, _refresh, watermark_ms)
+                .map_err(SourceError::Source);
         }
         LocalSource::Codex => {
-            return codex::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+            return codex::load_source_view_since(view_name, _refresh, watermark_ms)
+                .map_err(SourceError::Source);
         }
         LocalSource::Opencode => {
-            return opencode::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+            return opencode::load_source_view_since(view_name, _refresh, watermark_ms)
+                .map_err(SourceError::Source);
         }
         LocalSource::Pi => {
-            return pi::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+            return pi::load_source_view_since(view_name, _refresh, watermark_ms)
+                .map_err(SourceError::Source);
         }
         LocalSource::OpenClaw => {
-            return openclaw::load_source_view(view_name, _refresh).map_err(SourceError::Source);
+            return openclaw::load_source_view_since(view_name, _refresh, watermark_ms)
+                .map_err(SourceError::Source);
+        }
+        LocalSource::Kimi if view == SourceView::Messages => {
+            return kimi::load_messages(watermark_ms);
         }
         LocalSource::Hermes
         | LocalSource::Grok
         | LocalSource::Cursor
         | LocalSource::Cherry
         | LocalSource::ClaudeScience
-        | LocalSource::Zcode => {}
+        | LocalSource::Zcode
+        | LocalSource::Kimi => {}
     }
 
-    if view == SourceView::Blocks {
+    // Message-level rows only exist for sources with per-message timestamps in
+    // their local logs. Grok/Cherry/ZCode/Claude Science/Cursor session rows
+    // are already event-level; Hermes has nothing finer than a session. All of
+    // them keep session-level hourly attribution via the ledger fallback.
+    if view == SourceView::Blocks || view == SourceView::Messages {
         return Ok(Vec::new());
     }
 
@@ -215,19 +263,43 @@ pub fn load_local_source(
         | LocalSource::Pi
         => unreachable!(),
         LocalSource::Hermes => hermes::load_sessions()?,
-        LocalSource::Grok => grok::load_sessions()?,
-        LocalSource::Cursor => cursor::load_sessions()?,
+        LocalSource::Grok => grok::load_sessions(watermark_ms)?,
+        LocalSource::Cursor => cursor::load_sessions(watermark_ms)?,
         LocalSource::Cherry => cherry::load_sessions()?,
         LocalSource::ClaudeScience => claude_science::load_sessions()?,
         LocalSource::Zcode => zcode::load_sessions()?,
+        LocalSource::Kimi => kimi::load_sessions(watermark_ms)?,
     };
 
     Ok(match view {
         SourceView::Daily => sessions_to_daily(&sessions),
         SourceView::Monthly => sessions_to_monthly(&sessions),
         SourceView::Sessions => sessions_to_sessions(&sessions),
-        SourceView::Blocks => Vec::new(),
+        SourceView::Blocks | SourceView::Messages => Vec::new(),
     })
+}
+
+/// `TOKEN_USAGE_FULL_RESCAN=1` (or true/yes/on) disables watermark filtering.
+pub(crate) fn full_rescan_requested() -> bool {
+    std::env::var("TOKEN_USAGE_FULL_RESCAN")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// True when `path`'s mtime is strictly newer than `watermark_ms` (epoch
+/// millis). Metadata failures fail open so the file is re-read.
+pub(crate) fn file_modified_after(path: &std::path::Path, watermark_ms: i64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .map_or(true, |modified_ms| modified_ms > watermark_ms)
 }
 
 fn sessions_to_daily(sessions: &[LocalSession]) -> Vec<Value> {
@@ -412,6 +484,8 @@ pub(crate) fn cluster_model_name(model_name: &str) -> String {
         "deepseek-v4-flash"
     } else if stripped.contains("kimi-k2.6") {
         "kimi-k2.6"
+    } else if stripped.starts_with("k3") || lowered.contains("kimi-code/") {
+        "kimi-k3"
     } else if stripped.contains("qwen3.6-plus") {
         "qwen3.6-plus"
     } else if stripped.contains("step-3.7-flash") {
@@ -469,6 +543,9 @@ mod tests {
         assert_eq!(cluster_model_name("Grok-Composer-2.5-Fast"), "composer-2.5-fast");
         assert_eq!(cluster_model_name("cursor-composer-2-5"), "composer-2.5");
         assert_eq!(cluster_model_name("composer-2.5"), "composer-2.5");
+        assert_eq!(cluster_model_name("k3"), "kimi-k3");
+        assert_eq!(cluster_model_name("kimi-code/k3"), "kimi-k3");
+        assert_eq!(cluster_model_name("k3-agent"), "kimi-k3");
     }
 
     #[test]
@@ -519,6 +596,27 @@ mod tests {
         assert_eq!(LocalSource::try_from("ohmypi").unwrap(), LocalSource::Pi);
         assert_eq!(LocalSource::try_from("omp").unwrap(), LocalSource::Pi);
     }
+
+    #[test]
+    fn full_rescan_env_flag_toggles_watermark_filtering() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("TOKEN_USAGE_FULL_RESCAN");
+
+        std::env::set_var("TOKEN_USAGE_FULL_RESCAN", "1");
+        assert!(super::full_rescan_requested());
+        std::env::set_var("TOKEN_USAGE_FULL_RESCAN", "yes");
+        assert!(super::full_rescan_requested());
+        std::env::set_var("TOKEN_USAGE_FULL_RESCAN", "0");
+        assert!(!super::full_rescan_requested());
+        std::env::remove_var("TOKEN_USAGE_FULL_RESCAN");
+        assert!(!super::full_rescan_requested());
+
+        match previous {
+            Some(value) => std::env::set_var("TOKEN_USAGE_FULL_RESCAN", value),
+            None => std::env::remove_var("TOKEN_USAGE_FULL_RESCAN"),
+        }
+    }
 }
 
 pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
@@ -546,6 +644,11 @@ pub(crate) fn unix_millis_to_utc_parts(milliseconds: i64) -> Option<(String, Str
         .timestamp_millis_opt(milliseconds)
         .single()
         .map(local_parts)
+}
+
+pub(crate) fn iso8601_to_local_parts(text: &str) -> Option<(String, String)> {
+    let parsed = DateTime::parse_from_rfc3339(text.trim()).ok()?;
+    Some(local_parts(parsed.with_timezone(&Local)))
 }
 
 pub(crate) fn to_i64(value: &Value) -> i64 {

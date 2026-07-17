@@ -135,6 +135,9 @@ fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
     if is_claude_fable_5 {
         return Some(claude_fable_5_cost_usd(usage));
     }
+    if let Some(cost) = gpt_5_6_cost_usd(&candidates, usage) {
+        return Some(cost);
+    }
     None
 }
 
@@ -190,6 +193,51 @@ fn claude_fable_5_cost_usd(usage: TokenUsage) -> f64 {
         + usage.output_tokens.max(0) as f64 * 50.0
         + usage.cache_creation_tokens.max(0) as f64 * 12.50
         + usage.cache_read_tokens.max(0) as f64 * 1.0)
+        / MILLION
+}
+
+fn gpt_5_6_cost_usd(candidates: &[String], usage: TokenUsage) -> Option<f64> {
+    let is_sol = candidates.iter().any(|candidate| {
+        candidate == "gpt-5.6-sol"
+            || candidate == "gpt-5-6-sol"
+            || candidate == "gpt-5.6"
+            || candidate == "gpt-5-6"
+            || candidate == "openai/gpt-5.6-sol"
+            || candidate == "openai/gpt-5.6"
+    });
+    if is_sol {
+        return Some(gpt_5_6_tier_cost_usd(usage, 5.0, 30.0, 6.25, 0.50));
+    }
+    let is_terra = candidates.iter().any(|candidate| {
+        candidate == "gpt-5.6-terra"
+            || candidate == "gpt-5-6-terra"
+            || candidate == "openai/gpt-5.6-terra"
+    });
+    if is_terra {
+        return Some(gpt_5_6_tier_cost_usd(usage, 2.5, 15.0, 3.125, 0.25));
+    }
+    let is_luna = candidates.iter().any(|candidate| {
+        candidate == "gpt-5.6-luna"
+            || candidate == "gpt-5-6-luna"
+            || candidate == "openai/gpt-5.6-luna"
+    });
+    if is_luna {
+        return Some(gpt_5_6_tier_cost_usd(usage, 1.0, 6.0, 1.25, 0.10));
+    }
+    None
+}
+
+fn gpt_5_6_tier_cost_usd(
+    usage: TokenUsage,
+    input_per_m: f64,
+    output_per_m: f64,
+    cache_write_per_m: f64,
+    cache_read_per_m: f64,
+) -> f64 {
+    (usage.input_tokens.max(0) as f64 * input_per_m
+        + usage.output_tokens.max(0) as f64 * output_per_m
+        + usage.cache_creation_tokens.max(0) as f64 * cache_write_per_m
+        + usage.cache_read_tokens.max(0) as f64 * cache_read_per_m)
         / MILLION
 }
 

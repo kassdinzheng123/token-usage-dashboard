@@ -15,10 +15,11 @@ pub enum Source {
     Cherry,
     ClaudeScience,
     Zcode,
+    Kimi,
 }
 
 impl Source {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
@@ -30,6 +31,7 @@ impl Source {
         Self::Cherry,
         Self::ClaudeScience,
         Self::Zcode,
+        Self::Kimi,
     ];
 
     pub fn label(self) -> &'static str {
@@ -45,6 +47,7 @@ impl Source {
             Self::Cherry => "Cherry Studio",
             Self::ClaudeScience => "Claude Science",
             Self::Zcode => "ZCode",
+            Self::Kimi => "Kimi",
         }
     }
 }
@@ -63,6 +66,7 @@ impl fmt::Display for Source {
             Self::Cherry => "cherry",
             Self::ClaudeScience => "claude-science",
             Self::Zcode => "zcode",
+            Self::Kimi => "kimi",
         })
     }
 }
@@ -83,6 +87,7 @@ impl FromStr for Source {
             "cherry" | "cherrystudio" | "cherry-studio" => Ok(Self::Cherry),
             "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
             "zcode" | "z-code" | "z_code" => Ok(Self::Zcode),
+            "kimi" | "kimi-code" | "kimi-work" | "kimicode" | "kimiwork" => Ok(Self::Kimi),
             _ => Err(ParseProtocolError::new("source", value)),
         }
     }
@@ -171,7 +176,7 @@ impl WarmTask {
     }
 }
 
-pub const ALL_TASKS: [WarmTask; 34] = [
+pub const ALL_TASKS: [WarmTask; 37] = [
     WarmTask {
         key: "claude:daily",
         source: Source::Claude,
@@ -342,6 +347,21 @@ pub const ALL_TASKS: [WarmTask; 34] = [
         source: Source::Zcode,
         view: View::Sessions,
     },
+    WarmTask {
+        key: "kimi:daily",
+        source: Source::Kimi,
+        view: View::Daily,
+    },
+    WarmTask {
+        key: "kimi:monthly",
+        source: Source::Kimi,
+        view: View::Monthly,
+    },
+    WarmTask {
+        key: "kimi:sessions",
+        source: Source::Kimi,
+        view: View::Sessions,
+    },
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +447,168 @@ pub struct TodayModelRow {
     pub total_cost: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourlyResponse {
+    pub date: String,
+    pub hours: Vec<HourlyRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourlyRow {
+    pub hour: i64,
+    pub source: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefModelInfo {
+    pub base_url: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefModelConfig {
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TodayBriefCard {
+    pub id: String,
+    pub source: String,
+    pub project: String,
+    pub headline: String,
+    pub bullets: Vec<String>,
+    pub session_count: usize,
+    pub coverage: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TodayBriefSection {
+    pub source: String,
+    pub headline: String,
+    pub bullets: Vec<String>,
+    pub session_count: usize,
+    pub coverage: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TodayBriefHour {
+    pub hour: i64,
+    pub headline: String,
+    pub session_count: usize,
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TodayBriefResponse {
+    pub date: String,
+    pub status: String,
+    pub generated_at: String,
+    pub trigger: String,
+    pub model: BriefModelInfo,
+    pub enabled_sources: Vec<String>,
+    pub content_fingerprint: String,
+    /// One-line collapsed summary for the board header.
+    #[serde(default)]
+    pub summary: String,
+    /// Project cards (CLI × project). Preferred over legacy `sections`.
+    #[serde(default)]
+    pub cards: Vec<TodayBriefCard>,
+    /// Legacy per-CLI sections; kept for older brief files.
+    #[serde(default)]
+    pub sections: Vec<TodayBriefSection>,
+    /// Per-hour timeline of today's activity. Absent in briefs saved before
+    /// this field existed; those regenerate once on the next request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hours: Option<Vec<TodayBriefHour>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl TodayBriefResponse {
+    pub fn normalized(mut self) -> Self {
+        if self.cards.is_empty() && !self.sections.is_empty() {
+            self.cards = self
+                .sections
+                .iter()
+                .map(|section| TodayBriefCard {
+                    id: format!("{}:{}", section.source, section.headline),
+                    source: section.source.clone(),
+                    project: section.source.clone(),
+                    headline: section.headline.clone(),
+                    bullets: section.bullets.clone(),
+                    session_count: section.session_count,
+                    coverage: section.coverage.clone(),
+                })
+                .collect();
+        }
+        if self.summary.trim().is_empty() && !self.cards.is_empty() {
+            self.summary = build_board_summary(&self.cards);
+        }
+        self
+    }
+}
+
+pub fn build_board_summary(cards: &[TodayBriefCard]) -> String {
+    if cards.is_empty() {
+        return "今日暂无项目摘要".to_string();
+    }
+    let previews: Vec<String> = cards
+        .iter()
+        .take(3)
+        .map(|card| format!("{}·{}", short_source(&card.source), card.project))
+        .collect();
+    if cards.len() <= 3 {
+        format!("{} 个项目：{}", cards.len(), previews.join("；"))
+    } else {
+        format!(
+            "{} 个项目：{} 等",
+            cards.len(),
+            previews.join("；")
+        )
+    }
+}
+
+fn short_source(source: &str) -> &str {
+    match source {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "zcode" => "ZCode",
+        "kimi" => "Kimi",
+        other => other,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefGenerateRequest {
+    #[serde(default)]
+    pub force: Option<bool>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+    #[serde(default)]
+    pub model: Option<BriefModelConfig>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::Source;
@@ -437,5 +619,14 @@ mod tests {
         assert_eq!(Source::from_str("oh-my-pi").unwrap(), Source::Pi);
         assert_eq!(Source::from_str("ohmypi").unwrap(), Source::Pi);
         assert_eq!(Source::from_str("omp").unwrap(), Source::Pi);
+    }
+
+    #[test]
+    fn kimi_aliases_parse_as_kimi() {
+        assert_eq!(Source::from_str("kimi").unwrap(), Source::Kimi);
+        assert_eq!(Source::from_str("kimi-code").unwrap(), Source::Kimi);
+        assert_eq!(Source::from_str("kimi-work").unwrap(), Source::Kimi);
+        assert_eq!(Source::from_str("kimicode").unwrap(), Source::Kimi);
+        assert_eq!(Source::from_str("kimiwork").unwrap(), Source::Kimi);
     }
 }

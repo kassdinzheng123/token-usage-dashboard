@@ -2,49 +2,11 @@ import Charts
 import AppKit
 import SwiftUI
 
-// MARK: - Cohesive Color Family System
-// Each color family provides primary / light / dark variants for visual consistency.
-// Sources, providers, and chart palettes all derive from these families.
+// MARK: - Color System
+// CLI brand colors and model provider colors come from `AppPalette` (Design.swift).
+// Chart series domains are keyed by display label, so the lookup below stays a dictionary.
 
-private struct ColorFamily {
-    let primary: Color
-    let light: Color
-    let dark: Color
-}
-
-private let colorRose    = ColorFamily(primary: Color(red: 0.85, green: 0.38, blue: 0.30), light: Color(red: 0.95, green: 0.72, blue: 0.68), dark: Color(red: 0.65, green: 0.22, blue: 0.18))
-private let colorOcean   = ColorFamily(primary: Color(red: 0.18, green: 0.46, blue: 0.85), light: Color(red: 0.55, green: 0.72, blue: 0.95), dark: Color(red: 0.10, green: 0.30, blue: 0.65))
-private let colorAmber   = ColorFamily(primary: Color(red: 0.88, green: 0.62, blue: 0.18), light: Color(red: 0.96, green: 0.85, blue: 0.58), dark: Color(red: 0.70, green: 0.46, blue: 0.08))
-private let colorEmerald = ColorFamily(primary: Color(red: 0.15, green: 0.62, blue: 0.42), light: Color(red: 0.52, green: 0.85, blue: 0.70), dark: Color(red: 0.06, green: 0.42, blue: 0.28))
-private let colorViolet  = ColorFamily(primary: Color(red: 0.52, green: 0.35, blue: 0.90), light: Color(red: 0.76, green: 0.68, blue: 0.98), dark: Color(red: 0.38, green: 0.20, blue: 0.72))
-private let colorTeal    = ColorFamily(primary: Color(red: 0.12, green: 0.58, blue: 0.72), light: Color(red: 0.48, green: 0.82, blue: 0.90), dark: Color(red: 0.05, green: 0.40, blue: 0.52))
-private let colorCoral   = ColorFamily(primary: Color(red: 0.92, green: 0.38, blue: 0.30), light: Color(red: 0.98, green: 0.70, blue: 0.64), dark: Color(red: 0.72, green: 0.22, blue: 0.16))
-private let colorSlate   = ColorFamily(primary: Color(red: 0.38, green: 0.42, blue: 0.52), light: Color(red: 0.68, green: 0.72, blue: 0.80), dark: Color(red: 0.22, green: 0.25, blue: 0.34))
-
-private let allColorFamilies: [ColorFamily] = [
-    colorRose, colorOcean, colorAmber, colorEmerald, colorViolet, colorTeal, colorCoral, colorSlate
-]
-
-// Source -> Color Family mapping
-private let tokenTrendSourceColors: [String: Color] = [
-    TokenUsageSource.claude.label:   colorRose.primary,
-    TokenUsageSource.codex.label:    colorEmerald.primary,
-    TokenUsageSource.opencode.label: colorTeal.primary,
-    TokenUsageSource.hermes.label:   colorViolet.primary,
-    TokenUsageSource.openclaw.label: colorAmber.primary,
-    TokenUsageSource.pi.label:       colorCoral.primary,
-    TokenUsageSource.grok.label:     colorSlate.primary,
-    TokenUsageSource.cursor.label: colorSlate.primary,
-    TokenUsageSource.cherry.label: colorRose.light,
-    TokenUsageSource.claudeScience.label: colorOcean.primary,
-    TokenUsageSource.zcode.label: colorOcean.light,
-]
-
-// Model trend chart palette (single-source view): primary shades from each family
-private let tokenTrendChartPalette: [Color] = allColorFamilies.map(\.primary)
-
-// Model cost chart palette: primary + light alternation for visual richness
-private let modelCostPalette: [Color] = allColorFamilies.flatMap { [$0.primary, $0.light] }
+private let tokenTrendSourceColors: [String: Color] = AppPalette.cliColorsByLabel
 
 private let chartTooltipWidth = 190.0
 private let chartTooltipHeight = 86.0
@@ -52,21 +14,15 @@ private let maximumBarWidth: CGFloat = 96.0
 private let dailyUsagePlotHeight: CGFloat = 220
 private let dailyUsageContentHeight: CGFloat = 280
 private let tokenTrendLegendPageSize = 6
-private let modelDistributionLegendRowHeight: CGFloat = 32
-private let modelDistributionLegendRowSpacing: CGFloat = 10
+private let modelDistributionLegendRowHeight: CGFloat = 40
+private let modelDistributionLegendRowSpacing: CGFloat = 12
+private let modelDistributionLegendMaxPageSize = 5
 private let cliConsumptionPageSize = 5
 private let todayModelPageSize = 10
 private let allRangeBarPageSize = 60
 private let todayOverviewContentHeight = 340.0
 private let todaySourceRowHeight = 76.0
 private let todaySourceRowSpacing = 10.0
-
-private let dashboardMonthFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.calendar = Calendar(identifier: .gregorian)
-    formatter.locale = Locale.current
-    return formatter
-}()
 
 public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case all
@@ -81,6 +37,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case cherry
     case claudeScience = "claude-science"
     case zcode
+    case kimi
 
     public var id: String { rawValue }
 
@@ -98,6 +55,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
         case .cherry: "Cherry Studio"
         case .claudeScience: "Claude Science"
         case .zcode: "ZCode"
+        case .kimi: "Kimi"
         }
     }
 }
@@ -130,6 +88,45 @@ private enum DashboardTimeRange: String, CaseIterable, Identifiable {
         case .today: "Today"
         case .month: "This Month"
         case .all: "All"
+        }
+    }
+}
+
+private enum DashboardPage: String, CaseIterable, Identifiable {
+    case overview
+    case activity
+    case models
+    case brief
+    case logs
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .overview: "Overview"
+        case .activity: "Activity"
+        case .models: "Models"
+        case .brief: "Daily Brief"
+        case .logs: "Backend Logs"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .overview: "gauge"
+        case .activity: "chart.bar.xaxis"
+        case .models: "cpu"
+        case .brief: "sparkles"
+        case .logs: "terminal"
+        }
+    }
+
+    /// Pages that show usage statistics and therefore expose the
+    /// source / range / currency toolbar controls.
+    var showsUsageControls: Bool {
+        switch self {
+        case .overview, .activity, .models: true
+        case .brief, .logs: false
         }
     }
 }
@@ -190,18 +187,10 @@ private enum DashboardDailyUsageAggregation: String, CaseIterable, Identifiable 
     }
 }
 
-// Expanded stable model palette: primary/light/dark from every family.
-private let expandedModelPalette: [Color] = allColorFamilies.flatMap { [$0.primary, $0.light, $0.dark] }
-
-/// Deterministic color for a model, hashed from its display name so a model
-/// always keeps the same color regardless of ordering or filters.
+/// Deterministic color for a model: the provider's brand hue with a stable
+/// shade variation (see `AppPalette.modelColor`).
 private func stableModelColor(for modelName: String) -> Color {
-    let key = displayModelName(modelName)
-    var hash: UInt64 = 14695981039346656037
-    for byte in key.utf8 {
-        hash = (hash ^ UInt64(byte)) &* 1099511628211
-    }
-    return expandedModelPalette[Int(hash % UInt64(expandedModelPalette.count))]
+    AppPalette.modelColor(for: modelName)
 }
 
 public struct TokenUsageModelBreakdown: Identifiable, Hashable, Sendable {
@@ -285,22 +274,29 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     var selectedModels: Set<String> { get set }
     var records: [TokenUsageRecord] { get }
     var todaySummary: TodaySummaryResponse { get }
+    var todayHourly: HourlyUsageResponse? { get }
+    var todayBrief: TodayBriefResponse? { get }
     var isLoading: Bool { get }
+    var isGeneratingBrief: Bool { get }
+    var briefErrorMessage: String? { get }
     var isBackendConnected: Bool { get }
 
     func refresh() async
     func refreshToday() async
     func refreshDashboard(force: Bool) async
     func refreshToday(force: Bool) async
+    func refreshTodayBrief() async
+    func generateTodayBrief(force: Bool, trigger: String) async
     func updateDateRangeForViewMode()
 }
 
 struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @ObservedObject private var store: Store
     @ObservedObject private var currencyController: TokenUsageBillingCurrencyController
+    @ObservedObject private var preferences: TokenUsagePreferencesController
     @StateObject private var backendLogs = BackendLogStore.shared
     @State private var modelSearchText = ""
-    @State private var isModelFilterExpanded = false
+    @State private var isModelFilterPresented = false
     @State private var tokenTrendLegendPage = 0
     @State private var modelCostLegendPage = 0
     @State private var tokenMixLegendPage = 0
@@ -309,21 +305,26 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var todayModelPage = 0
     @State private var allRangeChartPage = 0
     @State private var heatmapPage = 0
-    @State private var isViewModeTransitioning = false
-    @State private var viewModeTransitionGeneration = 0
-    @State private var viewModeTransitionTask: Task<Void, Never>?
-    @State private var dateRangeRefreshSuppressionGeneration = 0
-    @State private var isLogViewerPresented = false
+    @State private var selectedPage: DashboardPage = .overview
     @State private var selectedTimeRange: DashboardTimeRange = .today
     @State private var cliCompositionPane: DashboardCLICompositionPane = .cli
     @State private var modelCostMixPane: DashboardModelCostMixPane = .cost
     @State private var dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
     @State private var dashboardData: TokenUsageDashboardData
 
-    init(store: Store, currencyController: TokenUsageBillingCurrencyController) {
+    init(
+        store: Store,
+        currencyController: TokenUsageBillingCurrencyController,
+        preferences: TokenUsagePreferencesController
+    ) {
         self.store = store
         self.currencyController = currencyController
-        _dashboardData = State(initialValue: Self.makeDashboardData(from: store, timeRange: .today))
+        self.preferences = preferences
+        _dashboardData = State(initialValue: Self.makeDashboardData(
+            from: store,
+            timeRange: .today,
+            enabledSources: preferences.enabledSources
+        ))
     }
 
     public var body: some View {
@@ -335,28 +336,14 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var dashboardRoot: some View {
-        ZStack {
-            dashboardContent
-                .disabled(isViewModeTransitioning)
-                .opacity(isViewModeTransitioning ? 0.55 : 1)
-                .transaction { transaction in
-                    transaction.animation = nil
-                }
-
-            if isViewModeTransitioning {
-                viewModeTransitionOverlay
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                    .zIndex(1)
-            }
-
-            if isLogViewerPresented {
-                logViewerOverlay
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                    .zIndex(2)
-            }
+        NavigationSplitView {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 260)
+        } detail: {
+            detailContent
+                .frame(minWidth: 740, maxWidth: .infinity, minHeight: 680, maxHeight: .infinity)
         }
         .frame(minWidth: 960, maxWidth: .infinity, minHeight: 680, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private func applyDashboardTasks<Content: View>(to content: Content) -> some View {
@@ -368,13 +355,19 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 await store.refreshToday()
             }
             .task {
+                await store.refreshTodayBrief()
+            }
+            .task {
                 await currencyController.refreshExchangeRateIfNeeded()
             }
+            .onChange(of: selectedPage) {
+                if selectedPage == .logs {
+                    backendLogs.startTailing()
+                } else {
+                    backendLogs.stopTailing()
+                }
+            }
             .onDisappear {
-                viewModeTransitionTask?.cancel()
-                viewModeTransitionTask = nil
-                isViewModeTransitioning = false
-                isLogViewerPresented = false
                 backendLogs.stopTailing()
             }
     }
@@ -423,6 +416,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             .onChange(of: currencyController.selectedCurrency) {
                 Task { await currencyController.refreshExchangeRateIfNeeded() }
             }
+            .onChange(of: preferences.enabledSources) {
+                if store.selectedSource != .all,
+                   !preferences.enabledSources.contains(store.selectedSource) {
+                    store.selectedSource = .all
+                }
+                updateDashboardData()
+                cliConsumptionPage = 0
+                todayModelPage = 0
+            }
     }
 
     private func handleSelectedSourceChange() {
@@ -448,7 +450,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     private static func makeDashboardData(
         from store: Store,
         timeRange: DashboardTimeRange = .today,
-        dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
+        dailyUsageAggregation: DashboardDailyUsageAggregation = .cli,
+        enabledSources: Set<TokenUsageSource>
     ) -> TokenUsageDashboardData {
         TokenUsageDashboardData.make(
             records: store.records,
@@ -458,7 +461,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             endDate: store.endDate,
             selectedModels: store.selectedModels,
             timeRange: timeRange,
-            dailyUsageAggregation: dailyUsageAggregation
+            dailyUsageAggregation: dailyUsageAggregation,
+            enabledSources: enabledSources
         )
     }
 
@@ -466,32 +470,145 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         dashboardData = Self.makeDashboardData(
             from: store,
             timeRange: selectedTimeRange,
-            dailyUsageAggregation: dailyUsageAggregation
+            dailyUsageAggregation: dailyUsageAggregation,
+            enabledSources: preferences.enabledSources
         )
-        clearChartInteractionState()
         modelCostLegendPage = 0
         tokenMixLegendPage = 0
         cliConsumptionPage = 0
     }
 
-    private func clearChartInteractionState() {
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        List(selection: $selectedPage) {
+            Section("Usage") {
+                sidebarRow(for: .overview)
+                sidebarRow(for: .activity)
+                sidebarRow(for: .models)
+                sidebarRow(for: .brief)
+            }
+
+            Section("System") {
+                sidebarRow(for: .logs)
+            }
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            sidebarStatusFooter
+        }
     }
 
-    private var dashboardContent: some View {
-        ScrollView(.vertical, showsIndicators: true) {
+    private func sidebarRow(for page: DashboardPage) -> some View {
+        Label(page.label, systemImage: page.systemImage)
+            .tag(page)
+    }
+
+    private var sidebarStatusFooter: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(store.isBackendConnected ? Color.green : Color.red)
+                .frame(width: 7, height: 7)
+            Text(store.isBackendConnected ? "Backend connected" : "Backend disconnected")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: - Detail pages
+
+    @ViewBuilder
+    private var detailContent: some View {
+        Group {
+            switch selectedPage {
+            case .overview:
+                overviewPage
+            case .activity:
+                activityPage
+            case .models:
+                modelsPage
+            case .brief:
+                briefPage
+            case .logs:
+                logsPage
+            }
+        }
+        .id(selectedPage)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.15), value: selectedPage)
+        .navigationTitle("Token Usage")
+        .navigationSubtitle(selectedPage.label)
+        .toolbar {
+            dashboardToolbar
+        }
+    }
+
+    private var overviewPage: some View {
+        ScrollView(.vertical) {
             LazyVStack(alignment: .leading, spacing: 20) {
-                header
-
-                filterBar
-
                 if store.records.isEmpty {
                     dashboardLoadingView
                 } else {
                     heroMetricsRow
-                    if selectedTimeRange != .today {
-                        dailyTokenUsageSection
-                    }
                     chartSection
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .scrollIndicators(.visible)
+    }
+
+    private var activityPage: some View {
+        ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                if selectedTimeRange == .today {
+                    // Today is driven by /api/hourly, not dashboard records.
+                    // Don't wait on records — that raced and showed an empty state
+                    // while hourly was still loading (or failed silently).
+                    if store.todayHourly == nil {
+                        dashboardLoadingView
+                    } else if hourlyPoints.isEmpty {
+                        activityTodayEmptyState
+                    } else {
+                        todayTimelineSection
+                    }
+                } else if store.records.isEmpty {
+                    dashboardLoadingView
+                } else {
+                    dailyTokenUsageSection
+                    activityInsightsSection
+                    cacheEfficiencySection
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .scrollIndicators(.visible)
+    }
+
+    private var activityTodayEmptyState: some View {
+        ContentUnavailableView {
+            Label("No Activity Yet Today", systemImage: "chart.bar.xaxis")
+        } description: {
+            Text("Hourly usage appears here once a CLI records a session today. Daily trends live under This Month.")
+        } actions: {
+            Button("Show This Month") {
+                selectedTimeRange = .month
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 420)
+    }
+
+    private var modelsPage: some View {
+        ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                if store.records.isEmpty {
+                    dashboardLoadingView
+                } else {
                     modelConsumptionSection
                 }
             }
@@ -499,6 +616,35 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .scrollIndicators(.visible)
+    }
+
+    private var briefPage: some View {
+        ScrollView(.vertical) {
+            DailyBriefCard(
+                brief: store.todayBrief,
+                isLoading: store.isLoading,
+                isGenerating: store.isGeneratingBrief,
+                enabledSources: preferences.enabledSources,
+                errorMessage: store.briefErrorMessage,
+                onGenerate: {
+                    Task { await store.generateTodayBrief(force: true, trigger: "manual") }
+                }
+            )
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .scrollIndicators(.visible)
+    }
+
+    private var logsPage: some View {
+        BackendLogsView(
+            lines: backendLogs.lines,
+            onClear: {
+                backendLogs.clear()
+            }
+        )
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var dashboardLoadingView: some View {
@@ -512,86 +658,92 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .frame(maxWidth: .infinity, minHeight: 320)
     }
 
-    private var viewModeTransitionOverlay: some View {
-        VStack(spacing: 10) {
-            ProgressView()
-                .controlSize(.regular)
+    // MARK: - Toolbar
 
-            Text("Loading \(store.selectedViewMode.label.lowercased()) view...")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(0.14), radius: 14, y: 8)
-    }
+    @ToolbarContentBuilder
+    private var dashboardToolbar: some ToolbarContent {
+        if selectedPage.showsUsageControls {
+            ToolbarItemGroup(placement: .navigation) {
+                sourcePicker
 
-    private var logViewerOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.18)
-                .ignoresSafeArea()
-                .onTapGesture {
-                    dismissLogViewer()
+                Button {
+                    isModelFilterPresented.toggle()
+                } label: {
+                    Label(
+                        "Filter Models",
+                        systemImage: store.selectedModels.isEmpty
+                            ? "line.3.horizontal.decrease.circle"
+                            : "line.3.horizontal.decrease.circle.fill"
+                    )
                 }
-
-            BackendLogViewerPanel(
-                lines: backendLogs.lines,
-                onClear: {
-                    backendLogs.clear()
-                },
-                onClose: {
-                    dismissLogViewer()
+                .help(showsModelFilter ? "Filter models" : "Model filter is available for a specific source")
+                .disabled(!showsModelFilter)
+                .popover(isPresented: $isModelFilterPresented, arrowEdge: .bottom) {
+                    modelFilterPopover
                 }
-            )
-        }
-    }
-
-    private func presentLogViewer() {
-        backendLogs.startTailing()
-        isLogViewerPresented = true
-    }
-
-    private func dismissLogViewer() {
-        isLogViewerPresented = false
-        backendLogs.stopTailing()
-    }
-
-    private func refreshForViewModeChange() {
-        viewModeTransitionGeneration += 1
-        let generation = viewModeTransitionGeneration
-
-        clearChartInteractionState()
-        viewModeTransitionTask?.cancel()
-
-        viewModeTransitionTask = Task { @MainActor in
-            withAnimation(.easeInOut(duration: 0.16)) {
-                isViewModeTransitioning = true
             }
 
-            async let delay: Void = Self.minimumViewModeTransitionDelay()
-            await store.refresh()
-            await delay
-
-            guard !Task.isCancelled, generation == viewModeTransitionGeneration else { return }
-
-            withAnimation(.easeInOut(duration: 0.16)) {
-                isViewModeTransitioning = false
+            ToolbarItem(placement: .principal) {
+                timeRangePicker
             }
-            viewModeTransitionTask = nil
+
+            ToolbarItem(placement: .primaryAction) {
+                currencyPicker
+            }
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+            settingsButton
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+            refreshButton
         }
     }
 
-    private static func minimumViewModeTransitionDelay() async {
-        try? await Task.sleep(nanoseconds: 180_000_000)
+    private var currencyPicker: some View {
+        Picker("Currency", selection: $currencyController.selectedCurrency) {
+            ForEach(TokenUsageBillingCurrency.allCases) { currency in
+                Text(currency.label).tag(currency)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .fixedSize()
+        .help("Billing currency")
     }
 
-    private var filteredRecords: [TokenUsageRecord] {
-        dashboardData.filteredRecords
+    private var refreshButton: some View {
+        Button {
+            Task { await refreshCurrentPage() }
+        } label: {
+            Label("Refresh", systemImage: "arrow.clockwise")
+        }
+        .keyboardShortcut("r", modifiers: .command)
+        .help(selectedPage == .brief ? "Refresh brief" : "Refresh usage")
+        .disabled(store.isLoading || store.isGeneratingBrief)
+    }
+
+    @Environment(\.openSettings) private var openSettings
+
+    private var settingsButton: some View {
+        Button {
+            openSettings()
+        } label: {
+            Label("Settings", systemImage: "gearshape")
+        }
+        .help("Open settings")
+    }
+
+    private func refreshCurrentPage() async {
+        switch selectedPage {
+        case .brief:
+            await store.refreshTodayBrief()
+        case .logs:
+            break
+        case .overview, .activity, .models:
+            await refreshDashboardAndToday(force: true)
+        }
     }
 
     private var availableModels: [String] {
@@ -608,23 +760,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    private var modelFilterListHeight: CGFloat {
-        min(max(CGFloat(filteredAvailableModels.count) * 32, 44), 180)
-    }
-
     private var modelSelectionSummary: String {
         store.selectedModels.isEmpty ? "All Models" : "\(store.selectedModels.count) selected"
-    }
-
-
-
-    private func sessionIDText(for record: TokenUsageRecord) -> String {
-        guard store.selectedViewMode == .sessions else { return "-" }
-
-        let sessionID = record.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !sessionID.isEmpty else { return "-" }
-
-        return sessionID.count > 12 ? "\(sessionID.prefix(12))..." : sessionID
     }
 
     private var totalCost: Decimal {
@@ -633,68 +770,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var totalTokens: Int {
         dashboardData.totalTokens
-    }
-
-    private var todaySummary: TodaySummaryResponse {
-        store.todaySummary
-    }
-
-    private var activePeriodCount: Int {
-        dashboardData.activePeriodCount
-    }
-
-    private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Token Usage Dashboard")
-                    .font(.title2.weight(.semibold))
-                Text("Local token, model, and cost usage across supported sources.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            HStack(spacing: 8) {
-                Button {
-                    presentLogViewer()
-                } label: {
-                    Label("Logs", systemImage: "doc.text.magnifyingglass")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("View backend logs")
-
-                Picker("Currency", selection: $currencyController.selectedCurrency) {
-                    ForEach(TokenUsageBillingCurrency.allCases) { currency in
-                        Text(currency.label).tag(currency)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 120)
-            }
-
-            VStack(alignment: .trailing, spacing: 6) {
-                Button {
-                    Task { await refreshDashboardAndToday(force: true) }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .help("Refresh usage")
-                .disabled(store.isLoading)
-
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(store.isBackendConnected ? Color.green : Color.red)
-                        .frame(width: 7, height: 7)
-                    Text(store.isBackendConnected ? "Connected" : "Disconnected")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
     }
 
     private func refreshDashboardAndToday(force: Bool = false) async {
@@ -740,26 +815,9 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         store.endDate = tomorrow
     }
 
-    private var filterBar: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            filterControls
-
-            modelFilter
-        }
-        .padding(16)
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
-    }
-
-    private var filterControls: some View {
-        HStack(spacing: 16) {
-            sourcePicker
-            timeRangePicker
-            Spacer(minLength: 0)
+    private var visibleSourcePickerOptions: [TokenUsageSource] {
+        [.all] + TokenUsageSource.allCases.filter { source in
+            source != .all && preferences.enabledSources.contains(source)
         }
     }
 
@@ -776,7 +834,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var sourcePicker: some View {
         Picker("Source", selection: $store.selectedSource) {
-            ForEach(TokenUsageSource.allCases) { source in
+            ForEach(visibleSourcePickerOptions) { source in
                 HStack(spacing: 4) {
                     if let imageAssetName = source.imageAssetName {
                         BundledIconImage(imageAssetName: imageAssetName, padding: 1, size: 16)
@@ -791,115 +849,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             }
         }
         .pickerStyle(.menu)
-        .frame(width: 180)
-    }
-
-    private var viewModePicker: some View {
-        Picker("View", selection: $store.selectedViewMode) {
-            ForEach(TokenUsageViewMode.allCases) { mode in
-                Text(mode.label).tag(mode)
-            }
-        }
-        .pickerStyle(.segmented)
-        .frame(width: 280)
-    }
-
-    @ViewBuilder
-    private var dateRangePickers: some View {
-        HStack(spacing: 16) {
-            if store.selectedViewMode == .monthly {
-                monthPickerField("Month")
-            } else {
-                datePickerField("From", selection: $store.startDate)
-                datePickerField("To", selection: $store.endDate)
-            }
-        }
-    }
-
-    private func datePickerField(_ title: String, selection: Binding<Date>) -> some View {
-        HStack(spacing: 8) {
-            Text(title)
-                .frame(width: 42, alignment: .trailing)
-
-            DatePicker("", selection: selection, displayedComponents: .date)
-                .labelsHidden()
-                .datePickerStyle(.compact)
-                .frame(width: 190, alignment: .leading)
-        }
-        .frame(width: 242, alignment: .leading)
-        .layoutPriority(1)
-    }
-
-    private func monthPickerField(_ title: String) -> some View {
-        HStack(spacing: 8) {
-            Text(title)
-                .frame(width: 42, alignment: .trailing)
-
-            Picker("Year", selection: monthYearBinding) {
-                ForEach(monthYearOptions, id: \.self) { year in
-                    Text(year.formatted(.number.grouping(.never))).tag(year)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(width: 92)
-
-            Picker("Month", selection: monthNumberBinding) {
-                ForEach(1...12, id: \.self) { month in
-                    Text(dashboardMonthFormatter.monthSymbols[month - 1]).tag(month)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(width: 118)
-        }
-        .frame(width: 268, alignment: .leading)
-        .layoutPriority(1)
-    }
-
-    private var monthYearOptions: [Int] {
-        let calendar = Calendar.current
-        let currentYear = calendar.component(.year, from: Date())
-        let startYear = calendar.component(.year, from: store.startDate)
-        let endYear = calendar.component(.year, from: store.endDate)
-        let lowerBound = min(currentYear, startYear, endYear) - 5
-        let upperBound = max(currentYear, startYear, endYear) + 1
-        return Array(lowerBound...upperBound)
-    }
-
-    private var monthYearBinding: Binding<Int> {
-        Binding {
-            Calendar.current.component(.year, from: selectedMonthDate)
-        } set: { year in
-            updateSelectedMonth(year: year, month: Calendar.current.component(.month, from: selectedMonthDate))
-        }
-    }
-
-    private var monthNumberBinding: Binding<Int> {
-        Binding {
-            Calendar.current.component(.month, from: selectedMonthDate)
-        } set: { month in
-            updateSelectedMonth(year: Calendar.current.component(.year, from: selectedMonthDate), month: month)
-        }
-    }
-
-    private var selectedMonthDate: Date {
-        monthStart(for: store.startDate)
-    }
-
-    private func updateSelectedMonth(year: Int, month: Int) {
-        var components = DateComponents()
-        components.calendar = Calendar.current
-        components.year = year
-        components.month = month
-        components.day = 1
-
-        guard let monthStart = Calendar.current.date(from: components) else {
-            return
-        }
-
-        store.startDate = self.monthStart(for: monthStart)
-        store.endDate = monthEnd(for: monthStart)
+        .fixedSize()
+        .help("Data source")
     }
 
     private func monthStart(for date: Date) -> Date {
@@ -919,209 +870,61 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         !availableModels.isEmpty && store.selectedSource != .all
     }
 
-    @ViewBuilder
-    private var modelFilter: some View {
-        if showsModelFilter {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            isModelFilterExpanded.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: isModelFilterExpanded ? "chevron.down" : "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .frame(width: 12)
-                            Text("Models")
-                                .font(.callout.weight(.semibold))
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .contentShape(Rectangle())
-                    .help(isModelFilterExpanded ? "Collapse model filters" : "Expand model filters")
+    private var modelFilterPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Models")
+                    .font(.headline)
+                Spacer()
+                Text(modelSelectionSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-                    Text(modelSelectionSummary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                TextField("Search models", text: $modelSearchText)
+                    .textFieldStyle(.roundedBorder)
 
-                    Text("\(availableModels.count) models")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Spacer()
-
-                    if !store.selectedModels.isEmpty {
-                        Button("All Models") {
-                            store.selectedModels.removeAll()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
+                Button("All Models") {
+                    store.selectedModels.removeAll()
+                    modelSearchText = ""
                 }
+                .disabled(store.selectedModels.isEmpty && modelSearchText.isEmpty)
+            }
 
-                if isModelFilterExpanded {
-                    HStack(spacing: 8) {
-                        TextField("Search models", text: $modelSearchText)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 320)
-
-                        Button("All Models") {
-                            store.selectedModels.removeAll()
-                            modelSearchText = ""
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled(store.selectedModels.isEmpty && modelSearchText.isEmpty)
-
-                        Text("\(filteredAvailableModels.count) of \(availableModels.count) models")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        Spacer()
-                    }
-
-                    if filteredAvailableModels.isEmpty {
-                        Text("No matching models")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, minHeight: 48, alignment: .center)
-                            .background(Color(nsColor: .controlBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    } else {
-                        ScrollView(.vertical) {
-                            LazyVStack(alignment: .leading, spacing: 0) {
-                                ForEach(filteredAvailableModels, id: \.self) { model in
-                                    Toggle(isOn: modelBinding(model)) {
-                                        HStack(spacing: 8) {
-                                            ProviderIconBadge(modelName: model)
-                                            Text(displayModelName(model))
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
-                                                .help(model)
-                                        }
-                                    }
-                                    .toggleStyle(.checkbox)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+            if filteredAvailableModels.isEmpty {
+                ContentUnavailableView {
+                    Label("No Matching Models", systemImage: "magnifyingglass")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(.vertical) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(filteredAvailableModels, id: \.self) { model in
+                            Toggle(isOn: modelBinding(model)) {
+                                HStack(spacing: 8) {
+                                    ProviderIconBadge(modelName: model)
+                                    Text(displayModelName(model))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                        .help(model)
                                 }
                             }
+                            .toggleStyle(.checkbox)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .frame(height: modelFilterListHeight)
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-                        )
                     }
                 }
             }
+
+            Text("\(filteredAvailableModels.count) of \(availableModels.count) models")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-    }
-
-    private var todayDashboard: some View {
-        let summary = todaySummary
-        let overviewContentHeight = todayOverviewResolvedContentHeight(for: summary)
-
-        return VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 16) {
-                TodayTokenHeroView(
-                    totalTokens: summary.totalTokens,
-                    modelCount: summary.modelCount,
-                    isRefreshing: store.isLoading
-                )
-                .frame(minWidth: 280, idealWidth: 320, maxWidth: 360, alignment: .leading)
-
-                LazyVGrid(
-                    columns: [
-                        GridItem(.adaptive(minimum: 148), spacing: 12, alignment: .top),
-                    ],
-                    alignment: .leading,
-                    spacing: 12
-                ) {
-                    TodayMetricCard(
-                        title: "Cost",
-                        value: currencyController.string(fromUSD: summary.totalCostDecimal),
-                        subtitle: "\(summary.activeSourceCount) active CLI",
-                        systemImage: "creditcard",
-                        tint: .blue
-                    )
-                    TodayMetricCard(
-                        title: "Cache Read",
-                        value: summary.cacheReadTokens.tokenText,
-                        subtitle: "\(summary.cacheReadShare.percentText) of tokens",
-                        systemImage: "externaldrive.badge.icloud",
-                        tint: .purple
-                    )
-                    TodayMetricCard(
-                        title: "Cache Share",
-                        value: summary.cacheShare.percentText,
-                        subtitle: "read + create",
-                        systemImage: "chart.pie",
-                        tint: .orange
-                    )
-                    TodayMetricCard(
-                        title: "Input",
-                        value: summary.inputTokens.tokenText,
-                        subtitle: summary.inputShare.percentText,
-                        systemImage: "arrow.down.to.line.compact",
-                        tint: .cyan
-                    )
-                    TodayMetricCard(
-                        title: "Output",
-                        value: summary.outputTokens.tokenText,
-                        subtitle: summary.outputShare.percentText,
-                        systemImage: "arrow.up.to.line.compact",
-                        tint: .pink
-                    )
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            Grid(horizontalSpacing: 16, verticalSpacing: 16) {
-                GridRow {
-                    ChartCard(title: "CLI Consumption") {
-                        cliConsumptionPager(for: summary)
-                    } content: {
-                        todaySourceBreakdown(summary: summary)
-                    }
-                    .frame(height: overviewContentHeight + 66, alignment: .top)
-
-                    ChartCard(title: "Token Usage") {
-                        tokenMixLegendPager
-                    } content: {
-                        todayTokenMix(summary: summary)
-                    }
-                    .frame(height: overviewContentHeight + 66, alignment: .top)
-                }
-
-                GridRow {
-                    ChartCard(title: "Model Consumption") {
-                        if todayModelPageCount(for: summary) > 1 {
-                            LegendPageControls(
-                                currentPage: clampedTodayModelPage(for: summary),
-                                pageCount: todayModelPageCount(for: summary),
-                                totalCount: summary.modelRows.count,
-                                onPrevious: {
-                                    todayModelPage = max(clampedTodayModelPage(for: summary) - 1, 0)
-                                },
-                                onNext: {
-                                    todayModelPage = min(
-                                        clampedTodayModelPage(for: summary) + 1,
-                                        todayModelPageCount(for: summary) - 1
-                                    )
-                                }
-                            )
-                        }
-                    } content: {
-                        todayModelBreakdown(summary: summary)
-                    }
-                    .gridCellColumns(2)
-                }
-            }
-        }
+        .padding(12)
+        .frame(width: 340, height: 400)
     }
 
     private func todayOverviewResolvedContentHeight(for summary: TodaySummaryResponse) -> Double {
@@ -1237,35 +1040,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         }
     }
 
-    @ViewBuilder
-    private func todayModelBreakdown(summary: TodaySummaryResponse) -> some View {
-        if summary.modelRows.isEmpty {
-            emptyTodayState(text: store.isLoading ? "Loading models..." : "No model usage recorded today")
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    Text("Model")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Source")
-                        .frame(width: 120, alignment: .leading)
-                    Text("Tokens")
-                        .frame(width: 92, alignment: .trailing)
-                    Text("Cache")
-                        .frame(width: 78, alignment: .trailing)
-                    Text("Cost")
-                        .frame(width: 86, alignment: .trailing)
-                }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-                ForEach(visibleTodayModelRows(for: summary), id: \.dashboardID) { row in
-                    TodayModelRowView(row: row, costText: currencyController.string(fromUSD: row.totalCostDecimal))
-                }
-            }
-            .frame(maxWidth: .infinity, minHeight: 260, alignment: .topLeading)
-        }
-    }
-
     private func emptyTodayState(text: String) -> some View {
         VStack(spacing: 8) {
             Image(systemName: "chart.bar.doc.horizontal")
@@ -1281,11 +1055,12 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     private var heroMetricsRow: some View {
         VStack(alignment: .leading, spacing: 16) {
             DashboardHeroView(
+                periodLabel: heroPeriodLabel,
                 totalTokens: totalTokens,
                 costText: currencyController.string(fromUSD: totalCost),
+                subtitle: heroSubtitle,
                 isRefreshing: store.isLoading
             )
-            .frame(maxWidth: .infinity, minHeight: 140)
 
             HStack(alignment: .top, spacing: 12) {
                 TodayMetricCard(
@@ -1318,6 +1093,18 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 )
             }
         }
+    }
+
+    private var heroPeriodLabel: String {
+        switch selectedTimeRange {
+        case .today: "Today"
+        case .month: "This Month"
+        case .all: "All Time"
+        }
+    }
+
+    private var heroSubtitle: String {
+        "\(dashboardSummary.activeSourceCount) active CLI · \(dashboardSummary.modelCount) models"
     }
 
     private var dashboardCacheReadShare: Double {
@@ -1433,7 +1220,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private func updateModelDistributionLegendCapacity(for availableHeight: CGFloat) {
         let stride = modelDistributionLegendRowHeight + modelDistributionLegendRowSpacing
-        let capacity = max(Int((availableHeight + modelDistributionLegendRowSpacing) / stride), 1)
+        let fitted = max(Int((availableHeight + modelDistributionLegendRowSpacing) / stride), 1)
+        let capacity = min(fitted, modelDistributionLegendMaxPageSize)
         guard capacity != modelDistributionLegendCapacity else { return }
         modelDistributionLegendCapacity = capacity
     }
@@ -1517,7 +1305,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         if rows.isEmpty {
             emptyTodayState(text: store.isLoading ? "Loading models..." : "No model usage recorded")
         } else {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 10) {
                     Text("Model")
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1532,9 +1320,16 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, 2)
+                .padding(.bottom, 6)
 
-                ForEach(visibleDashboardModelRows, id: \.dashboardID) { row in
+                Divider()
+
+                ForEach(Array(visibleDashboardModelRows.enumerated()), id: \.element.dashboardID) { index, row in
                     TodayModelRowView(row: row, costText: currencyController.string(fromUSD: row.totalCostDecimal))
+                    if index < visibleDashboardModelRows.count - 1 {
+                        Divider()
+                    }
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 260, alignment: .topLeading)
@@ -1555,6 +1350,138 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         guard start < rows.count else { return rows }
         let end = min(start + todayModelPageSize, rows.count)
         return Array(rows[start..<end])
+    }
+
+    // MARK: - Activity insight sections (Daily Cost / By Weekday / Cache Efficiency)
+
+    private var activityInsightPlotHeight: CGFloat { 180 }
+    private var activityInsightCardHeight: CGFloat { activityInsightPlotHeight + 66 }
+
+    private var activityCostRangeTotal: String {
+        let total = dashboardData.costTrendRows.reduce(Decimal.zero) { $0 + Decimal($1.value) }
+        return "Total \(currencyController.string(fromUSD: total))"
+    }
+
+    private var activityWeekdayPeakSummary: String? {
+        guard let peak = dashboardData.weekdayAverageRows.max(by: { $0.averageTokens < $1.averageTokens }),
+              peak.averageTokens > 0 else { return nil }
+        return "Peak \(peak.label) · \(peak.averageTokens.tokenAxisText)"
+    }
+
+    private var activityCacheAverageSummary: String? {
+        let rows = dashboardData.cacheShareRows
+        guard !rows.isEmpty else { return nil }
+        let average = rows.reduce(0.0) { $0 + $1.value } / Double(rows.count)
+        return "Avg \(average.percentText)"
+    }
+
+    private var activityInsightsSection: some View {
+        GeometryReader { geometry in
+            let spacing: CGFloat = 20
+            let weekdayWidth = max((geometry.size.width - spacing) / 3, 0)
+
+            HStack(alignment: .top, spacing: spacing) {
+                ChartCard(title: "Daily Cost") {
+                    Text(activityCostRangeTotal)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } content: {
+                    CostTrendChartView(
+                        rows: dashboardData.costTrendRows,
+                        formatCost: { currencyController.string(fromUSD: $0) }
+                    )
+                    .frame(height: activityInsightPlotHeight)
+                }
+                .frame(width: weekdayWidth * 2, height: activityInsightCardHeight)
+
+                ChartCard(title: "By Weekday") {
+                    if let activityWeekdayPeakSummary {
+                        Text(activityWeekdayPeakSummary)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                } content: {
+                    WeekdayAverageChartView(rows: dashboardData.weekdayAverageRows)
+                        .frame(height: activityInsightPlotHeight)
+                }
+                .frame(width: weekdayWidth, height: activityInsightCardHeight)
+            }
+        }
+        .frame(height: activityInsightCardHeight)
+    }
+
+    private var cacheEfficiencySection: some View {
+        ChartCard(title: "Cache Efficiency") {
+            if let activityCacheAverageSummary {
+                Text(activityCacheAverageSummary)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        } content: {
+            CacheShareChartView(rows: dashboardData.cacheShareRows)
+                .frame(height: activityInsightPlotHeight)
+        }
+        .frame(height: activityInsightCardHeight)
+    }
+
+    // MARK: - Hourly (Today range)
+
+    private var hourlyPoints: [HourlyUsagePoint] {
+        guard let hours = store.todayHourly?.hours else { return [] }
+        return hours.compactMap { row in
+            guard let tokenSource = TokenUsageSource(rawValue: row.source.rawValue),
+                  preferences.enabledSources.contains(tokenSource),
+                  store.selectedSource == .all || store.selectedSource == tokenSource
+            else { return nil }
+            return HourlyUsagePoint(hour: row.hour, series: row.source.displayName, tokens: row.totalTokens)
+        }
+    }
+
+    private var hourlyColorDomain: [String] {
+        Array(Set(hourlyPoints.map(\.series))).sorted()
+    }
+
+    private var hourlyColorRange: [Color] {
+        hourlyColorDomain.map { tokenTrendSourceColors[$0] ?? .blue }
+    }
+
+    private var hourlyPeakSummary: String? {
+        var totals: [Int: Int] = [:]
+        for point in hourlyPoints where (0...23).contains(point.hour) {
+            totals[point.hour, default: 0] += point.tokens
+        }
+        guard let peak = totals.max(by: { $0.value < $1.value }), peak.value > 0 else {
+            return nil
+        }
+        return "Peak \(TodayHourlyTimelineView.hourLabel(peak.key)) · \(peak.value.tokenText)"
+    }
+
+    private var hourlyShowsNowIndicator: Bool {
+        guard let date = store.todayHourly?.date else { return false }
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return date == formatter.string(from: Date())
+    }
+
+    /// 24h usage strip + hour event rail (no Daily Brief kanban board).
+    private var todayTimelineSection: some View {
+        ChartCard(title: "Today Timeline") {
+            if let hourlyPeakSummary {
+                Text(hourlyPeakSummary)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        } content: {
+            TodayHourlyTimelineView(
+                points: hourlyPoints,
+                briefHours: store.todayBrief?.hours ?? [],
+                colorDomain: hourlyColorDomain,
+                colorRange: hourlyColorRange,
+                showsNowIndicator: hourlyShowsNowIndicator
+            )
+        }
     }
 
     private var tokenTrendChart: some View {
@@ -1659,21 +1586,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         return Array(modelCostSlices[start..<end])
     }
 
-    private func todayModelPageCount(for summary: TodaySummaryResponse) -> Int {
-        max(Int(ceil(Double(summary.modelRows.count) / Double(todayModelPageSize))), 1)
-    }
-
-    private func clampedTodayModelPage(for summary: TodaySummaryResponse) -> Int {
-        min(max(todayModelPage, 0), todayModelPageCount(for: summary) - 1)
-    }
-
-    private func visibleTodayModelRows(for summary: TodaySummaryResponse) -> [TodayModelUsageRow] {
-        let start = clampedTodayModelPage(for: summary) * todayModelPageSize
-        guard start < summary.modelRows.count else { return summary.modelRows }
-        let end = min(start + todayModelPageSize, summary.modelRows.count)
-        return Array(summary.modelRows[start..<end])
-    }
-
     private var tokenTrendRows: [TokenTrendRow] {
         dashboardData.tokenTrendRows
     }
@@ -1729,22 +1641,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var compositionRows: [TokenCompositionRow] {
         dashboardData.compositionRows
-    }
-
-    private var primaryChartTitle: String {
-        switch store.selectedViewMode {
-        case .daily: "Daily Token Usage"
-        case .monthly: "Monthly Token Usage"
-        case .sessions: "Session Token Usage"
-        }
-    }
-
-    private var activePeriodLabel: String {
-        switch store.selectedViewMode {
-        case .daily: "Active Days"
-        case .monthly: "Active Months"
-        case .sessions: "Active Sessions"
-        }
     }
 
     private var dateColumnTitle: String {
@@ -2052,6 +1948,9 @@ private struct TokenUsageDashboardData {
     let monthlyXAxisValues: [Date]
     let dailyXAxisValues: [Date]
     let spansMultipleYears: Bool
+    let costTrendRows: [DailyValuePoint]
+    let cacheShareRows: [DailyValuePoint]
+    let weekdayAverageRows: [WeekdayAveragePoint]
 
     static func make(
         records: [TokenUsageRecord],
@@ -2061,7 +1960,8 @@ private struct TokenUsageDashboardData {
         endDate: Date,
         selectedModels: Set<String>,
         timeRange: DashboardTimeRange = .today,
-        dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
+        dailyUsageAggregation: DashboardDailyUsageAggregation = .cli,
+        enabledSources: Set<TokenUsageSource> = Set(TokenUsageSource.allCases.filter { $0 != .all })
     ) -> TokenUsageDashboardData {
         let calendar = Calendar.current
         let rangeStart = selectedViewMode == .monthly
@@ -2073,7 +1973,8 @@ private struct TokenUsageDashboardData {
 
         let filteredRecords = records
             .filter { record in
-                (selectedSource == .all || record.source == selectedSource)
+                enabledSources.contains(record.source)
+                    && (selectedSource == .all || record.source == selectedSource)
                     && record.viewMode == selectedViewMode
                     && calendar.startOfDay(for: record.date) >= rangeStart
                     && calendar.startOfDay(for: record.date) <= rangeEnd
@@ -2134,6 +2035,9 @@ private struct TokenUsageDashboardData {
             calendar: calendar
         )
         let heatmapDays = makeHeatmapDays(from: filteredRecords, days: heatmapAxisDays, calendar: calendar)
+        let costTrendRows = makeDailyTotalPoints(from: filteredRecords, calendar: calendar) { $0.totalCost.doubleValue }
+        let cacheShareRows = makeCacheSharePoints(from: filteredRecords, calendar: calendar)
+        let weekdayAverageRows = makeWeekdayAveragePoints(from: filteredRecords, calendar: calendar)
 
         return TokenUsageDashboardData(
             filteredRecords: filteredRecords,
@@ -2161,8 +2065,65 @@ private struct TokenUsageDashboardData {
             compositionByDateKey: compositionByDateKey,
             monthlyXAxisValues: monthlyXAxisValues,
             dailyXAxisValues: dailyXAxisValues,
-            spansMultipleYears: spansMultipleYears
+            spansMultipleYears: spansMultipleYears,
+            costTrendRows: costTrendRows,
+            cacheShareRows: cacheShareRows,
+            weekdayAverageRows: weekdayAverageRows
         )
+    }
+
+    private static func makeDailyTotalPoints(
+        from records: [TokenUsageRecord],
+        calendar: Calendar,
+        measure: (TokenUsageRecord) -> Double
+    ) -> [DailyValuePoint] {
+        let grouped = records.reduce(into: [Date: Double]()) { totals, record in
+            totals[calendar.startOfDay(for: record.date), default: 0] += measure(record)
+        }
+        return grouped
+            .map { DailyValuePoint(date: $0.key, value: $0.value) }
+            .sorted { $0.date < $1.date }
+    }
+
+    private static func makeCacheSharePoints(
+        from records: [TokenUsageRecord],
+        calendar: Calendar
+    ) -> [DailyValuePoint] {
+        let grouped = records.reduce(into: [Date: (cache: Int, total: Int)]()) { totals, record in
+            let day = calendar.startOfDay(for: record.date)
+            var entry = totals[day] ?? (0, 0)
+            entry.cache += record.cacheCreationTokens + record.cacheReadTokens
+            entry.total += record.totalTokens
+            totals[day] = entry
+        }
+        return grouped
+            .compactMap { day, entry in
+                guard entry.total > 0 else { return nil }
+                return DailyValuePoint(date: day, value: Double(entry.cache) / Double(entry.total))
+            }
+            .sorted { $0.date < $1.date }
+    }
+
+    private static func makeWeekdayAveragePoints(
+        from records: [TokenUsageRecord],
+        calendar: Calendar
+    ) -> [WeekdayAveragePoint] {
+        let tokensByDay = records.reduce(into: [Date: Int]()) { totals, record in
+            totals[calendar.startOfDay(for: record.date), default: 0] += record.totalTokens
+        }
+        var sums: [Int: Int] = [:]
+        var counts: [Int: Int] = [:]
+        for (day, tokens) in tokensByDay {
+            // Remap Sunday-first weekday (1...7) to Monday-first (1...7).
+            let weekday = (calendar.component(.weekday, from: day) + 5) % 7 + 1
+            sums[weekday, default: 0] += tokens
+            counts[weekday, default: 0] += 1
+        }
+        let labels = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        return (1...7).map { weekday in
+            let average = counts[weekday].map { Double(sums[weekday] ?? 0) / Double($0) } ?? 0
+            return WeekdayAveragePoint(weekday: weekday, label: labels[weekday], averageTokens: average)
+        }
     }
 
     private static func makeSummary(
@@ -2702,6 +2663,7 @@ private struct TokenTrendChartView: View {
 
     var body: some View {
         let barWidth = dashboardHistogramBarWidth(for: viewMode)
+        let dates = rows.map(\.date)
 
         Chart {
             ForEach(rows) { row in
@@ -2711,6 +2673,7 @@ private struct TokenTrendChartView: View {
                     width: barWidth
                 )
                 .foregroundStyle(by: .value(seriesLabel, row.series))
+                .cornerRadius(3)
             }
         }
         .chartForegroundStyleScale(domain: colorDomain, range: colorRange)
@@ -2728,7 +2691,7 @@ private struct TokenTrendChartView: View {
                         .onContinuousHover { phase in
                             switch phase {
                             case .active(let point):
-                                hoveredRow = tokenTrendRow(at: point, proxy: proxy, geometry: geometry)
+                                hoveredRow = tokenTrendRow(at: point, proxy: proxy, geometry: geometry, dates: dates)
                                 hoveredPoint = hoveredRow == nil ? nil : point
                             case .ended:
                                 hoveredRow = nil
@@ -2738,10 +2701,10 @@ private struct TokenTrendChartView: View {
 
                     if let row = hoveredRow, let point = hoveredPoint {
                         ChartTooltipPanel(
-                            title: row.series,
+                            title: tooltipDateText(row.date),
                             rows: [
-                                (dateColumnTitle, tooltipDateText(row.date)),
-                                ("Tokens", row.tokens.tokenText),
+                                ChartTooltipRow(row.series, row.tokens.tokenText, color: seriesColor(for: row.series)),
+                                ChartTooltipRow("Day Total", dayTotalText(for: row.date), emphasized: true),
                             ]
                         )
                         .position(dashboardTooltipPosition(for: point, in: geometry.size))
@@ -2757,16 +2720,17 @@ private struct TokenTrendChartView: View {
         }
         .chartYAxis {
             AxisMarks { value in
-                AxisGridLine()
-                AxisTick()
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                    .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.35))
                 AxisValueLabel {
                     if let tokens = value.as(Double.self) {
                         Text(tokens.tokenAxisText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
         }
-        .chartYAxisLabel("Tokens")
         .frame(height: dailyUsagePlotHeight)
     }
 
@@ -2774,29 +2738,30 @@ private struct TokenTrendChartView: View {
     private var xAxisMarks: some AxisContent {
         if viewMode == .monthly {
             AxisMarks(values: monthlyXAxisValues) { value in
-                AxisGridLine()
-                AxisTick()
                 AxisValueLabel {
                     if let date = value.as(Date.self) {
                         Text(monthAxisLabel(date))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
         } else {
             AxisMarks(values: dailyXAxisValues) { value in
                 if let date = value.as(Date.self), isFirstDayOfMonth(date) {
-                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.8))
-                    AxisTick(stroke: StrokeStyle(lineWidth: 0.8))
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.45))
                     AxisValueLabel {
                         Text(monthSeparatorLabel(date))
                             .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
                 } else {
-                    AxisGridLine()
-                    AxisTick()
                     AxisValueLabel {
                         if let date = value.as(Date.self) {
                             Text(date.formatted(.dateTime.day()))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -2804,8 +2769,8 @@ private struct TokenTrendChartView: View {
         }
     }
 
-    private func tokenTrendRow(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> TokenTrendRow? {
-        guard let hit = dashboardStackedBarHit(at: point, proxy: proxy, geometry: geometry, dates: rows.map(\.date), viewMode: viewMode) else {
+    private func tokenTrendRow(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy, dates: [Date]) -> TokenTrendRow? {
+        guard let hit = dashboardStackedBarHit(at: point, proxy: proxy, geometry: geometry, dates: dates, viewMode: viewMode) else {
             return nil
         }
 
@@ -2818,6 +2783,21 @@ private struct TokenTrendChartView: View {
             rowOrder: { colorDomain.firstIndex(of: $0.series) ?? Int.max },
             viewMode: viewMode
         )
+    }
+
+    private func seriesColor(for series: String) -> Color {
+        guard let index = colorDomain.firstIndex(of: series), index < colorRange.count else {
+            return .blue
+        }
+        return colorRange[index]
+    }
+
+    private func dayTotalText(for date: Date) -> String {
+        let period = dashboardPeriodKey(for: date, viewMode: viewMode)
+        let total = rows
+            .filter { dashboardPeriodKey(for: $0.date, viewMode: viewMode) == period }
+            .reduce(0) { $0 + $1.tokens }
+        return total.tokenText
     }
 }
 
@@ -2857,7 +2837,8 @@ private struct CompositionChartView: View {
                         y: .value("Tokens", row.tokens),
                         width: barWidth
                     )
-                    .foregroundStyle(colorRose.primary)
+                    .foregroundStyle(AppPalette.compositionOutput)
+                    .cornerRadius(3)
                 }
                 ForEach(inputRows) { row in
                     BarMark(
@@ -2865,7 +2846,8 @@ private struct CompositionChartView: View {
                         y: .value("Tokens", row.tokens),
                         width: barWidth
                     )
-                    .foregroundStyle(colorOcean.primary)
+                    .foregroundStyle(AppPalette.compositionInput)
+                    .cornerRadius(3)
                 }
                 ForEach(cacheReadRows) { row in
                     BarMark(
@@ -2873,7 +2855,8 @@ private struct CompositionChartView: View {
                         y: .value("Tokens", row.tokens),
                         width: barWidth
                     )
-                    .foregroundStyle(colorOcean.light)
+                    .foregroundStyle(AppPalette.compositionCacheRead)
+                    .cornerRadius(3)
                 }
             }
             .chartLegend(position: .bottom, alignment: .center)
@@ -2909,13 +2892,12 @@ private struct CompositionChartView: View {
                             let cacheCoverage = min(floor(rawCoverage * 10) / 10, 99.9)
 
                             ChartTooltipPanel(
-                                title: "Token Composition",
+                                title: tooltipDateText(hovered.date),
                                 rows: [
-                                    (dateColumnTitle, tooltipDateText(hovered.date)),
-                                    ("Input", inputTokens.tokenText),
-                                    ("Cache Read", cacheReadTokens.tokenText),
-                                    ("Output", outputTokens.tokenText),
-                                    ("Cache Coverage", String(format: "%.1f%%", cacheCoverage)),
+                                    ChartTooltipRow("Input", inputTokens.tokenText, color: AppPalette.compositionInput),
+                                    ChartTooltipRow("Cache Read", cacheReadTokens.tokenText, color: AppPalette.compositionCacheRead),
+                                    ChartTooltipRow("Output", outputTokens.tokenText, color: AppPalette.compositionOutput),
+                                    ChartTooltipRow("Cache Coverage", String(format: "%.1f%%", cacheCoverage), emphasized: true),
                                 ]
                             )
                             .position(dashboardTooltipPosition(for: point, in: overlayGeometry.size))
@@ -2931,16 +2913,17 @@ private struct CompositionChartView: View {
             }
             .chartYAxis {
                 AxisMarks { value in
-                    AxisGridLine()
-                    AxisTick()
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.35))
                     AxisValueLabel {
                         if let tokens = value.as(Double.self) {
                             Text(tokens.tokenAxisText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
             }
-            .chartYAxisLabel("Tokens")
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2950,29 +2933,30 @@ private struct CompositionChartView: View {
     private var xAxisMarks: some AxisContent {
         if viewMode == .monthly {
             AxisMarks(values: monthlyXAxisValues) { value in
-                AxisGridLine()
-                AxisTick()
                 AxisValueLabel {
                     if let date = value.as(Date.self) {
                         Text(monthAxisLabel(date))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
         } else {
             AxisMarks(values: dailyXAxisValues) { value in
                 if let date = value.as(Date.self), isFirstDayOfMonth(date) {
-                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.8))
-                    AxisTick(stroke: StrokeStyle(lineWidth: 0.8))
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.45))
                     AxisValueLabel {
                         Text(monthSeparatorLabel(date))
                             .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
                 } else {
-                    AxisGridLine()
-                    AxisTick()
                     AxisValueLabel {
                         if let date = value.as(Date.self) {
                             Text(date.formatted(.dateTime.day()))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -2997,100 +2981,740 @@ private struct CompositionChartView: View {
     }
 }
 
-private struct SummaryCard: View {
-    let title: String
-    let value: String
+// MARK: - Activity insight charts
+
+private struct DailyValuePoint: Identifiable {
+    var id: Date { date }
+    let date: Date
+    let value: Double
+}
+
+private struct WeekdayAveragePoint: Identifiable {
+    var id: Int { weekday }
+    let weekday: Int
+    let label: String
+    let averageTokens: Double
+}
+
+/// Shared hover plumbing for single-series daily line charts: tracks the
+/// pointer, resolves the nearest row by x position, and floats a tooltip.
+private protocol DailyLineChartRow {
+    var date: Date { get }
+    var value: Double { get }
+}
+
+extension DailyValuePoint: DailyLineChartRow {}
+
+private struct DailyLineChartHover<Row: DailyLineChartRow>: View {
+    let rows: [Row]
+    let proxy: ChartProxy
+    let geometry: GeometryProxy
+    let tooltip: (Row) -> ChartTooltipPanel
+
+    @State private var hoveredRow: Row?
+    @State private var hoveredPoint: CGPoint?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(value)
-                .font(.system(size: 26, weight: .semibold, design: .monospaced))
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-            Text(title.uppercased())
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+        ZStack(alignment: .topLeading) {
+            Rectangle()
+                .fill(.clear)
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let point):
+                        hoveredRow = row(at: point)
+                        hoveredPoint = hoveredRow == nil ? nil : point
+                    case .ended:
+                        hoveredRow = nil
+                        hoveredPoint = nil
+                    }
+                }
+
+            if let row = hoveredRow, let point = hoveredPoint {
+                tooltip(row)
+                    .position(dashboardTooltipPosition(for: point, in: geometry.size))
+                    .zIndex(1)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(18)
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
-        .drawingGroup()
+        .allowsHitTesting(true)
+        .animation(nil, value: hoveredRow?.date)
+    }
+
+    private func row(at point: CGPoint) -> Row? {
+        guard let plotFrame = proxy.plotFrame, !rows.isEmpty else { return nil }
+        let plotRect = geometry[plotFrame]
+        let x = point.x - plotRect.origin.x
+        guard let date: Date = proxy.value(atX: x) else { return nil }
+        return rows.min { left, right in
+            abs(left.date.timeIntervalSince(date)) < abs(right.date.timeIntervalSince(date))
+        }
     }
 }
 
-private struct ProviderMetadata {
-    let label: String
-    let abbreviation: String
-    let color: Color
-    let imageAssetName: String?
-    let preservesOriginalImageColor: Bool
+private struct CostTrendChartView: View {
+    let rows: [DailyValuePoint]
+    let formatCost: (Decimal) -> String
 
-    static func forModel(_ modelName: String) -> ProviderMetadata {
-        let model = modelName.lowercased()
-
-        if model.contains("deepseek") {
-            return ProviderMetadata(label: "DeepSeek", abbreviation: "DS", color: colorOcean.primary, imageAssetName: "deepseek-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("longcat") {
-            return ProviderMetadata(label: "LongCat", abbreviation: "LC", color: colorEmerald.light, imageAssetName: "longcat-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("kimi") || model.contains("moonshot") {
-            return ProviderMetadata(label: "Kimi", abbreviation: "KM", color: colorSlate.primary, imageAssetName: "kimi-mark")
-        }
-        if model.contains("minimax") {
-            return ProviderMetadata(label: "MiniMax", abbreviation: "MM", color: colorCoral.dark, imageAssetName: "minimax-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("mimo") || model.contains("xiaomi") {
-            return ProviderMetadata(label: "MiMo", abbreviation: "MO", color: colorAmber.dark, imageAssetName: "xiaomi-mi-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("claude") || model.contains("opus") || model.contains("sonnet") || model.contains("haiku") {
-            return ProviderMetadata(label: "Claude", abbreviation: "CL", color: colorRose.primary, imageAssetName: "anthropic-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("gpt") || model.contains("openai") || model.contains("chatgpt") || model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
-            return ProviderMetadata(label: "OpenAI", abbreviation: "AI", color: colorEmerald.primary, imageAssetName: "openai-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("glm") || model.contains("zai") || model.contains("z.ai") {
-            return ProviderMetadata(label: "GLM", abbreviation: "GL", color: colorOcean.light, imageAssetName: "zai-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("gemini") || model.contains("google") {
-            return ProviderMetadata(label: "Gemini", abbreviation: "GM", color: colorViolet.primary, imageAssetName: "gemini-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("composer-2.5") || model.contains("composer-2-5") {
-            return ProviderMetadata(label: "Cursor", abbreviation: "CR", color: colorSlate.primary, imageAssetName: "cursor-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("grok") || model.contains("xai") || model.contains("x.ai") || model.contains("x-ai") {
-            return ProviderMetadata(label: "Grok", abbreviation: "GK", color: colorSlate.dark, imageAssetName: "grok-mark")
-        }
-        if model.contains("stepfun") || model.contains("step-3") {
-            return ProviderMetadata(label: "StepFun", abbreviation: "ST", color: colorOcean.dark, imageAssetName: "stepfun-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("qwen") || model.contains("qwq") {
-            return ProviderMetadata(label: "Qwen", abbreviation: "QW", color: colorTeal.primary, imageAssetName: "qwen-mark", preservesOriginalImageColor: true)
-        }
-        if model.contains("mistral") || model.contains("mixtral") || model.contains("codestral") || model.contains("ministral") {
-            return ProviderMetadata(label: "Mistral", abbreviation: "MI", color: colorAmber.primary)
-        }
-        if model.contains("llama") || model.contains("meta") {
-            return ProviderMetadata(label: "Llama", abbreviation: "LL", color: colorViolet.primary)
-        }
-
-        let fallbackIndex = abs(modelName.lowercased().unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }) % allColorFamilies.count
-        let color = allColorFamilies[fallbackIndex].primary
-        let abbreviation = String(modelName.prefix(2)).uppercased()
-        return ProviderMetadata(label: "Model", abbreviation: abbreviation, color: color)
+    private var averageCost: Double {
+        guard !rows.isEmpty else { return 0 }
+        return rows.reduce(0.0) { $0 + $1.value } / Double(rows.count)
     }
 
-    init(label: String, abbreviation: String, color: Color, imageAssetName: String? = nil, preservesOriginalImageColor: Bool = false) {
-        self.label = label
-        self.abbreviation = abbreviation
-        self.color = color
-        self.imageAssetName = imageAssetName
-        self.preservesOriginalImageColor = preservesOriginalImageColor
+    private var peakRow: DailyValuePoint? {
+        rows.max { $0.value < $1.value }
+    }
+
+    var body: some View {
+        if rows.isEmpty {
+            ChartEmptyState(symbol: "chart.xyaxis.line", text: "No cost data in range")
+        } else {
+            Chart {
+                RuleMark(y: .value("Average", averageCost))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    .foregroundStyle(Color.secondary.opacity(0.55))
+
+                ForEach(rows) { row in
+                    AreaMark(
+                        x: .value("Date", row.date),
+                        y: .value("Cost", row.value)
+                    )
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [AppPalette.chartCost.opacity(0.22), AppPalette.chartCost.opacity(0.02)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+
+                    LineMark(
+                        x: .value("Date", row.date),
+                        y: .value("Cost", row.value)
+                    )
+                    .interpolationMethod(.catmullRom)
+                    .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .foregroundStyle(AppPalette.chartCost)
+                }
+
+                if let peak = peakRow, rows.count > 1 {
+                    PointMark(
+                        x: .value("Date", peak.date),
+                        y: .value("Cost", peak.value)
+                    )
+                    .symbolSize(24)
+                    .foregroundStyle(AppPalette.chartCost)
+                    .annotation(position: .top, spacing: 2) {
+                        Text(formatCost(Decimal(peak.value)))
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .chartLegend(.hidden)
+            .chartXAxis {
+                AxisMarks(preset: .aligned, values: .automatic(desiredCount: 6)) { _ in
+                    AxisValueLabel()
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .chartYAxis {
+                AxisMarks(preset: .aligned, values: .automatic(desiredCount: 4)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.3))
+                    AxisValueLabel {
+                        if let cost = value.as(Double.self) {
+                            Text("$\(cost.tokenAxisText)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    DailyLineChartHover(rows: rows, proxy: proxy, geometry: geometry) { row in
+                        ChartTooltipPanel(
+                            title: row.date.formatted(.dateTime.year().month().day()),
+                            rows: [ChartTooltipRow("Cost", formatCost(Decimal(row.value)), color: AppPalette.chartCost)]
+                        )
+                    }
+                }
+            }
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+        }
+    }
+}
+
+private struct CacheShareChartView: View {
+    let rows: [DailyValuePoint]
+
+    private var averageShare: Double {
+        guard !rows.isEmpty else { return 0 }
+        return rows.reduce(0.0) { $0 + $1.value } / Double(rows.count)
+    }
+
+    var body: some View {
+        if rows.isEmpty {
+            ChartEmptyState(symbol: "chart.xyaxis.line", text: "No cache data in range")
+        } else {
+            Chart {
+                RuleMark(y: .value("Average", averageShare * 100))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    .foregroundStyle(Color.secondary.opacity(0.55))
+
+                ForEach(rows) { row in
+                    AreaMark(
+                        x: .value("Date", row.date),
+                        y: .value("Cache", row.value * 100)
+                    )
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [AppPalette.chartCache.opacity(0.20), AppPalette.chartCache.opacity(0.02)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+
+                    LineMark(
+                        x: .value("Date", row.date),
+                        y: .value("Cache", row.value * 100)
+                    )
+                    .interpolationMethod(.catmullRom)
+                    .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .foregroundStyle(AppPalette.chartCache)
+                }
+            }
+            .chartLegend(.hidden)
+            .chartYScale(domain: 0...100)
+            .chartXAxis {
+                AxisMarks(preset: .aligned, values: .automatic(desiredCount: 6)) { _ in
+                    AxisValueLabel()
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .chartYAxis {
+                AxisMarks(values: [0, 25, 50, 75, 100]) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.3))
+                    AxisValueLabel {
+                        if let percent = value.as(Double.self) {
+                            Text("\(Int(percent))%")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    DailyLineChartHover(rows: rows, proxy: proxy, geometry: geometry) { row in
+                        ChartTooltipPanel(
+                            title: row.date.formatted(.dateTime.year().month().day()),
+                            rows: [
+                                ChartTooltipRow("Cache Share", (row.value).percentText, color: AppPalette.chartCache),
+                                ChartTooltipRow("Average", averageShare.percentText, emphasized: true),
+                            ]
+                        )
+                    }
+                }
+            }
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+        }
+    }
+}
+
+private struct WeekdayAverageChartView: View {
+    let rows: [WeekdayAveragePoint]
+
+    @State private var hoveredRow: WeekdayAveragePoint?
+    @State private var hoveredPoint: CGPoint?
+
+    private var peakRow: WeekdayAveragePoint? {
+        rows.max { $0.averageTokens < $1.averageTokens }
+    }
+
+    var body: some View {
+        if rows.allSatisfy({ $0.averageTokens <= 0 }) {
+            ChartEmptyState(symbol: "chart.bar.xaxis", text: "No usage in range")
+        } else {
+            Chart(rows) { row in
+                BarMark(
+                    x: .value("Weekday", row.label),
+                    y: .value("Avg Tokens", row.averageTokens)
+                )
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [AppPalette.chartWeekday, AppPalette.chartWeekday.opacity(0.6)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .cornerRadius(4)
+                .opacity(hoveredRow == nil || hoveredRow?.id == row.id ? 1 : 0.35)
+                .annotation(position: .top, spacing: 2) {
+                    if row.id == peakRow?.id {
+                        Text(row.averageTokens.tokenAxisText)
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .chartLegend(.hidden)
+            .chartXAxis {
+                AxisMarks { _ in
+                    AxisValueLabel()
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .chartYAxis {
+                AxisMarks(preset: .aligned, values: .automatic(desiredCount: 4)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.3))
+                    AxisValueLabel {
+                        if let tokens = value.as(Double.self) {
+                            Text(tokens.tokenAxisText)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    ZStack(alignment: .topLeading) {
+                        Rectangle()
+                            .fill(.clear)
+                            .contentShape(Rectangle())
+                            .onContinuousHover { phase in
+                                switch phase {
+                                case .active(let point):
+                                    hoveredRow = row(at: point, proxy: proxy, geometry: geometry)
+                                    hoveredPoint = hoveredRow == nil ? nil : point
+                                case .ended:
+                                    hoveredRow = nil
+                                    hoveredPoint = nil
+                                }
+                            }
+
+                        if let row = hoveredRow, let point = hoveredPoint {
+                            ChartTooltipPanel(
+                                title: row.label,
+                                rows: [ChartTooltipRow("Avg Tokens", Int(row.averageTokens.rounded()).fullTokenText, color: AppPalette.chartWeekday)]
+                            )
+                            .position(dashboardTooltipPosition(for: point, in: geometry.size))
+                            .zIndex(1)
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .animation(nil, value: hoveredRow?.id)
+                }
+            }
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+        }
+    }
+
+    private func row(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> WeekdayAveragePoint? {
+        guard let plotFrame = proxy.plotFrame else { return nil }
+        let plotRect = geometry[plotFrame]
+        let x = point.x - plotRect.origin.x
+        guard let label: String = proxy.value(atX: x) else { return nil }
+        return rows.first { $0.label == label }
+    }
+}
+
+private struct ChartEmptyState: View {
+    let symbol: String
+    let text: String
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct HourlyUsagePoint: Identifiable {
+    var id: String { "\(hour)-\(series)" }
+    let hour: Int
+    let series: String
+    let tokens: Int
+}
+
+private struct HourlyStackSegment: Identifiable {
+    var id: String { "\(hour)-\(series)" }
+    let hour: Int
+    let series: String
+    let yStart: Double
+    let yEnd: Double
+    var isTop: Bool = false
+}
+
+/// 24h timeline: wide equal-slot histogram (Monthly axis styling) + brief event rail.
+/// Daily Brief kanban lives only on the Brief page.
+private struct TodayHourlyTimelineView: View {
+    let points: [HourlyUsagePoint]
+    let briefHours: [HourlyBriefItem]
+    let colorDomain: [String]
+    let colorRange: [Color]
+    let showsNowIndicator: Bool
+
+    @State private var hoveredHour: Int?
+    @State private var hoveredPoint: CGPoint?
+
+    private var hourlyTotals: [Int] {
+        var totals = Array(repeating: 0, count: 24)
+        for point in points where (0...23).contains(point.hour) {
+            totals[point.hour] += point.tokens
+        }
+        return totals
+    }
+
+    private var yUpperBound: Double {
+        let peak = hourlyTotals.max() ?? 0
+        return max(Double(peak) * 1.12, 1)
+    }
+
+    private var nowHourPosition: Double {
+        let components = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let hour = Double(components.hour ?? 0)
+        let minute = Double(components.minute ?? 0)
+        return min(hour + minute / 60.0, 23.999)
+    }
+
+    private var currentHour: Int {
+        Calendar.current.component(.hour, from: Date())
+    }
+
+    /// Half-gap on each side of an hour slot (unit = 1 hour). 0.14 → ~72% bar width.
+    private static let hourBarInset = 0.14
+
+    /// Pre-stacked segments so RectangleMark can draw wide bars with gaps.
+    /// NOTE: do not use BarMark(width: .ratio) on a custom continuous x scale —
+    /// it resolves to zero-width marks and every bar disappears.
+    private var stackedSegments: [HourlyStackSegment] {
+        var segments: [HourlyStackSegment] = []
+        var baseByHour = Array(repeating: 0.0, count: 24)
+        let ordered = points
+            .filter { (0...23).contains($0.hour) && $0.tokens > 0 }
+            .sorted {
+                if $0.hour != $1.hour { return $0.hour < $1.hour }
+                return $0.series < $1.series
+            }
+        for point in ordered {
+            let base = baseByHour[point.hour]
+            let top = base + Double(point.tokens)
+            segments.append(
+                HourlyStackSegment(
+                    hour: point.hour,
+                    series: point.series,
+                    yStart: base,
+                    yEnd: top
+                )
+            )
+            baseByHour[point.hour] = top
+        }
+        // Segments are appended hour-by-hour, so the last segment of each hour
+        // is the stack's top; only that one gets rounded corners.
+        var lastIndexByHour: [Int: Int] = [:]
+        for (index, segment) in segments.enumerated() {
+            lastIndexByHour[segment.hour] = index
+        }
+        for (index, segment) in segments.enumerated() where lastIndexByHour[segment.hour] == index {
+            segments[index].isTop = true
+        }
+        return segments
+    }
+
+    private var briefByHour: [Int: HourlyBriefItem] {
+        Dictionary(uniqueKeysWithValues: briefHours.map { ($0.hour, $0) })
+    }
+
+    private var timelineEventHours: [Int] {
+        var hours = Set(points.filter { $0.tokens > 0 }.map(\.hour))
+        hours.formUnion(briefHours.map(\.hour))
+        return hours.filter { (0...23).contains($0) }.sorted()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            usageStrip
+                .frame(height: dailyUsagePlotHeight)
+
+            if !timelineEventHours.isEmpty {
+                eventRail
+            }
+        }
+    }
+
+    private var usageStrip: some View {
+        Chart {
+            ForEach(stackedSegments) { segment in
+                // Inset x range creates gaps between hours; clipShape rounds only
+                // the top of each stack (BarMark width:.ratio on a continuous
+                // scale draws zero-size marks).
+                RectangleMark(
+                    xStart: .value("Start", Double(segment.hour) + Self.hourBarInset),
+                    xEnd: .value("End", Double(segment.hour) + 1.0 - Self.hourBarInset),
+                    yStart: .value("Base", segment.yStart),
+                    yEnd: .value("Top", segment.yEnd)
+                )
+                .foregroundStyle(by: .value("CLI", segment.series))
+                .clipShape(
+                    UnevenRoundedRectangle(
+                        topLeadingRadius: segment.isTop ? 3 : 0,
+                        bottomLeadingRadius: 0,
+                        bottomTrailingRadius: 0,
+                        topTrailingRadius: segment.isTop ? 3 : 0,
+                        style: .continuous
+                    )
+                )
+                .opacity(hoveredHour == nil || hoveredHour == segment.hour ? 1 : 0.35)
+            }
+
+            if showsNowIndicator {
+                RuleMark(x: .value("Now", nowHourPosition))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(Color.secondary.opacity(0.55))
+                    .annotation(position: .top, alignment: .center, spacing: 1) {
+                        Text("Now")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+            }
+        }
+        .chartForegroundStyleScale(domain: colorDomain, range: colorRange)
+        .chartLegend(.hidden)
+        .chartXScale(domain: 0.0...24.0)
+        .chartYScale(domain: 0...yUpperBound)
+        .chartXAxis {
+            AxisMarks(values: [0.0, 6.0, 12.0, 18.0]) { value in
+                AxisValueLabel(anchor: .top) {
+                    if let hour = value.as(Double.self) {
+                        Text(Self.hourLabel(Int(hour.rounded(.towardZero))))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .chartYAxis {
+            AxisMarks { value in
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                    .foregroundStyle(Color(nsColor: .separatorColor).opacity(0.35))
+                AxisValueLabel {
+                    if let tokens = value.as(Double.self) {
+                        Text(tokens.tokenAxisText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                ZStack(alignment: .topLeading) {
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let point):
+                                hoveredHour = hour(at: point, proxy: proxy, geometry: geometry)
+                                hoveredPoint = hoveredHour == nil ? nil : point
+                            case .ended:
+                                hoveredHour = nil
+                                hoveredPoint = nil
+                            }
+                        }
+
+                    if let hour = hoveredHour, let point = hoveredPoint {
+                        ChartTooltipPanel(
+                            title: Self.hourLabel(hour),
+                            rows: tooltipRows(for: hour)
+                        )
+                        .position(dashboardTooltipPosition(for: point, in: geometry.size))
+                        .zIndex(1)
+                        .allowsHitTesting(false)
+                    }
+                }
+                .animation(nil, value: hoveredHour)
+            }
+        }
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+
+    private var eventRail: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(timelineEventHours, id: \.self) { hour in
+                timelineEventRow(hour: hour)
+            }
+        }
+    }
+
+    private func timelineEventRow(hour: Int) -> some View {
+        let total = hourlyTotals[hour]
+        let brief = briefByHour[hour]
+        let isNow = showsNowIndicator && hour == currentHour
+        let isHovered = hoveredHour == hour
+
+        return HStack(alignment: .top, spacing: 0) {
+            HStack(alignment: .top, spacing: 10) {
+                Text(Self.hourLabel(hour))
+                    .font(.system(.caption, design: .monospaced).weight(isNow ? .semibold : .regular))
+                    .foregroundStyle(isNow ? Color.primary : Color.secondary)
+                    .frame(width: 44, alignment: .trailing)
+                    .padding(.top, 2)
+
+                VStack(spacing: 0) {
+                    Circle()
+                        .fill(isNow ? Color.accentColor : Color.secondary.opacity(0.45))
+                        .frame(width: 8, height: 8)
+                        .padding(.top, 5)
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.18))
+                        .frame(width: 1)
+                        .frame(maxHeight: .infinity)
+                }
+                .frame(width: 8)
+            }
+            .frame(width: 70, alignment: .topTrailing)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if let brief {
+                        Text(brief.headline)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Activity")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if total > 0 {
+                        Text(total.tokenText)
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if total > 0 {
+                    seriesChipRow(for: hour)
+                }
+
+                if let brief, brief.sessionCount > 0 {
+                    Text("\(brief.sessionCount) sessions")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.leading, 12)
+            .padding(.vertical, 8)
+            .padding(.trailing, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovered || isNow ? Color.primary.opacity(0.04) : Color.clear)
+            )
+        }
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
+        .onHover { inside in
+            hoveredHour = inside ? hour : (hoveredHour == hour ? nil : hoveredHour)
+        }
+    }
+
+    private func seriesChipRow(for hour: Int) -> some View {
+        let series = points
+            .filter { $0.hour == hour && $0.tokens > 0 }
+            .sorted { $0.tokens > $1.tokens }
+        return HStack(spacing: 6) {
+            ForEach(series.prefix(5), id: \.id) { point in
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(seriesColor(for: point.series))
+                        .frame(width: 6, height: 6)
+                    Text(point.series)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.primary.opacity(0.04), in: Capsule())
+            }
+            if series.count > 5 {
+                Text("+\(series.count - 5)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func hour(at point: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> Int? {
+        guard let plotFrame = proxy.plotFrame else { return nil }
+        let plotRect = geometry[plotFrame]
+        let x = point.x - plotRect.origin.x
+        guard let value: Double = proxy.value(atX: x) else { return nil }
+        let hour = Int(value.rounded(.down))
+        return (0...23).contains(hour) ? hour : nil
+    }
+
+    private func seriesColor(for series: String) -> Color {
+        guard let index = colorDomain.firstIndex(of: series), index < colorRange.count else {
+            return .blue
+        }
+        return colorRange[index]
+    }
+
+    private func tooltipRows(for hour: Int) -> [ChartTooltipRow] {
+        let rows = points
+            .filter { $0.hour == hour && $0.tokens > 0 }
+            .sorted { $0.tokens > $1.tokens }
+        let total = rows.reduce(0) { $0 + $1.tokens }
+        var tooltip = rows.prefix(4).map { row in
+            ChartTooltipRow(row.series, row.tokens.tokenText, color: seriesColor(for: row.series))
+        }
+        if rows.count > 4 {
+            let others = rows.dropFirst(4).reduce(0) { $0 + $1.tokens }
+            tooltip.append(ChartTooltipRow("Others", others.tokenText))
+        }
+        if let brief = briefByHour[hour] {
+            tooltip.append(ChartTooltipRow(brief.headline, "", emphasized: false))
+        }
+        tooltip.append(ChartTooltipRow("Total", total.tokenText, emphasized: true))
+        return tooltip
+    }
+
+    static func hourLabel(_ hour: Int) -> String {
+        switch hour {
+        case 0: "12AM"
+        case 12: "12PM"
+        case 1...11: "\(hour)AM"
+        default: "\(hour - 12)PM"
+        }
     }
 }
 
@@ -3183,7 +3807,7 @@ private struct TokenUsageSourceLabel: View {
     }
 }
 
-private struct BundledIconImage: View {
+struct BundledIconImage: View {
     let imageAssetName: String
     var tint: Color? = nil
     var padding: CGFloat = 0
@@ -3261,150 +3885,11 @@ private enum IconImageLoader {
     }
 }
 
-private struct ModelListLabel: View {
-    let models: [String]
-
-    private var modelsText: String {
-        models.map(displayModelName).joined(separator: ", ")
-    }
-
-    var body: some View {
-        if let firstModel = models.first {
-            HStack(spacing: 7) {
-                ProviderIconBadge(modelName: firstModel)
-                Text(modelsText)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(modelsText)
-            }
-        } else {
-            Text("-")
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
-private struct TodayTokenHeroView: View {
-    let totalTokens: Int
-    let modelCount: Int
-    let isRefreshing: Bool
-
-    @State private var displayedValue = 0
-    @State private var hasAppeared = false
-    @State private var wasRefreshing = false
-    @State private var animationTask: Task<Void, Never>?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("TODAY'S TOKENS")
-                .font(.caption.weight(.semibold))
-                .tracking(1.2)
-                .foregroundStyle(.secondary)
-
-            Text(displayedValue.fullTokenText)
-                .font(.system(size: 44, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [
-                            Color(nsColor: .labelColor),
-                            Color.accentColor.opacity(0.85),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .lineLimit(1)
-                .minimumScaleFactor(0.45)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentTransition(.numericText())
-
-            Text("\(modelCount) models")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, minHeight: 86, alignment: .leading)
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color.accentColor.opacity(0.10),
-                    Color(nsColor: .controlBackgroundColor).opacity(0.55),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.accentColor.opacity(0.22), lineWidth: 1)
-        )
-        .onAppear {
-            wasRefreshing = isRefreshing
-            guard !hasAppeared else { return }
-            hasAppeared = true
-            if !isRefreshing {
-                animate(to: totalTokens, fromZero: true)
-            }
-        }
-        .onChange(of: totalTokens) { _, newValue in
-            guard !isRefreshing else { return }
-            animate(to: newValue, fromZero: false)
-        }
-        .onChange(of: isRefreshing) { _, refreshing in
-            if wasRefreshing && !refreshing {
-                animate(to: totalTokens, fromZero: true)
-            }
-            wasRefreshing = refreshing
-        }
-        .onDisappear {
-            animationTask?.cancel()
-            animationTask = nil
-        }
-    }
-
-    private func animate(to target: Int, fromZero: Bool) {
-        animationTask?.cancel()
-
-        let end = max(target, 0)
-        let start = fromZero ? 0 : displayedValue
-        guard start != end else {
-            displayedValue = end
-            return
-        }
-
-        animationTask = Task { @MainActor in
-            let duration = 0.85
-            let startedAt = Date()
-            displayedValue = start
-
-            while !Task.isCancelled {
-                let progress = min(Date().timeIntervalSince(startedAt) / duration, 1)
-                let eased = 1 - pow(1 - progress, 3)
-                let next = start + Int((Double(end - start) * eased).rounded())
-                if next != displayedValue {
-                    withAnimation(.linear(duration: 0.05)) {
-                        displayedValue = next
-                    }
-                }
-                if progress >= 1 {
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 16_000_000)
-            }
-
-            if !Task.isCancelled {
-                displayedValue = end
-            }
-        }
-    }
-}
-
 private struct DashboardHeroView: View {
+    let periodLabel: String
     let totalTokens: Int
     let costText: String
+    let subtitle: String
     let isRefreshing: Bool
 
     @State private var displayedValue = 0
@@ -3413,56 +3898,31 @@ private struct DashboardHeroView: View {
     @State private var animationTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(alignment: .center, spacing: 10) {
-            Text("TOTAL TOKENS")
-                .font(.caption.weight(.semibold))
-                .tracking(1.2)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(periodLabel.uppercased())
+                .font(.callout.weight(.semibold))
+                .tracking(0.8)
                 .foregroundStyle(.secondary)
 
             Text(displayedValue.fullTokenText)
-                .font(.system(size: 48, weight: .bold, design: .rounded))
+                .font(.system(size: 40, weight: .bold, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [
-                            Color(nsColor: .labelColor),
-                            Color.accentColor.opacity(0.85),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
                 .lineLimit(1)
-                .minimumScaleFactor(0.4)
-                .frame(maxWidth: .infinity)
+                .minimumScaleFactor(0.45)
                 .contentTransition(.numericText())
-                .multilineTextAlignment(.center)
 
-            Text(costText)
-                .font(.system(size: 20, weight: .semibold, design: .rounded))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-                .multilineTextAlignment(.center)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(costText)
+                    .font(.system(.title3, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-        .padding(.horizontal, 22)
-        .padding(.vertical, 20)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color.accentColor.opacity(0.10),
-                    Color(nsColor: .controlBackgroundColor).opacity(0.55),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.accentColor.opacity(0.22), lineWidth: 1)
-        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
         .onAppear {
             wasRefreshing = isRefreshing
             guard !hasAppeared else { return }
@@ -3676,8 +4136,8 @@ private struct DashboardHeatmapView: View {
                     ChartTooltipPanel(
                         title: hoveredDay.date.formatted(.dateTime.year().month().day()),
                         rows: [
-                            (label: "Tokens", value: hoveredDay.tokens.fullTokenText),
-                            (label: "Cost", value: costText(hoveredDay.cost))
+                            ChartTooltipRow("Tokens", hoveredDay.tokens.fullTokenText),
+                            ChartTooltipRow("Cost", costText(hoveredDay.cost), emphasized: true)
                         ]
                     )
                     .padding(4)
@@ -3773,8 +4233,8 @@ private struct DashboardHeatmapView: View {
 
     private func color(for tokens: Int) -> Color {
         guard tokens > 0, maxTokens > 0 else {
-            // Zero-token days: use a visible light gray that contrasts with the card background
-            return Color(nsColor: .separatorColor).opacity(0.35)
+            // Zero-token days: a faint neutral cell that recedes into the card.
+            return Color(nsColor: .separatorColor).opacity(0.18)
         }
         let ratio = Double(tokens) / Double(maxTokens)
         let intensity = 0.25 + 0.75 * pow(ratio, 0.5)
@@ -3792,19 +4252,20 @@ private struct TodayMetricCard: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: systemImage)
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(tint)
                 .frame(width: 28, height: 28)
-                .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text(value)
-                    .font(.system(size: 21, weight: .semibold, design: .monospaced))
+                    .font(.system(.title2, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                Text(title.uppercased())
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -3812,14 +4273,9 @@ private struct TodayMetricCard: View {
                     .minimumScaleFactor(0.8)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
         .padding(14)
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .appCard()
         .drawingGroup()
     }
 }
@@ -3852,13 +4308,13 @@ private struct TodaySourceRowView: View {
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Capsule()
-                        .fill(Color(nsColor: .controlBackgroundColor))
+                        .fill(Color(nsColor: .separatorColor).opacity(0.25))
                     Capsule()
                         .fill(row.source.tintColor)
                         .frame(width: max(geometry.size.width * fillWidthRatio, row.totalTokens > 0 ? 3 : 0))
                 }
             }
-            .frame(height: 8)
+            .frame(height: 6)
 
             HStack(spacing: 12) {
                 Label(row.cacheReadTokens.tokenText, systemImage: "externaldrive")
@@ -3869,9 +4325,8 @@ private struct TodaySourceRowView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, 2)
+        .padding(.vertical, 6)
     }
 }
 
@@ -3893,7 +4348,7 @@ private struct TokenMixDistributionChart: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            HStack(alignment: .center, spacing: 22) {
+            HStack(alignment: .center, spacing: 32) {
                 ZStack {
                     TokenMixSectorChart(rows: rows)
                         .zIndex(1)
@@ -3930,10 +4385,10 @@ private struct TokenMixSectorChart: View {
         Chart(rows) { row in
             SectorMark(
                 angle: .value("Tokens", row.tokens),
-                innerRadius: .ratio(0.58),
-                angularInset: 1.5
+                innerRadius: .ratio(0.62),
+                angularInset: 1.6
             )
-            .cornerRadius(4)
+            .cornerRadius(6)
             .foregroundStyle(row.color)
             .opacity(hoveredRow == nil || hoveredRow?.id == row.id ? 1 : 0.55)
         }
@@ -3960,8 +4415,8 @@ private struct TokenMixSectorChart: View {
                         ChartTooltipPanel(
                             title: displayModelName(row.modelName),
                             rows: [
-                                ("Tokens", row.tokens.tokenText),
-                                ("Share", row.percentText),
+                                ChartTooltipRow("Tokens", row.tokens.tokenText, color: row.color),
+                                ChartTooltipRow("Share", row.percentText, emphasized: true),
                             ]
                         )
                         .position(tooltipPosition(for: point, in: geometry.size))
@@ -3990,7 +4445,7 @@ private struct TokenMixSectorChart: View {
         let vectorY = point.y - plotRect.midY
         let radius = hypot(vectorX, vectorY)
         let outerRadius = min(plotRect.width, plotRect.height) / 2
-        let innerRadius = outerRadius * 0.58
+        let innerRadius = outerRadius * 0.62
         guard radius >= innerRadius, radius <= outerRadius else {
             return nil
         }
@@ -4113,10 +4568,8 @@ private struct TodayModelRowView: View {
                 .frame(width: 86, alignment: .trailing)
         }
         .font(.caption)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 2)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
 
@@ -4148,12 +4601,7 @@ private struct ChartCard<Content: View, TitleAccessory: View>: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .appCard()
     }
 }
 
@@ -4167,53 +4615,33 @@ private extension ChartCard where TitleAccessory == EmptyView {
     }
 }
 
-private struct BackendLogViewerPanel: View {
+private struct BackendLogsView: View {
     let lines: [String]
     let onClear: () -> Void
-    let onClose: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                Label("Backend Logs", systemImage: "terminal")
-                    .font(.headline)
+                Text("\(lines.count) lines")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
 
                 Spacer()
-
-                Text("\(lines.count) lines")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
 
                 Button("Clear") {
                     onClear()
                 }
-                .controlSize(.small)
                 .disabled(lines.isEmpty)
-
-                Button {
-                    onClose()
-                } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .help("Close logs")
+                .help("Clear backend logs")
             }
 
-            Divider()
-
             if lines.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 28))
-                        .foregroundStyle(.secondary)
-                    Text("No backend logs yet.")
-                        .font(.subheadline.weight(.medium))
+                ContentUnavailableView {
+                    Label("No Backend Logs", systemImage: "terminal")
+                } description: {
                     Text("Refresh or change dashboard data to generate backend activity.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, minHeight: 280)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: true) {
@@ -4221,7 +4649,7 @@ private struct BackendLogViewerPanel: View {
                             ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
                                 Text(line)
                                     .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(line.contains("[stderr]") ? colorRose.primary : .primary)
+                                    .foregroundStyle(line.contains("[stderr]") ? AppPalette.semanticError : .primary)
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .id(index)
@@ -4229,11 +4657,13 @@ private struct BackendLogViewerPanel: View {
                         }
                         .padding(10)
                     }
-                    .background(Color(nsColor: .textBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .background(
+                        Color(nsColor: .textBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
+                    )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
+                            .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
                     )
                     .onAppear {
                         scrollToBottom(proxy)
@@ -4242,19 +4672,10 @@ private struct BackendLogViewerPanel: View {
                         scrollToBottom(proxy)
                     }
                 }
-                .frame(minHeight: 360)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .padding(16)
-        .frame(width: 760, height: 520, alignment: .topLeading)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(0.18), radius: 18, y: 10)
-        .onTapGesture {}
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -4268,25 +4689,49 @@ private struct BackendLogViewerPanel: View {
     }
 }
 
+/// A single key/value line in a chart hover panel. `color` draws a small
+/// series dot in front of the label; `emphasized` renders the value in the
+/// primary style (used for totals).
+private struct ChartTooltipRow {
+    let label: String
+    let value: String
+    var color: Color? = nil
+    var emphasized: Bool = false
+
+    init(_ label: String, _ value: String, color: Color? = nil, emphasized: Bool = false) {
+        self.label = label
+        self.value = value
+        self.color = color
+        self.emphasized = emphasized
+    }
+}
+
 private struct ChartTooltipPanel: View {
     let title: String
-    let rows: [(label: String, value: String)]
+    let rows: [ChartTooltipRow]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .padding(.bottom, 1)
 
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    if let color = row.color {
+                        Circle()
+                            .fill(color)
+                            .frame(width: 6, height: 6)
+                    }
                     Text(row.label)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(row.emphasized ? Color.primary : Color.secondary)
                         .lineLimit(1)
                     Spacer(minLength: 12)
                     Text(row.value)
                         .font(.system(.caption, design: .monospaced))
+                        .fontWeight(row.emphasized ? .semibold : .regular)
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.85)
@@ -4298,13 +4743,7 @@ private struct ChartTooltipPanel: View {
         .padding(.vertical, 8)
         .frame(width: chartTooltipWidth, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(0.12), radius: 8, y: 4)
+        .appFloatingOverlaySurface(cornerRadius: 10)
         .allowsHitTesting(false)
     }
 }
@@ -4482,7 +4921,7 @@ private struct ModelCostDistributionChart: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            HStack(alignment: .center, spacing: 22) {
+            HStack(alignment: .center, spacing: 32) {
                 ZStack {
                     ModelCostSectorChart(slices: slices, formatCost: { currencyController.string(fromUSD: $0) })
                         .zIndex(1)
@@ -4523,10 +4962,10 @@ private struct ModelCostSectorChart: View {
         Chart(slices) { slice in
             SectorMark(
                 angle: .value("Cost", slice.cost.doubleValue),
-                innerRadius: .ratio(0.58),
-                angularInset: 1.5
+                innerRadius: .ratio(0.62),
+                angularInset: 1.6
             )
-            .cornerRadius(4)
+            .cornerRadius(6)
             .foregroundStyle(slice.color)
             .opacity(hoveredSlice == nil || hoveredSlice?.id == slice.id ? 1 : 0.55)
         }
@@ -4553,8 +4992,8 @@ private struct ModelCostSectorChart: View {
                         ChartTooltipPanel(
                             title: displayModelName(slice.model),
                             rows: [
-                                ("Cost", formatCost(slice.cost)),
-                                ("Share", slice.percentText),
+                                ChartTooltipRow("Cost", formatCost(slice.cost), color: slice.color),
+                                ChartTooltipRow("Share", slice.percentText, emphasized: true),
                             ]
                         )
                         .position(tooltipPosition(for: point, in: geometry.size))
@@ -4583,7 +5022,7 @@ private struct ModelCostSectorChart: View {
         let vectorY = point.y - plotRect.midY
         let radius = hypot(vectorX, vectorY)
         let outerRadius = min(plotRect.width, plotRect.height) / 2
-        let innerRadius = outerRadius * 0.58
+        let innerRadius = outerRadius * 0.62
         guard radius >= innerRadius, radius <= outerRadius else {
             return nil
         }
@@ -4870,6 +5309,7 @@ private extension Int {
 
 private extension Double {
     var tokenAxisText: String {
+        if self >= 1_000_000_000 { return String(format: "%.1fB", self / 1_000_000_000) }
         if self >= 1_000_000 { return String(format: "%.1fM", self / 1_000_000) }
         if self >= 1_000 { return String(format: "%.1fK", self / 1_000) }
         return String(Int(self.rounded()))
@@ -4969,6 +5409,7 @@ extension TokenUsageSource {
         case .cherry: .cherry
         case .claudeScience: .claudeScience
         case .zcode: .zcode
+        case .kimi: .kimi
         }
     }
 
@@ -4990,6 +5431,7 @@ extension TokenUsageSource {
         case .cherry: "leaf"
         case .claudeScience: "flask"
         case .zcode: "bolt.horizontal.circle"
+        case .kimi: "moon.stars.fill"
         }
     }
 
@@ -5007,6 +5449,7 @@ extension TokenUsageSource {
         case .cherry: "cherrystudio-mark"
         case .claudeScience: "anthropic-mark"
         case .zcode: "zai-mark"
+        case .kimi: "kimi-mark"
         }
     }
 
@@ -5042,6 +5485,7 @@ extension UsageSource {
         case .cherry: "leaf"
         case .claudeScience: "flask"
         case .zcode: "bolt.horizontal.circle"
+        case .kimi: "moon.stars.fill"
         }
     }
 
@@ -5058,6 +5502,7 @@ extension UsageSource {
         case .cherry: "cherrystudio-mark"
         case .claudeScience: "anthropic-mark"
         case .zcode: "zai-mark"
+        case .kimi: "kimi-mark"
         }
     }
 
@@ -5086,7 +5531,11 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     @Published var selectedModels: Set<String> = []
     @Published private(set) var records: [TokenUsageRecord]
     @Published private(set) var todaySummary: TodaySummaryResponse
+    @Published private(set) var todayHourly: HourlyUsageResponse?
+    @Published private(set) var todayBrief: TodayBriefResponse?
     @Published private(set) var isLoading = false
+    @Published private(set) var isGeneratingBrief = false
+    @Published private(set) var briefErrorMessage: String?
     @Published private(set) var isBackendConnected = true
 
     init(
@@ -5099,6 +5548,58 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
         self.records = records ?? Self.makePreviewRecords(startDate: startDate)
         self.todaySummary = Self.makePreviewTodaySummary(
             records: records ?? Self.makePreviewRecords(startDate: Calendar.current.startOfDay(for: Date()))
+        )
+        self.todayHourly = Self.makePreviewHourly()
+        self.todayBrief = Self.makePreviewBrief()
+    }
+
+    private static func makePreviewHourly() -> HourlyUsageResponse {
+        let sources: [UsageSource] = [.claude, .codex, .opencode]
+        let baseByHour: [Int: Int] = [
+            8: 2_000_000, 9: 6_500_000, 10: 11_000_000, 11: 8_000_000,
+            12: 3_500_000, 13: 5_000_000, 14: 12_500_000, 15: 9_000_000,
+            16: 7_500_000, 17: 4_000_000, 18: 1_500_000,
+        ]
+        let hours = baseByHour.flatMap { hour, base in
+            sources.enumerated().map { index, source in
+                let total = base / (index + 2)
+                let input = total / 5
+                let output = total / 20
+                let cacheRead = total - input - output
+                return HourlyUsageRow(
+                    hour: hour,
+                    source: source,
+                    inputTokens: input,
+                    outputTokens: output,
+                    cacheCreationTokens: 0,
+                    cacheReadTokens: cacheRead,
+                    totalTokens: total,
+                    totalCost: Double(total) / 1_000_000 * 3.2
+                )
+            }
+        }
+        return HourlyUsageResponse(date: todayFormatter.string(from: Date()), hours: hours)
+    }
+
+    private static func makePreviewBrief() -> TodayBriefResponse {
+        TodayBriefResponse(
+            date: todayFormatter.string(from: Date()),
+            status: "ok",
+            generatedAt: "",
+            trigger: "preview",
+            model: BriefModelInfo(baseUrl: "", modelId: "preview"),
+            enabledSources: ["claude", "codex"],
+            contentFingerprint: "preview",
+            summary: "3 个项目：claude·token-usage；codex·backend；kimi·token-usage",
+            cards: nil,
+            sections: nil,
+            error: nil,
+            hours: [
+                HourlyBriefItem(hour: 9, headline: "晨间集中重构认证模块", sessionCount: 3, tokens: 6_500_000),
+                HourlyBriefItem(hour: 10, headline: "API 集成与联调", sessionCount: 2, tokens: 11_000_000),
+                HourlyBriefItem(hour: 14, headline: "修复 token 统计的边界问题", sessionCount: 4, tokens: 12_500_000),
+                HourlyBriefItem(hour: 16, headline: "Daily Brief 卡片联调", sessionCount: 2, tokens: 7_500_000),
+            ]
         )
     }
 
@@ -5119,6 +5620,10 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     func refreshToday(force: Bool) async {
         await refreshToday()
     }
+
+    func refreshTodayBrief() async {}
+
+    func generateTodayBrief(force: Bool, trigger: String) async {}
 
     func updateDateRangeForViewMode() {
         // Mock: no-op
@@ -5260,7 +5765,8 @@ struct TokenUsageDashboardView_Previews: PreviewProvider {
     static var previews: some View {
         TokenUsageDashboardView(
             store: TokenUsageDashboardMockStore(),
-            currencyController: TokenUsageBillingCurrencyController()
+            currencyController: TokenUsageBillingCurrencyController(),
+            preferences: TokenUsagePreferencesController()
         )
     }
 }

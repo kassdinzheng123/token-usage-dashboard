@@ -12,6 +12,7 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
     case cherry
     case claudeScience = "claude-science"
     case zcode
+    case kimi
 
     var id: String { rawValue }
 
@@ -39,6 +40,8 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
             "Claude Science"
         case .zcode:
             "ZCode"
+        case .kimi:
+            "Kimi"
         }
     }
 }
@@ -106,6 +109,31 @@ struct TodaySummaryResponse: Codable, Hashable {
         sourceRows: [],
         modelRows: []
     )
+
+    func filtered(byEnabledSources enabledSources: Set<TokenUsageSource>) -> TodaySummaryResponse {
+        let enabledRaw = Set(enabledSources.map(\.rawValue))
+        let sourceRows = self.sourceRows.filter { enabledRaw.contains($0.source.rawValue) }
+        let modelRows = self.modelRows.filter { enabledRaw.contains($0.source.rawValue) }
+        let inputTokens = sourceRows.reduce(0) { $0 + $1.inputTokens }
+        let outputTokens = sourceRows.reduce(0) { $0 + $1.outputTokens }
+        let cacheCreationTokens = sourceRows.reduce(0) { $0 + $1.cacheCreationTokens }
+        let cacheReadTokens = sourceRows.reduce(0) { $0 + $1.cacheReadTokens }
+        let totalTokens = sourceRows.reduce(0) { $0 + $1.totalTokens }
+        let totalCost = sourceRows.reduce(0.0) { $0 + $1.totalCost }
+        return TodaySummaryResponse(
+            date: date,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheCreationTokens: cacheCreationTokens,
+            cacheReadTokens: cacheReadTokens,
+            totalTokens: totalTokens,
+            totalCost: totalCost,
+            activeSourceCount: sourceRows.count,
+            modelCount: Set(modelRows.map(\.modelName)).count,
+            sourceRows: sourceRows,
+            modelRows: modelRows
+        )
+    }
 }
 
 struct TodaySourceUsageRow: Codable, Hashable {
@@ -128,6 +156,114 @@ struct TodayModelUsageRow: Codable, Hashable {
     var cacheReadTokens: Int
     var totalTokens: Int
     var totalCost: Double
+}
+
+struct HourlyUsageRow: Codable, Hashable {
+    var hour: Int
+    var source: UsageSource
+    var inputTokens: Int
+    var outputTokens: Int
+    var cacheCreationTokens: Int
+    var cacheReadTokens: Int
+    var totalTokens: Int
+    var totalCost: Double
+}
+
+struct HourlyUsageResponse: Codable, Hashable {
+    var date: String
+    var hours: [HourlyUsageRow]
+}
+
+struct BriefModelInfo: Codable, Hashable {
+    var baseUrl: String
+    var modelId: String
+}
+
+struct TodayBriefCardItem: Codable, Hashable, Identifiable {
+    var id: String
+    var source: String
+    var project: String
+    var headline: String
+    var bullets: [String]
+    var sessionCount: Int
+    var coverage: String
+}
+
+struct TodayBriefSection: Codable, Hashable, Identifiable {
+    var source: String
+    var headline: String
+    var bullets: [String]
+    var sessionCount: Int
+    var coverage: String
+
+    var id: String { "\(source)-\(headline)" }
+}
+
+struct HourlyBriefItem: Codable, Hashable, Identifiable {
+    var hour: Int
+    var headline: String
+    var sessionCount: Int
+    var tokens: Int
+
+    var id: Int { hour }
+}
+
+struct TodayBriefResponse: Codable, Hashable {
+    var date: String
+    var status: String
+    var generatedAt: String
+    var trigger: String
+    var model: BriefModelInfo
+    var enabledSources: [String]
+    var contentFingerprint: String
+    var summary: String?
+    var cards: [TodayBriefCardItem]?
+    var sections: [TodayBriefSection]?
+    var error: String?
+    var hours: [HourlyBriefItem]?
+
+    var boardCards: [TodayBriefCardItem] {
+        if let cards, !cards.isEmpty {
+            return cards
+        }
+        return (sections ?? []).map { section in
+            TodayBriefCardItem(
+                id: "\(section.source):\(section.headline)",
+                source: section.source,
+                project: section.source,
+                headline: section.headline,
+                bullets: section.bullets,
+                sessionCount: section.sessionCount,
+                coverage: section.coverage
+            )
+        }
+    }
+
+    var boardSummary: String {
+        if let summary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return summary
+        }
+        let cards = boardCards
+        guard !cards.isEmpty else { return "今日暂无项目摘要" }
+        let previews = cards.prefix(3).map { "\($0.source)·\($0.project)" }
+        if cards.count <= 3 {
+            return "\(cards.count) 个项目：\(previews.joined(separator: "；"))"
+        }
+        return "\(cards.count) 个项目：\(previews.joined(separator: "；")) 等"
+    }
+}
+
+struct BriefModelConfig: Encodable {
+    var baseUrl: String
+    var apiKey: String
+    var modelId: String
+}
+
+struct BriefGenerateRequest: Encodable {
+    var force: Bool
+    var trigger: String
+    var sources: [String]
+    var model: BriefModelConfig
 }
 
 protocol UsageSummary: Codable, Hashable {

@@ -11,13 +11,13 @@ npm run build:native-mac
 The output is:
 
 ```text
-release/native/Token Usage Dashboard.app
+release/native/Token Usage.app
 ```
 
 ## Bundle Layout
 
 ```text
-Token Usage Dashboard.app/
+Token Usage.app/
   Contents/
     MacOS/
       TokenUsageNative
@@ -34,7 +34,7 @@ The Swift app starts `Resources/Backend/token-usage-server` on `127.0.0.1:3456`.
 Ad-hoc signing for local testing:
 
 ```bash
-codesign --force --deep --sign - "release/native/Token Usage Dashboard.app"
+codesign --force --deep --sign - "release/native/Token Usage.app"
 ```
 
 Developer ID distribution requires a real Developer ID Application certificate and notarization:

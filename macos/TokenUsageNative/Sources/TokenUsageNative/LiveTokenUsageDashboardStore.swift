@@ -9,35 +9,47 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     @Published var selectedModels: Set<String> = []
     @Published private(set) var records: [TokenUsageRecord] = []
     @Published private(set) var todaySummary: TodaySummaryResponse = .empty
+    @Published private(set) var todayHourly: HourlyUsageResponse?
+    @Published private(set) var todayBrief: TodayBriefResponse?
     @Published private(set) var isLoading = false
+    @Published private(set) var isGeneratingBrief = false
+    @Published private(set) var briefErrorMessage: String?
     @Published private(set) var errorMessage: String?
     @Published private(set) var isBackendConnected = false
 
     private let client: TokenUsageAPIClient
     private let serverProcess: LocalServerProcess
+    private let preferences: TokenUsagePreferencesController
     private let calendar = Calendar.current
     private var activeLoadCount = 0
     private var isDashboardRefreshInFlight = false
     private var isTodayRefreshInFlight = false
+    private var isBriefRefreshInFlight = false
     private var dashboardWarmTask: Task<Void, Never>?
     private var dashboardCacheRefreshTask: Task<Void, Never>?
     private var dashboardCacheRefreshTasks: [DashboardRecordRequest: Task<Void, Never>] = [:]
     private var backendPollerTask: Task<Void, Never>?
+    private var briefSchedulerTask: Task<Void, Never>?
     private var activeDashboardRequest: DashboardRecordRequest?
     private let dashboardRecordsCache: DashboardRecordsCache
+    private var lastAutoBriefAttemptDate: String?
+    private var nextAutoBriefAttempt: Date?
 
     init(
         client: TokenUsageAPIClient = TokenUsageAPIClient(),
-        serverProcess: LocalServerProcess = LocalServerProcess()
+        serverProcess: LocalServerProcess = LocalServerProcess(),
+        preferences: TokenUsagePreferencesController = TokenUsagePreferencesController()
     ) {
         self.client = client
         self.serverProcess = serverProcess
+        self.preferences = preferences
         self.dashboardRecordsCache = DashboardRecordsCache(client: client)
         let today = Date()
         self.endDate = calendar.date(byAdding: .day, value: 1, to: today) ?? today
         self.startDate = calendar.startOfDay(for: today)
         startDashboardCacheRefreshTimer()
         startBackendPoller()
+        startBriefScheduler()
     }
 
     deinit {
@@ -45,6 +57,7 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
         dashboardCacheRefreshTask?.cancel()
         dashboardCacheRefreshTasks.values.forEach { $0.cancel() }
         backendPollerTask?.cancel()
+        briefSchedulerTask?.cancel()
     }
 
     private func startBackendPoller() {
@@ -54,6 +67,19 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
                 do {
                     _ = try await self?.client.fetchHealth()
                     await MainActor.run { self?.isBackendConnected = true }
+                    // If the initial load raced backend startup (or hit a
+                    // transient failure), records would stay empty forever —
+                    // nudge a reload whenever the backend is reachable and
+                    // nothing has loaded yet. refreshDashboard guards itself
+                    // against concurrent in-flight loads.
+                    if let self {
+                        if self.records.isEmpty {
+                            await self.refreshDashboard()
+                        }
+                        if self.todayHourly == nil {
+                            await self.refreshToday()
+                        }
+                    }
                 } catch {
                     await MainActor.run { self?.isBackendConnected = false }
                 }
@@ -118,12 +144,132 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
 
         do {
             try await serverProcess.ensureRunning()
-            todaySummary = try await client.fetchTodaySummary(refresh: force)
+            async let summaryTask = client.fetchTodaySummary(refresh: force)
+            // Summary re-ingests when forced; hourly can share that pass.
+            // Fetch hourly in parallel on non-force so Today isn't blocked on summary.
+            if force {
+                todaySummary = try await summaryTask
+                todayHourly = try await client.fetchHourly(refresh: false)
+            } else {
+                let (summary, hourly) = try await (summaryTask, client.fetchHourly(refresh: false))
+                todaySummary = summary
+                todayHourly = hourly
+            }
             warmDashboardCacheIfNeeded()
+            await refreshTodayBrief()
         } catch {
             errorMessage = error.localizedDescription
             todaySummary = .empty
         }
+    }
+
+    func refreshTodayBrief() async {
+        guard !isBriefRefreshInFlight else { return }
+        isBriefRefreshInFlight = true
+        defer { isBriefRefreshInFlight = false }
+
+        do {
+            try await serverProcess.ensureRunning()
+            todayBrief = try await client.fetchTodayBrief()
+            briefErrorMessage = nil
+        } catch {
+            briefErrorMessage = error.localizedDescription
+        }
+    }
+
+    func generateTodayBrief(force: Bool, trigger: String) async {
+        guard !isGeneratingBrief else { return }
+        isGeneratingBrief = true
+        briefErrorMessage = nil
+        defer { isGeneratingBrief = false }
+
+        let sources = preferences.briefSupportedEnabledSources.map(\.rawValue)
+        let model = BriefModelConfig(
+            baseUrl: preferences.briefBaseURL,
+            apiKey: preferences.resolvedBriefApiKey,
+            modelId: preferences.briefModelId
+        )
+
+        do {
+            try await serverProcess.ensureRunning()
+            let brief = try await client.generateTodayBrief(
+                force: force,
+                trigger: trigger,
+                sources: sources,
+                model: model
+            )
+            todayBrief = brief
+            if brief.status == "ok" {
+                nextAutoBriefAttempt = nil
+            } else {
+                briefErrorMessage = brief.error
+                if trigger == "auto" {
+                    nextAutoBriefAttempt = Date().addingTimeInterval(15 * 60)
+                }
+            }
+        } catch {
+            briefErrorMessage = error.localizedDescription
+            if trigger == "auto" {
+                nextAutoBriefAttempt = Date().addingTimeInterval(15 * 60)
+            }
+        }
+    }
+
+    private func startBriefScheduler() {
+        briefSchedulerTask?.cancel()
+        briefSchedulerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.maybeAutoGenerateBrief()
+                try? await Task.sleep(for: .seconds(60))
+            }
+        }
+    }
+
+    private func maybeAutoGenerateBrief() async {
+        let now = Date()
+        let today = localDateString(for: now)
+
+        if todayBrief?.date == today && todayBrief?.status == "ok" {
+            return
+        }
+
+        if lastAutoBriefAttemptDate == today {
+            if let nextAutoBriefAttempt, now >= nextAutoBriefAttempt {
+                // Retry after backoff.
+            } else {
+                return
+            }
+        }
+
+        let hour = calendar.component(.hour, from: now)
+        guard hour >= 10 else {
+            return
+        }
+
+        if todayBrief == nil || todayBrief?.date != today {
+            await refreshTodayBrief()
+            if todayBrief?.date == today && todayBrief?.status == "ok" {
+                return
+            }
+        } else if todayBrief?.status == "ok" {
+            return
+        }
+
+        guard !preferences.resolvedBriefApiKey.isEmpty else {
+            return
+        }
+
+        lastAutoBriefAttemptDate = today
+        await generateTodayBrief(force: false, trigger: "auto")
+    }
+
+    private func localDateString(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
     }
 
     private func beginLoading() {
@@ -170,16 +316,50 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
 
         dashboardCacheRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                self?.refreshDashboardCacheInBackground()
+                await self?.performScheduledRefresh()
                 try? await Task.sleep(nanoseconds: DashboardRecordsCache.refreshIntervalNanoseconds)
             }
         }
     }
 
+    /// Scheduled auto-refresh: update the ledger first, then sync the today summary
+    /// and dashboard panel data so the frontend always reflects the latest ledger state.
+    ///
+    /// `refreshTodayInBackground` issues `GET /api/today?refresh=true`, which forces
+    /// the backend to re-ingest all source files into the SQLite ledger before returning.
+    /// By awaiting its completion before fetching panel data, we ensure the ledger is
+    /// fully updated first. Then `refreshDashboardCacheInBackground` fetches incremental
+    /// panel updates with `?refresh=true`, reading from the freshly-ingested ledger.
+    private func performScheduledRefresh() async {
+        await refreshTodayInBackground()
+        refreshDashboardCacheInBackground()
+    }
+
+    private func refreshTodayInBackground() async {
+        guard !Task.isCancelled else { return }
+        do {
+            try await serverProcess.ensureRunning()
+            guard !Task.isCancelled else { return }
+            let summary = try await client.fetchTodaySummary(refresh: true)
+            todaySummary = summary
+            if let hourly = try? await client.fetchHourly(refresh: false) {
+                todayHourly = hourly
+            }
+        } catch {
+            // Stale today summary is preferable to surfacing background refresh noise.
+        }
+    }
+
     private func refreshDashboardCacheInBackground() {
-        let requests = dashboardWarmRequests()
-        for request in requests {
+        let warmRequests = dashboardWarmRequests()
+        for request in warmRequests {
             refreshDashboardCacheInBackground(request: request)
+        }
+
+        if let activeRequest = activeDashboardRequest,
+           !warmRequests.contains(activeRequest)
+        {
+            refreshDashboardCacheInBackground(request: activeRequest)
         }
     }
 
@@ -329,7 +509,7 @@ private struct DashboardRecordsCacheEntry: Sendable {
 }
 
 private actor DashboardRecordsCache {
-    static let refreshIntervalNanoseconds: UInt64 = 5 * 60 * 1_000_000_000
+    static let refreshIntervalNanoseconds: UInt64 = 3 * 60 * 1_000_000_000
     private static let maximumEntryAge: TimeInterval = 30 * 60
     private static let maximumEntryCount = 24
 
@@ -763,7 +943,7 @@ private actor DashboardRecordsCache {
 }
 
 private extension TokenUsageSource {
-    static let apiSources: [TokenUsageSource] = [.claude, .codex, .opencode, .hermes, .openclaw, .pi, .grok, .cursor, .cherry, .claudeScience, .zcode]
+    static let apiSources: [TokenUsageSource] = [.claude, .codex, .opencode, .hermes, .openclaw, .pi, .grok, .cursor, .cherry, .claudeScience, .zcode, .kimi]
 
     var apiSource: UsageSource {
         switch self {
@@ -791,6 +971,8 @@ private extension TokenUsageSource {
             .claudeScience
         case .zcode:
             .zcode
+        case .kimi:
+            .kimi
         }
     }
 }

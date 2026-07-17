@@ -33,6 +33,8 @@ struct UsageEntry {
     model: String,
     usage: UsageCounts,
     cost_usd: f64,
+    /// Stable dedupe key (messageId[:requestId], or path:line fallback).
+    message_key: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -105,6 +107,7 @@ enum SourceView {
     Monthly,
     Sessions,
     Blocks,
+    Messages,
 }
 
 impl TryFrom<&str> for SourceView {
@@ -116,21 +119,30 @@ impl TryFrom<&str> for SourceView {
             "monthly" => Ok(Self::Monthly),
             "sessions" => Ok(Self::Sessions),
             "blocks" => Ok(Self::Blocks),
+            "messages" => Ok(Self::Messages),
             other => Err(format!("unsupported view: {other}")),
         }
     }
 }
 
 pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String> {
-    let _ = refresh;
+    load_source_view_since(view, refresh, None)
+}
+
+pub fn load_source_view_since(
+    view: &str,
+    _refresh: bool,
+    watermark_ms: Option<i64>,
+) -> Result<Vec<Value>, String> {
     let view = SourceView::try_from(view)?;
-    let entries = load_usage_entries()?;
+    let entries = load_usage_entries(watermark_ms)?;
 
     Ok(match view {
         SourceView::Daily => entries_to_daily(&entries),
         SourceView::Monthly => entries_to_monthly(&entries),
         SourceView::Sessions => entries_to_sessions(&entries),
         SourceView::Blocks => entries_to_blocks(&entries),
+        SourceView::Messages => entries_to_messages(&entries),
     })
 }
 
@@ -143,7 +155,7 @@ pub fn load_daily_for_date(date: &str, refresh: bool) -> Result<Vec<Value>, Stri
         .collect())
 }
 
-fn load_usage_entries() -> Result<Vec<UsageEntry>, String> {
+fn load_usage_entries(watermark_ms: Option<i64>) -> Result<Vec<UsageEntry>, String> {
     let projects_dirs = discover_projects_dirs();
     if projects_dirs.is_empty() {
         return Ok(Vec::new());
@@ -151,7 +163,16 @@ fn load_usage_entries() -> Result<Vec<UsageEntry>, String> {
 
     let mut jsonl_files = Vec::new();
     for projects_dir in projects_dirs {
-        collect_jsonl_files(&projects_dir, &mut jsonl_files)?;
+        match watermark_ms {
+            // `collect_jsonl_files_modified_since` is inclusive; shift by 1ms
+            // so files at exactly the watermark are skipped.
+            Some(watermark) => collect_jsonl_files_modified_since(
+                &projects_dir,
+                &mut jsonl_files,
+                watermark.saturating_add(1),
+            )?,
+            None => collect_jsonl_files(&projects_dir, &mut jsonl_files)?,
+        }
     }
     jsonl_files.sort();
 
@@ -328,13 +349,14 @@ fn read_usage_file(
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        let Some(entry) = entry_from_value(&value, path) else {
+        let Some(mut entry) = entry_from_value(&value, path) else {
             continue;
         };
 
         let dedupe_key = dedupe_key(&value)
             .unwrap_or_else(|| format!("{}:{line_number}", path.to_string_lossy()));
-        if seen.insert(dedupe_key) {
+        if seen.insert(dedupe_key.clone()) {
+            entry.message_key = dedupe_key;
             entries.push(entry);
         }
     }
@@ -383,6 +405,7 @@ fn entry_from_value(value: &Value, path: &Path) -> Option<UsageEntry> {
         model,
         usage,
         cost_usd,
+        message_key: String::new(),
     })
 }
 
@@ -545,6 +568,28 @@ fn entries_to_sessions(entries: &[UsageEntry]) -> Vec<Value> {
         .collect();
     rows.sort_by_key(sort_key);
     rows
+}
+
+/// One row per usage-bearing message, keyed by the stable dedupe key so
+/// ledger upserts stay idempotent across incremental re-scans.
+fn entries_to_messages(entries: &[UsageEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "messageId": entry.message_key,
+                "sessionId": entry.session_id,
+                "date": entry.timestamp.format("%Y-%m-%d").to_string(),
+                "time": entry.timestamp.format("%H:%M").to_string(),
+                "inputTokens": entry.usage.input_tokens,
+                "outputTokens": entry.usage.output_tokens,
+                "cacheCreationTokens": entry.usage.cache_creation_tokens,
+                "cacheReadTokens": entry.usage.cache_read_tokens,
+                "totalTokens": entry.usage.total_tokens(),
+                "cost": entry.cost_usd,
+            })
+        })
+        .collect()
 }
 
 fn entries_to_blocks(entries: &[UsageEntry]) -> Vec<Value> {
@@ -745,6 +790,38 @@ mod tests {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
+    fn watermark_skips_unchanged_files_and_rereads_newer_ones() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let fixture = TestFixture::new();
+        let projects_dir = fixture.path.join("claude").join(PROJECTS_DIR).join("proj");
+        fs::create_dir_all(&projects_dir).unwrap();
+        let session_file = projects_dir.join("session-a.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"timestamp":"2024-01-01T12:15:00Z","sessionId":"s1","requestId":"r1","costUSD":0.01,"message":{"id":"m1","model":"claude-sonnet","usage":{"input_tokens":100,"output_tokens":40}}}
+"#,
+        )
+        .unwrap();
+        let mtime_ms = file_mtime_ms(&session_file);
+
+        let previous = std::env::var_os(CLAUDE_CONFIG_DIR);
+        std::env::set_var(CLAUDE_CONFIG_DIR, fixture.path.join("claude"));
+
+        // First run (no watermark): full scan.
+        let full = load_source_view_since("sessions", true, None).unwrap();
+        // Unchanged file (mtime at the watermark): skipped.
+        let skipped = load_source_view_since("sessions", true, Some(mtime_ms)).unwrap();
+        // File newer than the watermark: re-read.
+        let reread = load_source_view_since("sessions", true, Some(mtime_ms - 1)).unwrap();
+
+        restore_env(previous);
+
+        assert_eq!(full.len(), 1);
+        assert!(skipped.is_empty());
+        assert_eq!(reread.len(), 1);
+    }
+
+    #[test]
     fn loads_and_aggregates_claude_jsonl() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let fixture = TestFixture::new();
@@ -777,6 +854,47 @@ not-json
         assert_eq!(sessions[0]["sessionId"], "s1");
         assert_eq!(sessions[0]["inputTokens"], 120);
         assert_eq!(sessions[0]["totalTokens"], 215);
+    }
+
+    #[test]
+    fn messages_view_attributes_tokens_to_each_messages_own_hour() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let fixture = TestFixture::new();
+        let projects_dir = fixture.path.join("claude").join(PROJECTS_DIR).join("proj");
+        fs::create_dir_all(&projects_dir).unwrap();
+        fs::write(
+            projects_dir.join("session-a.jsonl"),
+            r#"{"timestamp":"2024-01-01T12:15:00Z","sessionId":"s1","requestId":"r1","costUSD":0.01,"message":{"id":"m1","model":"claude-sonnet","usage":{"input_tokens":100,"output_tokens":40}}}
+{"timestamp":"2024-01-01T16:45:00Z","sessionId":"s1","requestId":"r2","costUSD":0.02,"message":{"id":"m2","model":"claude-sonnet","usage":{"input_tokens":20,"output_tokens":10}}}
+"#,
+        )
+        .unwrap();
+
+        let previous = std::env::var_os(CLAUDE_CONFIG_DIR);
+        std::env::set_var(CLAUDE_CONFIG_DIR, fixture.path.join("claude"));
+        let messages = load_source_view("messages", false).unwrap();
+        let sessions = load_source_view("sessions", false).unwrap();
+        restore_env(previous);
+
+        // The sessions view collapses everything into one row keyed by the
+        // session's last-activity time...
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["totalTokens"], 170);
+
+        // ...while the messages view keeps one row per message, each with its
+        // own timestamp (assertions stay timezone-agnostic on purpose).
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["messageId"], "m1:r1");
+        assert_eq!(messages[0]["sessionId"], "s1");
+        assert_eq!(messages[0]["totalTokens"], 140);
+        assert_eq!(messages[0]["cost"], 0.01);
+        assert!(messages[0]["date"].as_str().unwrap().starts_with("2024-01-"));
+        assert_eq!(messages[1]["messageId"], "m2:r2");
+        assert_eq!(messages[1]["totalTokens"], 30);
+        assert!(
+            messages[0]["time"] != messages[1]["time"]
+                || messages[0]["date"] != messages[1]["date"]
+        );
     }
 
     #[test]
@@ -888,6 +1006,11 @@ not-json
         } else {
             std::env::remove_var(CLAUDE_CONFIG_DIR);
         }
+    }
+
+    fn file_mtime_ms(path: &Path) -> i64 {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        i64::try_from(modified.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
     }
 
     struct TestFixture {

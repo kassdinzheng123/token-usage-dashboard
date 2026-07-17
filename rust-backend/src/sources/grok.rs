@@ -29,9 +29,9 @@ struct InferenceEvent {
     reasoning_tokens: i64,
 }
 
-pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
+pub fn load_sessions(watermark_ms: Option<i64>) -> Result<Vec<LocalSession>, SourceError> {
     let metadata = load_session_metadata()?;
-    let events = load_inference_events()?;
+    let events = load_inference_events(watermark_ms)?;
     let mut sessions = Vec::with_capacity(events.len());
 
     for event in events {
@@ -93,7 +93,7 @@ fn inference_to_session(
     })
 }
 
-fn load_inference_events() -> Result<Vec<InferenceEvent>, SourceError> {
+fn load_inference_events(watermark_ms: Option<i64>) -> Result<Vec<InferenceEvent>, SourceError> {
     let Some(log_root) = discover_log_root() else {
         return Ok(Vec::new());
     };
@@ -107,6 +107,11 @@ fn load_inference_events() -> Result<Vec<InferenceEvent>, SourceError> {
 
     let mut events = Vec::new();
     for path in files {
+        if let Some(watermark) = watermark_ms {
+            if !super::file_modified_after(&path, watermark) {
+                continue;
+            }
+        }
         events.extend(read_log_file(&path)?);
     }
     Ok(events)
@@ -350,7 +355,7 @@ mod tests {
         let previous_home = std::env::var_os(GROK_HOME_ENV);
         std::env::set_var(GROK_HOME_ENV, &temp_root);
 
-        let sessions = load_sessions().unwrap();
+        let sessions = load_sessions(None).unwrap();
         if let Some(value) = previous_home {
             std::env::set_var(GROK_HOME_ENV, value);
         } else {

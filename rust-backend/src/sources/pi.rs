@@ -22,6 +22,7 @@ enum SourceView {
     Monthly,
     Sessions,
     Blocks,
+    Messages,
 }
 
 impl TryFrom<&str> for SourceView {
@@ -33,6 +34,7 @@ impl TryFrom<&str> for SourceView {
             "monthly" => Ok(Self::Monthly),
             "sessions" => Ok(Self::Sessions),
             "blocks" => Ok(Self::Blocks),
+            "messages" => Ok(Self::Messages),
             other => Err(format!("unsupported view: {other}")),
         }
     }
@@ -49,6 +51,8 @@ struct UsageEntry {
     cache_creation_tokens: i64,
     cache_read_tokens: i64,
     total_cost: f64,
+    /// Stable content hash assigned while scanning; used as the message id.
+    message_key: String,
 }
 
 impl UsageEntry {
@@ -86,6 +90,7 @@ impl WorkflowRunUsage {
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
             total_cost: self.total_cost,
+            message_key: String::new(),
         }
     }
 }
@@ -151,23 +156,31 @@ impl Aggregate {
 }
 
 pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String> {
-    let _ = refresh;
+    load_source_view_since(view, refresh, None)
+}
+
+pub fn load_source_view_since(
+    view: &str,
+    _refresh: bool,
+    watermark_ms: Option<i64>,
+) -> Result<Vec<Value>, String> {
     let view = SourceView::try_from(view)?;
 
     if view == SourceView::Blocks {
         return Ok(Vec::new());
     }
 
-    let entries = load_usage_entries()?;
+    let entries = load_usage_entries(watermark_ms)?;
     Ok(match view {
         SourceView::Daily => entries_to_daily(&entries),
         SourceView::Monthly => entries_to_monthly(&entries),
         SourceView::Sessions => entries_to_sessions(&entries),
         SourceView::Blocks => Vec::new(),
+        SourceView::Messages => entries_to_messages(&entries),
     })
 }
 
-fn load_usage_entries() -> Result<Vec<UsageEntry>, String> {
+fn load_usage_entries(watermark_ms: Option<i64>) -> Result<Vec<UsageEntry>, String> {
     let sessions_dirs = discover_sessions_dirs();
     if sessions_dirs.is_empty() {
         return Ok(Vec::new());
@@ -187,6 +200,11 @@ fn load_usage_entries() -> Result<Vec<UsageEntry>, String> {
         files.sort();
 
         for file in files {
+            if let Some(watermark) = watermark_ms {
+                if !super::file_modified_after(&file, watermark) {
+                    continue;
+                }
+            }
             append_entries_from_file(
                 &sessions_dir,
                 &file,
@@ -345,8 +363,11 @@ fn append_entries_from_file(
                 entry.total_cost,
                 entry_index
             );
-            if seen.insert(hash) {
-                entries.push(entry);
+            if seen.insert(hash.clone()) {
+                entries.push(UsageEntry {
+                    message_key: hash,
+                    ..entry
+                });
             }
         }
     }
@@ -396,8 +417,11 @@ fn append_workflow_entries_from_cwd(
             entry.timestamp.to_rfc3339(),
             entry.total_tokens()
         );
-        if seen.insert(hash) {
-            entries.push(entry);
+        if seen.insert(hash.clone()) {
+            entries.push(UsageEntry {
+                message_key: hash,
+                ..entry
+            });
         }
     }
 
@@ -513,6 +537,7 @@ fn parse_usage_entry(value: &Value, session_id: &str, project_path: &str) -> Opt
         cache_creation_tokens,
         cache_read_tokens,
         total_cost,
+        message_key: String::new(),
     };
 
     (entry.total_tokens() > 0 || entry.total_cost > 0.0).then_some(entry)
@@ -596,6 +621,7 @@ fn parse_subagent_usage_entries(
                 cache_creation_tokens,
                 cache_read_tokens,
                 total_cost,
+                message_key: String::new(),
             };
 
             (entry.total_tokens() > 0 || entry.total_cost > 0.0).then_some(entry)
@@ -725,6 +751,28 @@ fn entries_to_sessions(entries: &[UsageEntry]) -> Vec<Value> {
         .collect::<Vec<_>>();
     rows.sort_by_key(sort_key);
     rows
+}
+
+/// One row per usage entry, keyed by the stable content hash assigned during
+/// the scan, so ledger upserts stay idempotent across incremental re-scans.
+fn entries_to_messages(entries: &[UsageEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "messageId": entry.message_key,
+                "sessionId": entry.session_id,
+                "date": entry.timestamp.format("%Y-%m-%d").to_string(),
+                "time": entry.timestamp.format("%H:%M").to_string(),
+                "inputTokens": entry.input_tokens,
+                "outputTokens": entry.output_tokens,
+                "cacheCreationTokens": entry.cache_creation_tokens,
+                "cacheReadTokens": entry.cache_read_tokens,
+                "totalTokens": entry.total_tokens(),
+                "cost": entry.total_cost,
+            })
+        })
+        .collect()
 }
 
 fn aggregate_by(

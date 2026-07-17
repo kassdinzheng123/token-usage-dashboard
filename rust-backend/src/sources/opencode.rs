@@ -57,8 +57,14 @@ struct ModelBreakdown {
 }
 
 pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String> {
-    let _ = refresh;
+    load_source_view_since(view, refresh, None)
+}
 
+pub fn load_source_view_since(
+    view: &str,
+    _refresh: bool,
+    watermark_ms: Option<i64>,
+) -> Result<Vec<Value>, String> {
     if view == "blocks" {
         return Ok(Vec::new());
     }
@@ -69,13 +75,14 @@ pub fn load_source_view(view: &str, refresh: bool) -> Result<Vec<Value>, String>
         }
     }
 
-    let entries = load_usage_entries();
+    let entries = load_usage_entries(watermark_ms);
     let sessions = load_session_metadata();
 
     match view {
         "daily" => Ok(entries_to_daily(&entries)),
         "monthly" => Ok(entries_to_monthly(&entries)),
         "sessions" => Ok(entries_to_sessions(&entries, &sessions)),
+        "messages" => Ok(entries_to_messages(&entries)),
         other => Err(format!("unsupported view: {other}")),
     }
 }
@@ -100,14 +107,14 @@ pub fn load_daily_for_date(date: &str, refresh: bool) -> Result<Vec<Value>, Stri
         .collect())
 }
 
-fn load_usage_entries() -> Vec<UsageEntry> {
+fn load_usage_entries(watermark_ms: Option<i64>) -> Vec<UsageEntry> {
     let storage = storage_dir();
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
 
     if let Some(storage) = storage.as_deref() {
         if !append_sqlite_messages(&mut entries, &mut seen, storage) {
-            append_json_messages(&mut entries, &mut seen, &storage.join("message"));
+            append_json_messages(&mut entries, &mut seen, &storage.join("message"), watermark_ms);
         }
     }
 
@@ -121,7 +128,7 @@ fn load_usage_entries_between(start_ms: i64, end_ms: i64) -> Vec<UsageEntry> {
 
     if let Some(storage) = storage.as_deref() {
         if !append_sqlite_messages_between(&mut entries, &mut seen, storage, start_ms, end_ms) {
-            append_json_messages(&mut entries, &mut seen, &storage.join("message"));
+            append_json_messages(&mut entries, &mut seen, &storage.join("message"), None);
             entries.retain(|entry| entry.timestamp_ms >= start_ms && entry.timestamp_ms < end_ms);
         }
     }
@@ -154,12 +161,18 @@ fn append_json_messages(
     entries: &mut Vec<UsageEntry>,
     seen: &mut HashSet<String>,
     messages_dir: &Path,
+    watermark_ms: Option<i64>,
 ) {
     let mut files = Vec::new();
     collect_json_files(messages_dir, &mut files);
     files.sort();
 
     for file in files {
+        if let Some(watermark) = watermark_ms {
+            if !super::file_modified_after(&file, watermark) {
+                continue;
+            }
+        }
         let Ok(contents) = fs::read_to_string(file) else {
             continue;
         };
@@ -686,6 +699,29 @@ fn entries_to_monthly(entries: &[UsageEntry]) -> Vec<Value> {
         })
     })
     .collect()
+}
+
+/// One row per assistant message, keyed by the message id already used for
+/// cross-file dedupe, so ledger upserts stay idempotent.
+fn entries_to_messages(entries: &[UsageEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (date, time) = local_parts(entry.timestamp_ms);
+            json!({
+                "messageId": entry.message_id,
+                "sessionId": entry.session_id,
+                "date": date,
+                "time": time,
+                "inputTokens": entry.input_tokens,
+                "outputTokens": entry.output_tokens,
+                "cacheCreationTokens": entry.cache_creation_tokens,
+                "cacheReadTokens": entry.cache_read_tokens,
+                "totalTokens": entry.total_tokens(),
+                "cost": entry.total_cost,
+            })
+        })
+        .collect()
 }
 
 fn entries_to_sessions(
