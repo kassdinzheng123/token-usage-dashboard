@@ -19,6 +19,18 @@ private struct AppCardModifier: ViewModifier {
                 in: RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
             )
             .overlay(
+                // Glass-like top sheen: a soft vertical highlight that fades
+                // into the card, plus the hairline separator stroke.
+                RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.06), Color.clear],
+                            startPoint: .top,
+                            endPoint: UnitPoint(x: 0.5, y: 0.25)
+                        )
+                    )
+            )
+            .overlay(
                 RoundedRectangle(cornerRadius: AppDesign.cardCornerRadius, style: .continuous)
                     .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
             )
@@ -43,6 +55,32 @@ extension View {
                 in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             )
             .shadow(color: Color.black.opacity(0.12), radius: 8, y: 4)
+        }
+    }
+
+    /// Small interactive glass surface for chips, pickers, and inline
+    /// controls. Liquid Glass on macOS 26+, thin material fallback before it.
+    @ViewBuilder
+    func appGlassChip<S: InsettableShape>(in shape: S = Capsule()) -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(.regular.interactive(), in: shape)
+        } else {
+            background(.ultraThinMaterial, in: shape)
+                .overlay(
+                    shape.stroke(Color.primary.opacity(0.10), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.06), radius: 3, y: 1)
+        }
+    }
+
+    /// Glass surface for content cards the user interacts with (kanban cards,
+    /// month cards). Liquid Glass on macOS 26+; grouped-inset card before it.
+    @ViewBuilder
+    func appGlassCard(cornerRadius: CGFloat = AppDesign.cardCornerRadius) -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(.regular.interactive(), in: .rect(cornerRadius: cornerRadius))
+        } else {
+            appCard()
         }
     }
 }

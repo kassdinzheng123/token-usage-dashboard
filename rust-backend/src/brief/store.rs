@@ -60,6 +60,26 @@ pub fn has_successful_brief(date: &str) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+/// Lists the dates (YYYY-MM-DD) that have a saved brief file.
+pub fn list_brief_dates() -> Result<Vec<String>, String> {
+    let dir = briefs_dir()?;
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut dates: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let date = name.strip_suffix(".json")?;
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .ok()
+                .map(|_| date.to_string())
+        })
+        .collect();
+    dates.sort();
+    Ok(dates)
+}
+
 #[cfg(test)]
 pub(crate) static BRIEFS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

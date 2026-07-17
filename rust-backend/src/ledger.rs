@@ -213,6 +213,128 @@ impl UsageLedger {
         })
     }
 
+    /// Message-level hour attribution for one day: session id -> hour -> tokens.
+    /// Sources without message rows return an empty map so callers can fall
+    /// back to session-level hour attribution.
+    pub fn session_hour_tokens(
+        &self,
+        source: Source,
+        date: &str,
+    ) -> Result<std::collections::HashMap<String, std::collections::BTreeMap<i64, i64>>, String>
+    {
+        self.with_connection(|connection| {
+            let source_name = source.to_string();
+            let mut statement = connection.prepare(
+                r#"
+                SELECT session_id,
+                       CAST(substr(time, 1, 2) AS INTEGER) AS hour,
+                       SUM(total_tokens)
+                FROM usage_messages
+                WHERE source = ?1 AND date = ?2 AND length(time) >= 2
+                  AND session_id != ''
+                GROUP BY session_id, hour
+                "#,
+            )?;
+            let rows = statement.query_map(params![&source_name, date], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
+                ))
+            })?;
+
+            let mut map: std::collections::HashMap<
+                String,
+                std::collections::BTreeMap<i64, i64>,
+            > = std::collections::HashMap::new();
+            for row in rows {
+                let (session_id, hour, tokens) = row?;
+                map.entry(session_id).or_default().insert(hour, tokens);
+            }
+            Ok(map)
+        })
+    }
+
+    /// Per-day usage rollup across all sources, for the brief month view.
+    /// Returns rows: {date, totalTokens, totalCost, sessions, sources}.
+    pub fn daily_usage_rollup(&self, since: &str, until: &str) -> Result<Vec<Value>, String> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                r#"
+                SELECT date,
+                       SUM(total_tokens),
+                       SUM(total_cost),
+                       COUNT(*),
+                       GROUP_CONCAT(DISTINCT source)
+                FROM usage_sessions
+                WHERE date >= ?1 AND date <= ?2
+                GROUP BY date
+                ORDER BY date
+                "#,
+            )?;
+            let rows = statement.query_map(params![since, until], |row| {
+                Ok(json!({
+                    "date": row.get::<_, String>(0)?,
+                    "totalTokens": row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                    "totalCost": row.get::<_, Option<f64>>(2)?.unwrap_or_default(),
+                    "sessions": row.get::<_, i64>(3)?,
+                    "sources": row
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>(),
+                }))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row?);
+            }
+            Ok(result)
+        })
+    }
+
+    /// Per-month usage rollup across all sources, for the brief all view.
+    /// Returns rows: {month, totalTokens, totalCost, sessions, activeDays, sources}.
+    pub fn monthly_usage_rollup(&self) -> Result<Vec<Value>, String> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                r#"
+                SELECT substr(date, 1, 7) AS month,
+                       SUM(total_tokens),
+                       SUM(total_cost),
+                       COUNT(*),
+                       COUNT(DISTINCT date),
+                       GROUP_CONCAT(DISTINCT source)
+                FROM usage_sessions
+                WHERE length(date) >= 7
+                GROUP BY month
+                ORDER BY month
+                "#,
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(json!({
+                    "month": row.get::<_, String>(0)?,
+                    "totalTokens": row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                    "totalCost": row.get::<_, Option<f64>>(2)?.unwrap_or_default(),
+                    "sessions": row.get::<_, i64>(3)?,
+                    "activeDays": row.get::<_, i64>(4)?,
+                    "sources": row
+                        .get::<_, Option<String>>(5)?
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>(),
+                }))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row?);
+            }
+            Ok(result)
+        })
+    }
+
     fn upsert_session_rows(&self, source: Source, rows: &[Value]) -> Result<(), String> {
         self.with_connection(|connection| {
             let tx = connection.transaction()?;

@@ -10,7 +10,13 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     @Published private(set) var records: [TokenUsageRecord] = []
     @Published private(set) var todaySummary: TodaySummaryResponse = .empty
     @Published private(set) var todayHourly: HourlyUsageResponse?
+    /// Hourly usage keyed by date (YYYY-MM-DD) for the day drill-down view.
+    @Published private(set) var hourlyByDate: [String: HourlyUsageResponse] = [:]
     @Published private(set) var todayBrief: TodayBriefResponse?
+    @Published private(set) var briefCache: [String: TodayBriefResponse] = [:]
+    @Published private(set) var briefMissingDates: Set<String> = []
+    @Published private(set) var briefDays: [BriefDayEntry] = []
+    @Published private(set) var briefMonths: [BriefMonthEntry] = []
     @Published private(set) var isLoading = false
     @Published private(set) var isGeneratingBrief = false
     @Published private(set) var briefErrorMessage: String?
@@ -163,6 +169,18 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
         }
     }
 
+    func loadHourly(for date: String) async {
+        if hourlyByDate[date] != nil {
+            return
+        }
+        do {
+            try await serverProcess.ensureRunning()
+            hourlyByDate[date] = try await client.fetchHourly(date: date, refresh: false)
+        } catch {
+            // A missing day renders as the empty state; don't surface noise.
+        }
+    }
+
     func refreshTodayBrief() async {
         guard !isBriefRefreshInFlight else { return }
         isBriefRefreshInFlight = true
@@ -171,7 +189,105 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
         do {
             try await serverProcess.ensureRunning()
             todayBrief = try await client.fetchTodayBrief()
+            let today = localDateString(for: Date())
+            if let todayBrief {
+                briefCache[today] = todayBrief
+                briefMissingDates.remove(today)
+            }
             briefErrorMessage = nil
+        } catch {
+            briefErrorMessage = error.localizedDescription
+        }
+    }
+
+    func loadBrief(for date: String) async {
+        if briefCache[date] != nil || briefMissingDates.contains(date) {
+            return
+        }
+        do {
+            try await serverProcess.ensureRunning()
+            if let brief = try await client.fetchBrief(forDate: date) {
+                briefCache[date] = brief
+            } else {
+                briefMissingDates.insert(date)
+            }
+        } catch {
+            briefErrorMessage = error.localizedDescription
+        }
+    }
+
+    func loadBriefDays(month: String) async {
+        do {
+            try await serverProcess.ensureRunning()
+            briefDays = try await client.fetchBriefDays(month: month)
+        } catch {
+            briefDays = []
+            briefErrorMessage = error.localizedDescription
+        }
+    }
+
+    func loadBriefMonths() async {
+        do {
+            try await serverProcess.ensureRunning()
+            briefMonths = try await client.fetchBriefMonths()
+        } catch {
+            briefMonths = []
+            briefErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Regenerates the brief for a date. `mode` scopes the regeneration to
+    /// the whole day, selected hours, or selected CLIs.
+    func generateBrief(for date: String, mode: BriefRegenerateMode) async {
+        guard !isGeneratingBrief else { return }
+        isGeneratingBrief = true
+        briefErrorMessage = nil
+        defer { isGeneratingBrief = false }
+
+        let enabledSources = preferences.briefSupportedEnabledSources.map(\.rawValue)
+        let model = BriefModelConfig(
+            baseUrl: preferences.briefBaseURL,
+            apiKey: preferences.resolvedBriefApiKey,
+            modelId: preferences.briefModelId
+        )
+
+        var sources = enabledSources
+        var hours: [Int]?
+        var mergeSources = false
+        switch mode {
+        case .full:
+            break
+        case let .hours(selectedHours):
+            // Hour regeneration reuses the CLI set the brief was built with.
+            sources = briefCache[date]?.enabledSources ?? enabledSources
+            hours = selectedHours
+        case let .sources(selectedSources):
+            sources = selectedSources
+            mergeSources = true
+        }
+
+        do {
+            try await serverProcess.ensureRunning()
+            let brief = try await client.generateTodayBrief(
+                force: true,
+                trigger: "manual",
+                sources: sources,
+                model: model,
+                date: date,
+                hours: hours,
+                mergeSources: mergeSources
+            )
+            briefCache[date] = brief
+            briefMissingDates.remove(date)
+            if date == localDateString(for: Date()) {
+                todayBrief = brief
+                if brief.status == "ok" {
+                    nextAutoBriefAttempt = nil
+                }
+            }
+            if brief.status != "ok" {
+                briefErrorMessage = brief.error
+            }
         } catch {
             briefErrorMessage = error.localizedDescription
         }

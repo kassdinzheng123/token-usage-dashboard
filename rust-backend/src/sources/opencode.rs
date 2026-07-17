@@ -837,7 +837,7 @@ fn collect_json_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn storage_dir() -> Option<PathBuf> {
+pub(crate) fn storage_dir() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(OPENCODE_DATA_DIR_ENV) {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
@@ -857,14 +857,14 @@ fn storage_dir() -> Option<PathBuf> {
         .map(|home| home.join(".local/share/opencode/storage"))
 }
 
-fn opencode_db_path(storage: &Path) -> Option<PathBuf> {
+pub(crate) fn opencode_db_path(storage: &Path) -> Option<PathBuf> {
     storage
         .parent()
         .map(|base| base.join("opencode.db"))
         .filter(|path| path.exists())
 }
 
-fn open_opencode_readonly(db_path: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_opencode_readonly(db_path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

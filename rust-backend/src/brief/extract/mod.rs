@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod kimi;
+pub mod opencode;
 pub mod zcode;
 
 use crate::protocol::Source;
@@ -155,6 +156,7 @@ pub fn extract_for_source(
     match source {
         Source::Claude => claude::extract(session_rows),
         Source::Codex => codex::extract(session_rows),
+        Source::Opencode => opencode::extract(session_rows),
         Source::Zcode => zcode::extract(session_rows),
         Source::Cursor => cursor::extract(session_rows),
         Source::Kimi => kimi::extract(session_rows),

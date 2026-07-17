@@ -59,17 +59,51 @@ actor TokenUsageAPIClient {
         return try decoder.decode(TodayBriefResponse.self, from: data)
     }
 
+    /// Fetches the saved brief for an arbitrary date; nil when none exists.
+    func fetchBrief(forDate date: String) async throws -> TodayBriefResponse? {
+        let url = try makeURL(path: "brief/\(date)", queryItems: [])
+        let (data, response) = try await session.data(from: url)
+        if let httpResponse = response as? HTTPURLResponse {
+            if httpResponse.statusCode == 404 {
+                return nil
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                throw ClientError.unexpectedStatus(httpResponse.statusCode)
+            }
+        }
+        return try decoder.decode(TodayBriefResponse.self, from: data)
+    }
+
+    func fetchBriefDays(month: String) async throws -> [BriefDayEntry] {
+        let response: BriefDaysResponse = try await fetch(
+            "brief/days",
+            queryItems: [URLQueryItem(name: "month", value: month)]
+        )
+        return response.days
+    }
+
+    func fetchBriefMonths() async throws -> [BriefMonthEntry] {
+        let response: BriefMonthsResponse = try await fetch("brief/months", queryItems: [])
+        return response.months
+    }
+
     func generateTodayBrief(
         force: Bool,
         trigger: String,
         sources: [String],
-        model: BriefModelConfig
+        model: BriefModelConfig,
+        date: String? = nil,
+        hours: [Int]? = nil,
+        mergeSources: Bool = false
     ) async throws -> TodayBriefResponse {
         let requestBody = BriefGenerateRequest(
             force: force,
             trigger: trigger,
             sources: sources,
-            model: model
+            model: model,
+            hours: hours,
+            mergeSources: mergeSources ? true : nil,
+            date: date
         )
         let url = try makeURL(path: "today/brief", queryItems: [])
         var request = URLRequest(url: url)

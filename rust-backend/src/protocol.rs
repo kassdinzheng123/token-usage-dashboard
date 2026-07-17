@@ -585,10 +585,11 @@ pub fn build_board_summary(cards: &[TodayBriefCard]) -> String {
     }
 }
 
-fn short_source(source: &str) -> &str {
+pub fn short_source(source: &str) -> &str {
     match source {
         "claude" => "Claude",
         "codex" => "Codex",
+        "opencode" => "OpenCode",
         "cursor" => "Cursor",
         "zcode" => "ZCode",
         "kimi" => "Kimi",
@@ -607,6 +608,54 @@ pub struct BriefGenerateRequest {
     pub sources: Option<Vec<String>>,
     #[serde(default)]
     pub model: Option<BriefModelConfig>,
+    /// Restrict regeneration to these hours (0-23). Other hours keep their
+    /// cached headlines; requires an existing brief for the date.
+    #[serde(default)]
+    pub hours: Option<Vec<i64>>,
+    /// When true with `sources`, only those CLIs' cards are regenerated and
+    /// merged into the existing brief; other CLIs keep their cached cards.
+    #[serde(default)]
+    pub merge_sources: Option<bool>,
+    /// Generate/read the brief for this date (YYYY-MM-DD). Defaults to today.
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+/// One day in the brief month view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefDayEntry {
+    pub date: String,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+    pub sessions: i64,
+    pub sources: Vec<String>,
+    /// Number of project cards in the day's brief; absent when no brief was
+    /// generated for the day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_summary: Option<String>,
+    #[serde(default)]
+    pub top_projects: Vec<String>,
+    #[serde(default)]
+    pub has_brief: bool,
+}
+
+/// One month in the brief all view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefMonthEntry {
+    pub month: String,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+    pub sessions: i64,
+    pub active_days: i64,
+    pub sources: Vec<String>,
+    pub projects: i64,
+    pub brief_days: i64,
+    #[serde(default)]
+    pub top_projects: Vec<String>,
 }
 
 #[cfg(test)]

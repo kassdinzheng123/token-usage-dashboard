@@ -2,12 +2,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct DailyBriefCard: View {
+    /// The date (YYYY-MM-DD) this card presents.
+    let date: String
     let brief: TodayBriefResponse?
     let isLoading: Bool
     let isGenerating: Bool
     let enabledSources: Set<TokenUsageSource>
     let errorMessage: String?
-    let onGenerate: () -> Void
+    let onRegenerate: (BriefRegenerateMode) -> Void
 
     /// Per-CLI ordered project card IDs.
     @State private var projectOrderBySource: [String: [String]] = [:]
@@ -17,6 +19,10 @@ struct DailyBriefCard: View {
     @State private var draggingSourceID: String?
     /// Project cards keep details collapsed by default.
     @State private var expandedProjectIDs: Set<String> = []
+    @State private var isHourPickerPresented = false
+    @State private var isSourcePickerPresented = false
+    @State private var selectedHours: Set<Int> = []
+    @State private var selectedSources: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -44,7 +50,7 @@ struct DailyBriefCard: View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    Text("Daily Brief")
+                    Text("Brief")
                         .font(.title3.weight(.semibold))
                     if let brief, brief.status == "ok" {
                         Text("\(orderedCLIGroups.count) CLI · \(totalProjectCount) 项目")
@@ -70,33 +76,199 @@ struct DailyBriefCard: View {
                     .foregroundStyle(AppPalette.semanticWarning)
             }
 
-            Button {
-                onGenerate()
-            } label: {
-                if isGenerating {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
+            if isGenerating {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    onRegenerate(.full)
+                } label: {
                     Label(
                         brief?.status == "ok" ? "重新生成" : "生成",
                         systemImage: "sparkles"
                     )
                 }
+                .disabled(isGenerating || isLoading)
+                .controlSize(.regular)
+
+                Button {
+                    selectedHours = []
+                    isHourPickerPresented = true
+                } label: {
+                    Label("按小时", systemImage: "clock")
+                }
+                .disabled(isGenerating || isLoading || brief == nil)
+                .controlSize(.regular)
+                .popover(isPresented: $isHourPickerPresented, arrowEdge: .bottom) {
+                    hourPickerPopover
+                }
+
+                Button {
+                    selectedSources = Set(brief?.enabledSources ?? enabledBriefSources.map(\.rawValue))
+                    isSourcePickerPresented = true
+                } label: {
+                    Label("按 CLI", systemImage: "terminal")
+                }
+                .disabled(isGenerating || isLoading || enabledBriefSources.isEmpty)
+                .controlSize(.regular)
+                .popover(isPresented: $isSourcePickerPresented, arrowEdge: .bottom) {
+                    sourcePickerPopover
+                }
             }
-            .disabled(isGenerating || isLoading)
-            .controlSize(.regular)
         }
+    }
+
+    /// Brief-capable CLIs enabled in settings, sorted for a stable order.
+    private var enabledBriefSources: [TokenUsageSource] {
+        TokenUsageSource.allCases.filter {
+            $0 != .all
+                && enabledSources.contains($0)
+                && TokenUsagePreferencesController.briefSupportedSources.contains($0)
+        }
+    }
+
+    private var hourPickerPopover: some View {
+        let hoursWithEntries = Set(brief?.hours?.map(\.hour) ?? [])
+        let unresolvedHours = Set(
+            (brief?.hours ?? [])
+                .filter { $0.headline == Self.usageOnlyHeadline }
+                .map(\.hour)
+        )
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("按小时重新生成")
+                .font(.headline)
+            Text("仅重新生成选中的小时，其余小时保留现有摘要。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 6), spacing: 6) {
+                ForEach(0..<24, id: \.self) { hour in
+                    hourChip(hour, hasEntry: hoursWithEntries.contains(hour))
+                }
+            }
+
+            HStack(spacing: 10) {
+                if !unresolvedHours.isEmpty {
+                    Button("选中 \(unresolvedHours.count) 个未解析小时") {
+                        selectedHours = unresolvedHours
+                    }
+                    .font(.caption)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                }
+                Spacer()
+                Button("生成") {
+                    isHourPickerPresented = false
+                    onRegenerate(.hours(selectedHours.sorted()))
+                }
+                .disabled(selectedHours.isEmpty)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .frame(width: 320)
+    }
+
+    private func hourChip(_ hour: Int, hasEntry: Bool) -> some View {
+        let isSelected = selectedHours.contains(hour)
+        return Button {
+            if isSelected {
+                selectedHours.remove(hour)
+            } else {
+                selectedHours.insert(hour)
+            }
+        } label: {
+            Text(String(format: "%02d:00", hour))
+                .font(.system(.caption2, design: .monospaced))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(
+                    isSelected ? Color.accentColor.opacity(0.85) : Color.primary.opacity(hasEntry ? 0.08 : 0.03),
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+                .foregroundStyle(isSelected ? Color.white : Color.primary.opacity(hasEntry ? 0.85 : 0.35))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var sourcePickerPopover: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("按 CLI 重新生成")
+                .font(.headline)
+            Text("仅重新生成选中 CLI 的项目卡片，其他 CLI 保留现有卡片。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(enabledBriefSources) { source in
+                    let isSelected = selectedSources.contains(source.rawValue)
+                    Button {
+                        if isSelected {
+                            selectedSources.remove(source.rawValue)
+                        } else {
+                            selectedSources.insert(source.rawValue)
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                            if let usageSource = UsageSource(rawValue: source.rawValue) {
+                                UsageSourceIconBadge(source: usageSource, size: 18)
+                            }
+                            Text(source.label)
+                                .font(.subheadline)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("生成") {
+                    isSourcePickerPresented = false
+                    onRegenerate(.sources(selectedSources.sorted()))
+                }
+                .disabled(selectedSources.isEmpty)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .frame(width: 280)
+    }
+
+    /// Headline the backend uses for hours that only carry usage records.
+    private static let usageOnlyHeadline = "仅有用量记录，无对话内容"
+
+    private var isToday: Bool {
+        date == Self.todayString
+    }
+
+    static var todayString: String {
+        let formatter = DateFormatter()
+        formatter.calendar = .current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
     }
 
     private var statusLine: String {
         if isGenerating && brief == nil {
-            return "正在生成今日看板…"
+            return "正在生成看板…"
         }
         if let errorMessage, brief == nil {
             return errorMessage
         }
         guard let brief else {
-            return "尚未生成今日 Brief。可手动生成，或等待本地 10:00 自动生成。"
+            return isToday
+                ? "尚未生成今日 Brief。可手动生成，或等待本地 10:00 自动生成。"
+                : "该日尚未生成 Brief，可手动生成。"
         }
         switch brief.status {
         case "ok":
@@ -104,7 +276,7 @@ struct DailyBriefCard: View {
         case "error":
             return brief.error ?? "生成失败"
         default:
-            return "尚未生成今日 Brief"
+            return isToday ? "尚未生成今日 Brief" : "该日尚未生成 Brief"
         }
     }
 
@@ -134,9 +306,16 @@ struct DailyBriefCard: View {
 
             Text(item.headline)
                 .font(.subheadline)
-                .foregroundStyle(.primary)
+                .foregroundStyle(item.headline == Self.usageOnlyHeadline ? .tertiary : .primary)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if item.headline == Self.usageOnlyHeadline {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.caption2)
+                    .foregroundStyle(AppPalette.semanticWarning)
+                    .help("该小时只有用量记录，可用「按小时」重新生成解析")
+            }
 
             Spacer(minLength: 8)
 
@@ -170,7 +349,7 @@ struct DailyBriefCard: View {
             switch brief.status {
             case "ok":
                 if orderedCLIGroups.isEmpty {
-                    Text("今日暂无项目卡片。")
+                    Text("暂无项目卡片。")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, minHeight: 200, alignment: .center)
@@ -214,12 +393,16 @@ struct DailyBriefCard: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 200, alignment: .leading)
             default:
-                Text("尚未生成今日 Brief。")
+                Text(isToday ? "尚未生成今日 Brief。" : "该日尚未生成 Brief。")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
         } else {
-            Text("尚未生成今日 Brief。可手动生成，或等待本地 10:00 自动生成。")
+            Text(
+                isToday
+                    ? "尚未生成今日 Brief。可手动生成，或等待本地 10:00 自动生成。"
+                    : "该日尚未生成 Brief，可手动生成。"
+            )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 200, alignment: .center)
@@ -270,11 +453,7 @@ struct DailyBriefCard: View {
         }
         .padding(12)
         .frame(width: 260, alignment: .topLeading)
-        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
-        )
+        .appGlassCard(cornerRadius: 12)
     }
 
     private func projectKanbanCard(_ card: TodayBriefCardItem) -> some View {
@@ -354,14 +533,7 @@ struct DailyBriefCard: View {
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(
-            AppDesign.cardBackground,
-            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
-        )
+        .appGlassCard(cornerRadius: 10)
     }
 
     private var orderedCLIGroups: [BriefCLIGroup] {

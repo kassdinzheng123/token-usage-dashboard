@@ -264,6 +264,57 @@ struct BriefGenerateRequest: Encodable {
     var trigger: String
     var sources: [String]
     var model: BriefModelConfig
+    var hours: [Int]?
+    var mergeSources: Bool?
+    var date: String?
+}
+
+/// How a brief regeneration should be scoped.
+enum BriefRegenerateMode: Hashable {
+    /// Regenerate the whole day.
+    case full
+    /// Regenerate only the given hours, keeping the cached headlines of the rest.
+    case hours([Int])
+    /// Regenerate only the given CLIs' project cards, keeping the rest.
+    case sources([String])
+}
+
+/// One day in the brief month view.
+struct BriefDayEntry: Codable, Hashable, Identifiable {
+    var date: String
+    var totalTokens: Int
+    var totalCost: Double
+    var sessions: Int
+    var sources: [String]
+    var projects: Int?
+    var briefSummary: String?
+    var topProjects: [String]
+    var hasBrief: Bool
+
+    var id: String { date }
+}
+
+/// One month in the brief all view.
+struct BriefMonthEntry: Codable, Hashable, Identifiable {
+    var month: String
+    var totalTokens: Int
+    var totalCost: Double
+    var sessions: Int
+    var activeDays: Int
+    var sources: [String]
+    var projects: Int
+    var briefDays: Int
+    var topProjects: [String]
+
+    var id: String { month }
+}
+
+struct BriefDaysResponse: Codable, Hashable {
+    var days: [BriefDayEntry]
+}
+
+struct BriefMonthsResponse: Codable, Hashable {
+    var months: [BriefMonthEntry]
 }
 
 protocol UsageSummary: Codable, Hashable {

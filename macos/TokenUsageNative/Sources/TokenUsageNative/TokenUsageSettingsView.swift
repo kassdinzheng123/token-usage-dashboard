@@ -14,7 +14,7 @@ struct TokenUsageSettingsView: View {
 
             BriefModelSettingsTab(preferences: preferences)
                 .tabItem {
-                    Label("Daily Brief", systemImage: "sparkles")
+                    Label("Brief", systemImage: "sparkles")
                 }
         }
         .frame(width: 520, height: 440)
@@ -47,7 +47,7 @@ private struct CLIFiltersSettingsTab: View {
             } header: {
                 Text("Enabled CLIs")
             } footer: {
-                Text("Controls dashboard display and Daily Brief generation.")
+                Text("Controls dashboard display and Brief generation.")
             }
         }
         .formStyle(.grouped)

@@ -568,6 +568,9 @@ pub fn create_app(state: AppState) -> Router {
             "/api/today/brief",
             get(today_brief_get_handler).post(today_brief_post_handler),
         )
+        .route("/api/brief/days", get(brief_days_handler))
+        .route("/api/brief/months", get(brief_months_handler))
+        .route("/api/brief/{date}", get(brief_date_get_handler))
         .route("/api/{source}/{view}", get(source_view_handler))
         .layer(CompressionLayer::new())
         .with_state(state)
@@ -683,6 +686,68 @@ async fn today_brief_get_handler() -> Response {
 async fn today_brief_post_handler(Json(request): Json<BriefGenerateRequest>) -> Response {
     match tokio::task::spawn_blocking(move || brief::generate_today_brief(request)).await {
         Ok(Ok(brief)) => (StatusCode::OK, Json(brief)).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn brief_date_get_handler(Path(date): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || brief::load_brief_for_date(&date)).await {
+        Ok(Ok(Some(brief))) => (StatusCode::OK, Json(brief)).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "status": "missing" })),
+        )
+            .into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BriefDaysQuery {
+    month: Option<String>,
+}
+
+async fn brief_days_handler(Query(query): Query<BriefDaysQuery>) -> Response {
+    let month = query
+        .month
+        .filter(|month| !month.is_empty())
+        .unwrap_or_else(|| Local::now().format("%Y-%m").to_string());
+    match tokio::task::spawn_blocking(move || brief::month_days(&month)).await {
+        Ok(Ok(days)) => (StatusCode::OK, Json(json!({ "days": days }))).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn brief_months_handler() -> Response {
+    match tokio::task::spawn_blocking(brief::all_months).await {
+        Ok(Ok(months)) => (StatusCode::OK, Json(json!({ "months": months }))).into_response(),
         Ok(Err(message)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "status": "error", "error": message })),

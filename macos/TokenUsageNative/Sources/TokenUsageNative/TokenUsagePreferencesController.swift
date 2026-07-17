@@ -3,7 +3,7 @@ import Foundation
 @MainActor
 public final class TokenUsagePreferencesController: ObservableObject {
     public static let briefSupportedSources: Set<TokenUsageSource> = [
-        .claude, .codex, .cursor, .zcode, .kimi
+        .claude, .codex, .opencode, .cursor, .zcode, .kimi
     ]
 
     @Published public var enabledSources: Set<TokenUsageSource> {

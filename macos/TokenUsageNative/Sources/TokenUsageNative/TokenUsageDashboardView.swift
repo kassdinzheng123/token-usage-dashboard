@@ -18,7 +18,6 @@ private let modelDistributionLegendRowHeight: CGFloat = 40
 private let modelDistributionLegendRowSpacing: CGFloat = 12
 private let modelDistributionLegendMaxPageSize = 5
 private let cliConsumptionPageSize = 5
-private let todayModelPageSize = 10
 private let allRangeBarPageSize = 60
 private let todayOverviewContentHeight = 340.0
 private let todaySourceRowHeight = 76.0
@@ -106,7 +105,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
         case .overview: "Overview"
         case .activity: "Activity"
         case .models: "Models"
-        case .brief: "Daily Brief"
+        case .brief: "Brief"
         case .logs: "Backend Logs"
         }
     }
@@ -275,11 +274,21 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     var records: [TokenUsageRecord] { get }
     var todaySummary: TodaySummaryResponse { get }
     var todayHourly: HourlyUsageResponse? { get }
+    /// Hourly usage keyed by date (YYYY-MM-DD) for the day drill-down view.
+    var hourlyByDate: [String: HourlyUsageResponse] { get }
     var todayBrief: TodayBriefResponse? { get }
     var isLoading: Bool { get }
     var isGeneratingBrief: Bool { get }
     var briefErrorMessage: String? { get }
     var isBackendConnected: Bool { get }
+    /// Cached briefs keyed by date (YYYY-MM-DD); today mirrors `todayBrief`.
+    var briefCache: [String: TodayBriefResponse] { get }
+    /// Dates confirmed to have no saved brief.
+    var briefMissingDates: Set<String> { get }
+    /// Day entries for the month currently shown in the brief month view.
+    var briefDays: [BriefDayEntry] { get }
+    /// Month entries for the brief all view.
+    var briefMonths: [BriefMonthEntry] { get }
 
     func refresh() async
     func refreshToday() async
@@ -287,6 +296,11 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     func refreshToday(force: Bool) async
     func refreshTodayBrief() async
     func generateTodayBrief(force: Bool, trigger: String) async
+    func loadBrief(for date: String) async
+    func loadHourly(for date: String) async
+    func loadBriefDays(month: String) async
+    func loadBriefMonths() async
+    func generateBrief(for date: String, mode: BriefRegenerateMode) async
     func updateDateRangeForViewMode()
 }
 
@@ -302,7 +316,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var tokenMixLegendPage = 0
     @State private var modelDistributionLegendCapacity = 1
     @State private var cliConsumptionPage = 0
-    @State private var todayModelPage = 0
     @State private var allRangeChartPage = 0
     @State private var heatmapPage = 0
     @State private var selectedPage: DashboardPage = .overview
@@ -310,6 +323,12 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var cliCompositionPane: DashboardCLICompositionPane = .cli
     @State private var modelCostMixPane: DashboardModelCostMixPane = .cost
     @State private var dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
+    @State private var modelConsumptionGrouping: ModelConsumptionGrouping = .model
+    @State private var modelConsumptionFilter = ""
+    /// Day drill-down: when set, Overview/Activity show this single day.
+    @State private var focusedDay: Date?
+    @State private var isDayJumpPresented = false
+    @State private var dayJumpSelection = Date()
     @State private var dashboardData: TokenUsageDashboardData
 
     init(
@@ -410,9 +429,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             .onChange(of: tokenTrendColorDomain) {
                 tokenTrendLegendPage = 0
             }
-            .onChange(of: dashboardData.modelUsageRows.count) {
-                todayModelPage = 0
-            }
             .onChange(of: currencyController.selectedCurrency) {
                 Task { await currencyController.refreshExchangeRateIfNeeded() }
             }
@@ -423,7 +439,6 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 }
                 updateDashboardData()
                 cliConsumptionPage = 0
-                todayModelPage = 0
             }
     }
 
@@ -550,7 +565,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         ScrollView(.vertical) {
             LazyVStack(alignment: .leading, spacing: 20) {
                 if store.records.isEmpty {
-                    dashboardLoadingView
+                    if focusedDay != nil && !store.isLoading {
+                        emptyTodayState(text: "No usage recorded for this day")
+                    } else {
+                        dashboardLoadingView
+                    }
                 } else {
                     heroMetricsRow
                     chartSection
@@ -565,11 +584,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     private var activityPage: some View {
         ScrollView(.vertical) {
             LazyVStack(alignment: .leading, spacing: 20) {
-                if selectedTimeRange == .today {
-                    // Today is driven by /api/hourly, not dashboard records.
+                if isDayMode {
+                    // Day view is driven by /api/hourly, not dashboard records.
                     // Don't wait on records — that raced and showed an empty state
                     // while hourly was still loading (or failed silently).
-                    if store.todayHourly == nil {
+                    if activeHourly == nil {
                         dashboardLoadingView
                     } else if hourlyPoints.isEmpty {
                         activityTodayEmptyState
@@ -590,14 +609,42 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .scrollIndicators(.visible)
     }
 
+    /// Day mode shows a single day's hourly strip: either the Today range or
+    /// a day drilled into from the All/Month views.
+    private var isDayMode: Bool {
+        focusedDay != nil || selectedTimeRange == .today
+    }
+
+    /// Hourly data for the day currently shown in day mode.
+    private var activeHourly: HourlyUsageResponse? {
+        guard let focusedDayString, focusedDayString != todayDateString else {
+            return store.todayHourly
+        }
+        return store.hourlyByDate[focusedDayString]
+    }
+
     private var activityTodayEmptyState: some View {
-        ContentUnavailableView {
-            Label("No Activity Yet Today", systemImage: "chart.bar.xaxis")
+        let isPastDay = focusedDayString != nil && focusedDayString != todayDateString
+        return ContentUnavailableView {
+            Label(
+                isPastDay ? "No Activity This Day" : "No Activity Yet Today",
+                systemImage: "chart.bar.xaxis"
+            )
         } description: {
-            Text("Hourly usage appears here once a CLI records a session today. Daily trends live under This Month.")
+            Text(
+                isPastDay
+                    ? "No CLI recorded usage on this day."
+                    : "Hourly usage appears here once a CLI records a session today. Daily trends live under This Month."
+            )
         } actions: {
-            Button("Show This Month") {
-                selectedTimeRange = .month
+            if isPastDay {
+                Button("Back to All") {
+                    clearFocusedDay()
+                }
+            } else {
+                Button("Show This Month") {
+                    selectedTimeRange = .month
+                }
             }
         }
         .frame(maxWidth: .infinity, minHeight: 420)
@@ -607,7 +654,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         ScrollView(.vertical) {
             LazyVStack(alignment: .leading, spacing: 20) {
                 if store.records.isEmpty {
-                    dashboardLoadingView
+                    if focusedDay != nil && !store.isLoading {
+                        emptyTodayState(text: "No usage recorded for this day")
+                    } else {
+                        dashboardLoadingView
+                    }
                 } else {
                     modelConsumptionSection
                 }
@@ -620,15 +671,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var briefPage: some View {
         ScrollView(.vertical) {
-            DailyBriefCard(
-                brief: store.todayBrief,
-                isLoading: store.isLoading,
-                isGenerating: store.isGeneratingBrief,
-                enabledSources: preferences.enabledSources,
-                errorMessage: store.briefErrorMessage,
-                onGenerate: {
-                    Task { await store.generateTodayBrief(force: true, trigger: "manual") }
-                }
+            BriefPageView(
+                store: store,
+                preferences: preferences,
+                currencyController: currencyController
             )
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -684,7 +730,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             }
 
             ToolbarItem(placement: .principal) {
-                timeRangePicker
+                HStack(spacing: 10) {
+                    timeRangePicker
+
+                    if let focusedDay {
+                        focusedDayChip(focusedDay)
+                    }
+
+                    dayJumpButton
+                }
             }
 
             ToolbarItem(placement: .primaryAction) {
@@ -778,11 +832,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private func handleSelectedTimeRangeChange() {
+        focusedDay = nil
         applyTimeRange(selectedTimeRange)
         updateDashboardData()
         tokenMixLegendPage = 0
         cliConsumptionPage = 0
-        todayModelPage = 0
         modelCostLegendPage = 0
         if selectedTimeRange == .today {
             cliCompositionPane = .cli
@@ -800,6 +854,11 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         let calendar = Calendar.current
         let today = Date()
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: today) ?? today
+        if let focusedDay {
+            store.startDate = calendar.startOfDay(for: focusedDay)
+            store.endDate = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: focusedDay)) ?? tomorrow
+            return
+        }
         switch range {
         case .today:
             store.startDate = calendar.startOfDay(for: today)
@@ -813,6 +872,37 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             store.startDate = calendar.date(from: components) ?? calendar.startOfDay(for: today)
         }
         store.endDate = tomorrow
+    }
+
+    // MARK: - Day drill-down
+
+    private var todayDateString: String {
+        DayDrillDownFormatters.dayString.string(from: Date())
+    }
+
+    private var focusedDayString: String? {
+        focusedDay.map { DayDrillDownFormatters.dayString.string(from: $0) }
+    }
+
+    /// Enters the day view for an arbitrary day (from the heatmap or the
+    /// calendar jump). Loads that day's records, hourly strip, and brief.
+    private func selectDay(_ date: Date) {
+        focusedDay = date
+        applyTimeRange(selectedTimeRange)
+        updateDashboardData()
+        let dateString = DayDrillDownFormatters.dayString.string(from: date)
+        Task {
+            await store.refreshDashboard(force: false)
+            await store.loadHourly(for: dateString)
+            await store.loadBrief(for: dateString)
+        }
+    }
+
+    private func clearFocusedDay() {
+        focusedDay = nil
+        applyTimeRange(selectedTimeRange)
+        updateDashboardData()
+        Task { await store.refreshDashboard(force: false) }
     }
 
     private var visibleSourcePickerOptions: [TokenUsageSource] {
@@ -830,6 +920,65 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         .labelsHidden()
         .pickerStyle(.segmented)
         .frame(width: 260)
+    }
+
+    /// Chip shown while the day drill-down is active; clearing it returns to
+    /// the selected time range.
+    private func focusedDayChip(_ day: Date) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "calendar.day.timeline.left")
+                .font(.caption2)
+            Text(DayDrillDownFormatters.dayTitle.string(from: day))
+                .font(.caption.weight(.medium))
+            Button {
+                clearFocusedDay()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundStyle(Color.accentColor)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .appGlassChip()
+        .help("Day view — click × to return")
+    }
+
+    /// Calendar jump into the day view from any range.
+    private var dayJumpButton: some View {
+        Button {
+            dayJumpSelection = focusedDay ?? Date()
+            isDayJumpPresented = true
+        } label: {
+            Image(systemName: "calendar")
+                .font(.system(size: 12, weight: .medium))
+        }
+        .help("Jump to a day")
+        .popover(isPresented: $isDayJumpPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("跳转到某天")
+                    .font(.headline)
+                DatePicker(
+                    "日期",
+                    selection: $dayJumpSelection,
+                    in: ...Date(),
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.graphical)
+                .labelsHidden()
+                HStack {
+                    Spacer()
+                    Button("查看当天") {
+                        isDayJumpPresented = false
+                        selectDay(dayJumpSelection)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+            .padding(14)
+        }
     }
 
     private var sourcePicker: some View {
@@ -1096,7 +1245,13 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var heroPeriodLabel: String {
-        switch selectedTimeRange {
+        if let focusedDay {
+            let dateString = DayDrillDownFormatters.dayString.string(from: focusedDay)
+            return dateString == todayDateString
+                ? "Today"
+                : DayDrillDownFormatters.dayTitle.string(from: focusedDay)
+        }
+        return switch selectedTimeRange {
         case .today: "Today"
         case .month: "This Month"
         case .all: "All Time"
@@ -1243,7 +1398,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                         DashboardHeatmapView(
                             days: visibleHeatmapDays,
                             availableWidth: heatmapGeometry.size.width,
-                            costText: { currencyController.string(fromUSD: $0) }
+                            costText: { currencyController.string(fromUSD: $0) },
+                            onSelectDay: { selectDay($0.date) }
                         )
                         .frame(width: heatmapGeometry.size.width, height: dailyUsageContentHeight)
                     }
@@ -1281,36 +1437,65 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var modelConsumptionSection: some View {
         ChartCard(title: "Model Consumption") {
-            if dashboardModelPageCount > 1 {
-                LegendPageControls(
-                    currentPage: clampedDashboardModelPage,
-                    pageCount: dashboardModelPageCount,
-                    totalCount: dashboardData.modelUsageRows.count,
-                    onPrevious: {
-                        todayModelPage = max(clampedDashboardModelPage - 1, 0)
-                    },
-                    onNext: {
-                        todayModelPage = min(clampedDashboardModelPage + 1, dashboardModelPageCount - 1)
+            HStack(spacing: 10) {
+                Picker("Group by", selection: $modelConsumptionGrouping) {
+                    ForEach(ModelConsumptionGrouping.allCases) { grouping in
+                        Text(grouping.label).tag(grouping)
                     }
-                )
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 140)
+
+                modelConsumptionFilterField
             }
         } content: {
             dashboardModelConsumption
         }
     }
 
+    private var modelConsumptionFilterField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            TextField(
+                modelConsumptionGrouping == .model ? "Filter models" : "Filter CLIs",
+                text: $modelConsumptionFilter
+            )
+            .textFieldStyle(.plain)
+            .font(.caption)
+            if !modelConsumptionFilter.isEmpty {
+                Button {
+                    modelConsumptionFilter = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .appGlassChip()
+        .frame(width: 170)
+    }
+
     @ViewBuilder
     private var dashboardModelConsumption: some View {
-        let rows = dashboardData.modelUsageRows
-        if rows.isEmpty {
+        let rows = filteredModelConsumptionRows
+        if dashboardData.modelUsageRows.isEmpty {
             emptyTodayState(text: store.isLoading ? "Loading models..." : "No model usage recorded")
+        } else if rows.isEmpty {
+            emptyTodayState(text: "No matching entries")
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 10) {
-                    Text("Model")
+                    Text(modelConsumptionGrouping == .model ? "Model" : "CLI")
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Source")
-                        .frame(width: 120, alignment: .leading)
+                    Text(modelConsumptionGrouping == .model ? "Used by" : "Models")
+                        .frame(width: 150, alignment: .leading)
                     Text("Tokens")
                         .frame(width: 92, alignment: .trailing)
                     Text("Cache")
@@ -1325,31 +1510,80 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
                 Divider()
 
-                ForEach(Array(visibleDashboardModelRows.enumerated()), id: \.element.dashboardID) { index, row in
-                    TodayModelRowView(row: row, costText: currencyController.string(fromUSD: row.totalCostDecimal))
-                    if index < visibleDashboardModelRows.count - 1 {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                    ModelConsumptionGroupRowView(
+                        row: row,
+                        grouping: modelConsumptionGrouping,
+                        costText: currencyController.string(fromUSD: row.totalCost)
+                    )
+                    if index < rows.count - 1 {
                         Divider()
                     }
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: 260, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
 
-    private var dashboardModelPageCount: Int {
-        max(Int(ceil(Double(dashboardData.modelUsageRows.count) / Double(todayModelPageSize))), 1)
+    /// Groups the (CLI × model) usage rows by the selected dimension and
+    /// keeps the other dimension as hoverable icon parts.
+    private var groupedModelConsumptionRows: [ModelConsumptionGroupRow] {
+        var totals: [String: ModelConsumptionTotals] = [:]
+        for row in dashboardData.modelUsageRows {
+            let key = modelConsumptionGrouping == .model ? row.modelName : row.source.rawValue
+            var entry = totals[key] ?? ModelConsumptionTotals()
+            entry.total += row.totalTokens
+            entry.cache += row.cacheCreationTokens + row.cacheReadTokens
+            entry.cost += row.totalCostDecimal
+            let partCost = currencyController.string(fromUSD: row.totalCostDecimal)
+            let partLabel: String
+            let partModel: String?
+            let partSource: UsageSource?
+            switch modelConsumptionGrouping {
+            case .model:
+                partLabel = row.source.label
+                partModel = nil
+                partSource = row.source
+            case .cli:
+                partLabel = displayModelName(row.modelName)
+                partModel = row.modelName
+                partSource = nil
+            }
+            entry.parts.append(
+                ModelConsumptionPart(
+                    id: modelConsumptionGrouping == .model ? row.source.rawValue : row.modelName,
+                    label: partLabel,
+                    modelName: partModel,
+                    source: partSource,
+                    tokens: row.totalTokens,
+                    tooltip: "\(partLabel)\n\(row.totalTokens.tokenText) tokens · \(partCost)"
+                )
+            )
+            totals[key] = entry
+        }
+
+        return totals.map { key, entry in
+            ModelConsumptionGroupRow(
+                id: key,
+                title: modelConsumptionGrouping == .model ? displayModelName(key) : (UsageSource(rawValue: key)?.label ?? key),
+                modelName: modelConsumptionGrouping == .model ? key : nil,
+                source: modelConsumptionGrouping == .cli ? UsageSource(rawValue: key) : nil,
+                totalTokens: entry.total,
+                cacheShare: entry.total > 0 ? Double(entry.cache) / Double(entry.total) : 0,
+                totalCost: entry.cost,
+                parts: entry.parts.sorted { $0.tokens > $1.tokens }
+            )
+        }
+        .sorted { $0.totalCost > $1.totalCost }
     }
 
-    private var clampedDashboardModelPage: Int {
-        min(max(todayModelPage, 0), dashboardModelPageCount - 1)
-    }
-
-    private var visibleDashboardModelRows: [TodayModelUsageRow] {
-        let rows = dashboardData.modelUsageRows
-        let start = clampedDashboardModelPage * todayModelPageSize
-        guard start < rows.count else { return rows }
-        let end = min(start + todayModelPageSize, rows.count)
-        return Array(rows[start..<end])
+    private var filteredModelConsumptionRows: [ModelConsumptionGroupRow] {
+        let query = modelConsumptionFilter.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return groupedModelConsumptionRows }
+        return groupedModelConsumptionRows.filter { row in
+            row.title.localizedCaseInsensitiveContains(query)
+                || row.parts.contains { $0.label.localizedCaseInsensitiveContains(query) }
+        }
     }
 
     // MARK: - Activity insight sections (Daily Cost / By Weekday / Cache Efficiency)
@@ -1427,7 +1661,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     // MARK: - Hourly (Today range)
 
     private var hourlyPoints: [HourlyUsagePoint] {
-        guard let hours = store.todayHourly?.hours else { return [] }
+        guard let hours = activeHourly?.hours else { return [] }
         return hours.compactMap { row in
             guard let tokenSource = TokenUsageSource(rawValue: row.source.rawValue),
                   preferences.enabledSources.contains(tokenSource),
@@ -1457,17 +1691,27 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var hourlyShowsNowIndicator: Bool {
-        guard let date = store.todayHourly?.date else { return false }
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return date == formatter.string(from: Date())
+        guard let date = activeHourly?.date else { return false }
+        return date == todayDateString
+    }
+
+    /// Brief hour headlines for the day shown in day mode.
+    private var dayTimelineBriefHours: [HourlyBriefItem] {
+        let dateString = focusedDayString ?? todayDateString
+        if dateString == todayDateString, let todayBrief = store.todayBrief {
+            return todayBrief.hours ?? []
+        }
+        return store.briefCache[dateString]?.hours ?? []
     }
 
     /// 24h usage strip + hour event rail (no Daily Brief kanban board).
     private var todayTimelineSection: some View {
-        ChartCard(title: "Today Timeline") {
+        let title = focusedDayString.map { dateString in
+            dateString == todayDateString
+                ? "Today Timeline"
+                : "\(DayDrillDownFormatters.dayTitle.string(from: focusedDay ?? Date())) Timeline"
+        } ?? "Today Timeline"
+        return ChartCard(title: title) {
             if let hourlyPeakSummary {
                 Text(hourlyPeakSummary)
                     .font(.caption.monospacedDigit())
@@ -1476,7 +1720,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         } content: {
             TodayHourlyTimelineView(
                 points: hourlyPoints,
-                briefHours: store.todayBrief?.hours ?? [],
+                briefHours: dayTimelineBriefHours,
                 colorDomain: hourlyColorDomain,
                 colorRange: hourlyColorRange,
                 showsNowIndicator: hourlyShowsNowIndicator
@@ -3720,9 +3964,11 @@ private struct TodayHourlyTimelineView: View {
 
 struct ProviderIconBadge: View {
     private let metadata: ProviderMetadata
+    private let size: CGFloat
 
-    init(modelName: String) {
+    init(modelName: String, size: CGFloat = 22) {
         metadata = ProviderMetadata.forModel(modelName)
+        self.size = size
     }
 
     var body: some View {
@@ -3733,19 +3979,22 @@ struct ProviderIconBadge: View {
 
     @ViewBuilder
     private var badgeBody: some View {
+        let shape = RoundedRectangle(cornerRadius: size * 0.23, style: .continuous)
         if let imageAssetName = metadata.imageAssetName {
             BundledIconImage(
                 imageAssetName: imageAssetName,
                 tint: metadata.preservesOriginalImageColor ? nil : metadata.color,
                 padding: 1
             )
-            .frame(width: 22, height: 22)
-            .background(metadata.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+            .frame(width: size, height: size)
+            .background(metadata.color.opacity(0.10), in: shape)
+            .background(.ultraThinMaterial, in: shape)
+            .overlay(shape.stroke(metadata.color.opacity(0.18), lineWidth: 0.5))
         } else {
             Text(metadata.abbreviation)
-                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .font(.system(size: size * 0.41, weight: .bold, design: .rounded))
                 .foregroundStyle(metadata.color)
-                .frame(width: 24, height: 18)
+                .frame(width: size + 2, height: size - 4)
                 .background(metadata.color.opacity(0.13), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -3757,6 +4006,7 @@ struct ProviderIconBadge: View {
 
 struct UsageSourceIconBadge: View {
     let source: UsageSource
+    var size: CGFloat = 22
 
     var body: some View {
         sourceIconBadge
@@ -3766,15 +4016,18 @@ struct UsageSourceIconBadge: View {
 
     @ViewBuilder
     private var sourceIconBadge: some View {
+        let shape = RoundedRectangle(cornerRadius: size * 0.23, style: .continuous)
         if let imageAssetName = source.imageAssetName {
             BundledIconImage(imageAssetName: imageAssetName, padding: 1)
-                .frame(width: 22, height: 22)
-                .background(source.iconBadgeBackgroundColor, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .frame(width: size, height: size)
+                .background(source.iconBadgeBackgroundColor, in: shape)
+                .background(.ultraThinMaterial, in: shape)
+                .overlay(shape.stroke(source.tintColor.opacity(0.16), lineWidth: 0.5))
         } else {
             Image(systemName: source.systemImage)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: size * 0.5, weight: .semibold))
                 .foregroundStyle(source.tintColor)
-                .frame(width: 22, height: 18)
+                .frame(width: size, height: size - 4)
                 .background(source.tintColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         }
     }
@@ -3995,6 +4248,8 @@ private struct DashboardHeatmapView: View {
     let days: [DashboardHeatmapDay]
     let availableWidth: CGFloat
     let costText: (Decimal) -> String
+    /// Day tap for the day drill-down; nil disables cell interaction.
+    var onSelectDay: ((DashboardHeatmapDay) -> Void)? = nil
 
     @State private var hoveredDay: DashboardHeatmapDay?
 
@@ -4223,6 +4478,9 @@ private struct DashboardHeatmapView: View {
                     } else if hoveredDay?.date == day.date {
                         hoveredDay = nil
                     }
+                }
+                .onTapGesture {
+                    onSelectDay?(day)
                 }
         } else {
             RoundedRectangle(cornerRadius: 3, style: .continuous)
@@ -4533,29 +4791,70 @@ private struct TokenMixLegend: View {
     }
 }
 
-private struct TodayModelRowView: View {
-    let row: TodayModelUsageRow
+private enum ModelConsumptionGrouping: String, CaseIterable, Identifiable {
+    case model
+    case cli
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .model: "Model"
+        case .cli: "CLI"
+        }
+    }
+}
+
+private struct ModelConsumptionPart: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let modelName: String?
+    let source: UsageSource?
+    let tokens: Int
+    let tooltip: String
+}
+
+private struct ModelConsumptionTotals {
+    var total = 0
+    var cache = 0
+    var cost = Decimal.zero
+    var parts: [ModelConsumptionPart] = []
+}
+
+private struct ModelConsumptionGroupRow: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let modelName: String?
+    let source: UsageSource?
+    let totalTokens: Int
+    let cacheShare: Double
+    let totalCost: Decimal
+    let parts: [ModelConsumptionPart]
+}
+
+private struct ModelConsumptionGroupRowView: View {
+    let row: ModelConsumptionGroupRow
+    let grouping: ModelConsumptionGrouping
     let costText: String
 
     var body: some View {
-        let modelLabel = displayModelName(row.modelName)
         HStack(spacing: 10) {
             HStack(spacing: 8) {
-                ProviderIconBadge(modelName: row.modelName)
-                Text(modelLabel)
+                if grouping == .model, let modelName = row.modelName {
+                    ProviderIconBadge(modelName: modelName)
+                } else if let source = row.source {
+                    UsageSourceIconBadge(source: source)
+                }
+                Text(row.title)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .help(row.modelName)
+                    .help(row.modelName ?? row.title)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 6) {
-                UsageSourceIconBadge(source: row.source)
-                Text(row.source.label)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(width: 120, alignment: .leading)
+            ModelConsumptionPartStack(parts: row.parts, grouping: grouping)
+                .frame(width: 150, alignment: .leading)
+
             Text(row.totalTokens.tokenText)
                 .font(.system(.caption, design: .monospaced))
                 .frame(width: 92, alignment: .trailing)
@@ -4570,6 +4869,51 @@ private struct TodayModelRowView: View {
         .font(.caption)
         .padding(.horizontal, 2)
         .padding(.vertical, 7)
+    }
+}
+
+/// Inline row of counterpart icons (CLIs for a model, models for a CLI).
+/// Hovering an icon shows the counterpart's name and its usage.
+private struct ModelConsumptionPartStack: View {
+    let parts: [ModelConsumptionPart]
+    let grouping: ModelConsumptionGrouping
+    @State private var hoveredPartID: String?
+    private let maxVisible = 6
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(parts.prefix(maxVisible)) { part in
+                partIcon(part)
+                    .scaleEffect(hoveredPartID == part.id ? 1.18 : 1)
+                    .zIndex(hoveredPartID == part.id ? 1 : 0)
+                    .onHover { hovering in
+                        withAnimation(.easeInOut(duration: 0.12)) {
+                            hoveredPartID = hovering ? part.id : nil
+                        }
+                    }
+                    .help(part.tooltip)
+            }
+            if parts.count > maxVisible {
+                Text("+\(parts.count - maxVisible)")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 20)
+                    .background(
+                        Color.primary.opacity(0.06),
+                        in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    )
+                    .help(parts.dropFirst(maxVisible).map(\.label).joined(separator: ", "))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func partIcon(_ part: ModelConsumptionPart) -> some View {
+        if grouping == .model, let source = part.source {
+            UsageSourceIconBadge(source: source, size: 20)
+        } else if let modelName = part.modelName {
+            ProviderIconBadge(modelName: modelName, size: 20)
+        }
     }
 }
 
@@ -4697,18 +5041,27 @@ private struct ChartTooltipRow {
     let value: String
     var color: Color? = nil
     var emphasized: Bool = false
+    var multiline: Bool = false
 
-    init(_ label: String, _ value: String, color: Color? = nil, emphasized: Bool = false) {
+    init(
+        _ label: String,
+        _ value: String,
+        color: Color? = nil,
+        emphasized: Bool = false,
+        multiline: Bool = false
+    ) {
         self.label = label
         self.value = value
         self.color = color
         self.emphasized = emphasized
+        self.multiline = multiline
     }
 }
 
 private struct ChartTooltipPanel: View {
     let title: String
     let rows: [ChartTooltipRow]
+    var width: CGFloat = chartTooltipWidth
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -4719,29 +5072,36 @@ private struct ChartTooltipPanel: View {
                 .padding(.bottom, 1)
 
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 6) {
-                    if let color = row.color {
-                        Circle()
-                            .fill(color)
-                            .frame(width: 6, height: 6)
-                    }
+                if row.multiline {
                     Text(row.label)
                         .foregroundStyle(row.emphasized ? Color.primary : Color.secondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 12)
-                    Text(row.value)
-                        .font(.system(.caption, design: .monospaced))
-                        .fontWeight(row.emphasized ? .semibold : .regular)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    HStack(spacing: 6) {
+                        if let color = row.color {
+                            Circle()
+                                .fill(color)
+                                .frame(width: 6, height: 6)
+                        }
+                        Text(row.label)
+                            .foregroundStyle(row.emphasized ? Color.primary : Color.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 12)
+                        Text(row.value)
+                            .font(.system(.caption, design: .monospaced))
+                            .fontWeight(row.emphasized ? .semibold : .regular)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                    }
                 }
             }
         }
         .font(.caption)
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .frame(width: chartTooltipWidth, alignment: .leading)
+        .frame(width: width, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         .appFloatingOverlaySurface(cornerRadius: 10)
         .allowsHitTesting(false)
@@ -4875,30 +5235,56 @@ private struct LegendPageControls: View {
     let onPrevious: () -> Void
     let onNext: () -> Void
 
+    /// Dots replace the "n/m" readout for a handful of pages; beyond that the
+    /// readout stays compact.
+    private var showsDots: Bool { pageCount <= 8 }
+
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
             Button(action: onPrevious) {
                 Image(systemName: "chevron.left")
+                    .font(.system(size: 9, weight: .bold))
                     .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .foregroundStyle(currentPage == 0 ? Color.primary.opacity(0.25) : Color.primary.opacity(0.75))
             .disabled(currentPage == 0)
-            .help("Previous models")
+            .help("Previous page")
 
-            Text("\(currentPage + 1)/\(pageCount)")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 34)
-                .help("\(totalCount) models")
+            if showsDots {
+                HStack(spacing: 4) {
+                    ForEach(0..<pageCount, id: \.self) { page in
+                        Circle()
+                            .fill(page == currentPage ? Color.accentColor : Color.primary.opacity(0.18))
+                            .frame(width: page == currentPage ? 6 : 4, height: page == currentPage ? 6 : 4)
+                            .animation(.easeInOut(duration: 0.15), value: currentPage)
+                    }
+                }
+                .frame(minWidth: 34)
+                .help("\(totalCount) items · page \(currentPage + 1) of \(pageCount)")
+            } else {
+                Text("\(currentPage + 1)/\(pageCount)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 34)
+                    .help("\(totalCount) items")
+            }
 
             Button(action: onNext) {
                 Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
                     .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .foregroundStyle(currentPage >= pageCount - 1 ? Color.primary.opacity(0.25) : Color.primary.opacity(0.75))
             .disabled(currentPage >= pageCount - 1)
-            .help("Next models")
+            .help("Next page")
         }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .appGlassChip()
         .fixedSize()
     }
 }
@@ -5532,7 +5918,12 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     @Published private(set) var records: [TokenUsageRecord]
     @Published private(set) var todaySummary: TodaySummaryResponse
     @Published private(set) var todayHourly: HourlyUsageResponse?
+    @Published private(set) var hourlyByDate: [String: HourlyUsageResponse] = [:]
     @Published private(set) var todayBrief: TodayBriefResponse?
+    @Published private(set) var briefCache: [String: TodayBriefResponse] = [:]
+    @Published private(set) var briefMissingDates: Set<String> = []
+    @Published private(set) var briefDays: [BriefDayEntry] = []
+    @Published private(set) var briefMonths: [BriefMonthEntry] = []
     @Published private(set) var isLoading = false
     @Published private(set) var isGeneratingBrief = false
     @Published private(set) var briefErrorMessage: String?
@@ -5624,6 +6015,16 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     func refreshTodayBrief() async {}
 
     func generateTodayBrief(force: Bool, trigger: String) async {}
+
+    func loadBrief(for date: String) async {}
+
+    func loadHourly(for date: String) async {}
+
+    func loadBriefDays(month: String) async {}
+
+    func loadBriefMonths() async {}
+
+    func generateBrief(for date: String, mode: BriefRegenerateMode) async {}
 
     func updateDateRangeForViewMode() {
         // Mock: no-op
@@ -5769,4 +6170,24 @@ struct TokenUsageDashboardView_Previews: PreviewProvider {
             preferences: TokenUsagePreferencesController()
         )
     }
+}
+
+/// Formatters shared by the day drill-down. File scope because stored statics
+/// are not allowed inside the generic dashboard view.
+private enum DayDrillDownFormatters {
+    static let dayString: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    static let dayTitle: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale.current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 }
