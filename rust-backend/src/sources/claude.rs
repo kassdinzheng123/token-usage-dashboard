@@ -655,16 +655,20 @@ fn block_row(start: DateTime<Local>, entries: &[UsageEntry]) -> Value {
     };
     let model_name = aggregate
         .by_model
-        .keys()
-        .next()
-        .cloned()
+        .iter()
+        .max_by_key(|(_, totals)| totals.total_tokens())
+        .map(|(model, _)| model.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    let models_used = aggregate.models_used();
+    let model_breakdowns = aggregate.model_breakdowns();
     let timestamp = start.to_rfc3339();
 
     json!({
         "blockId": timestamp,
         "sessionId": session_id,
         "modelName": model_name,
+        "modelsUsed": models_used,
+        "modelBreakdowns": model_breakdowns,
         "timestamp": timestamp,
         "date": start.format("%Y-%m-%d").to_string(),
         "time": start.format("%H:%M").to_string(),
@@ -994,6 +998,50 @@ not-json
             after_midnight.format("%Y-%m-%d").to_string()
         );
         assert_eq!(blocks[1]["totalTokens"], 30);
+    }
+
+    #[test]
+    fn mixed_model_block_preserves_breakdowns_and_uses_dominant_label() {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 26, 10, 0, 0)
+            .single()
+            .unwrap();
+        let entry = |minute: i64, model: &str, tokens: i64, key: &str| UsageEntry {
+            timestamp: start + Duration::minutes(minute),
+            session_id: "s1".to_string(),
+            model: model.to_string(),
+            usage: UsageCounts {
+                input_tokens: tokens,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            cost_usd: tokens as f64 / 1_000.0,
+            message_key: key.to_string(),
+        };
+        let entries = vec![
+            entry(0, "claude-haiku", 10, "m1"),
+            entry(10, "claude-opus", 100, "m2"),
+            entry(20, "claude-sonnet", 20, "m3"),
+        ];
+
+        let blocks = entries_to_blocks(&entries);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["modelName"], "claude-opus");
+        assert_eq!(blocks[0]["totalTokens"], 130);
+        let breakdowns = blocks[0]["modelBreakdowns"].as_array().unwrap();
+        assert_eq!(breakdowns.len(), 3);
+        let tokens_for = |model: &str| {
+            breakdowns
+                .iter()
+                .find(|row| row["modelName"] == model)
+                .map(|row| row["inputTokens"].as_i64().unwrap())
+                .unwrap()
+        };
+        assert_eq!(tokens_for("claude-haiku"), 10);
+        assert_eq!(tokens_for("claude-opus"), 100);
+        assert_eq!(tokens_for("claude-sonnet"), 20);
     }
 
     #[test]

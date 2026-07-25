@@ -476,9 +476,10 @@ impl UsageLedger {
                     INSERT INTO usage_blocks (
                         source, block_id, session_id, model_name, timestamp, date, time,
                         input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
-                        total_tokens, cost, row_json, first_seen_at, last_seen_at
+                        total_tokens, cost, model_breakdowns_json, row_json,
+                        first_seen_at, last_seen_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
                     ON CONFLICT(source, block_id) DO UPDATE SET
                         session_id = excluded.session_id,
                         model_name = excluded.model_name,
@@ -491,6 +492,7 @@ impl UsageLedger {
                         cache_read_tokens = excluded.cache_read_tokens,
                         total_tokens = excluded.total_tokens,
                         cost = excluded.cost,
+                        model_breakdowns_json = excluded.model_breakdowns_json,
                         row_json = excluded.row_json,
                         last_seen_at = excluded.last_seen_at
                     WHERE excluded.total_tokens >= usage_blocks.total_tokens
@@ -515,6 +517,7 @@ impl UsageLedger {
                         number_i64(row, "cacheReadTokens"),
                         number_i64(row, "totalTokens"),
                         number_f64(row, "cost"),
+                        json_array_field(row, "modelBreakdowns").to_string(),
                         row.to_string(),
                         now,
                     ],
@@ -727,7 +730,8 @@ impl UsageLedger {
                 let sql = format!(
                     r#"
                     SELECT model_name, input_tokens, output_tokens,
-                           cache_creation_tokens, cache_read_tokens, cost
+                           cache_creation_tokens, cache_read_tokens, cost,
+                           model_breakdowns_json
                     FROM usage_blocks
                     WHERE source = ?1 AND {predicate}
                     "#,
@@ -741,10 +745,37 @@ impl UsageLedger {
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, f64>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 })?;
                 for row in rows {
-                    let (raw_model, input, output, cache_creation, cache_read, cost) = row?;
+                    let (
+                        raw_model,
+                        input,
+                        output,
+                        cache_creation,
+                        cache_read,
+                        cost,
+                        raw_breakdowns,
+                    ) = row?;
+                    let mut used_breakdowns = false;
+                    if let Ok(Value::Array(items)) =
+                        serde_json::from_str::<Value>(&raw_breakdowns)
+                    {
+                        for item in items {
+                            let model_name = item
+                                .get("modelName")
+                                .and_then(Value::as_str)
+                                .filter(|model| !model.is_empty())
+                                .unwrap_or("unknown");
+                            let clustered = sources::cluster_model_name(model_name);
+                            models.entry(clustered).or_default().add_breakdown(&item);
+                            used_breakdowns = true;
+                        }
+                    }
+                    if used_breakdowns {
+                        continue;
+                    }
                     let clustered = sources::cluster_model_name(&raw_model);
                     let entry = models.entry(clustered).or_default();
                     entry.input_tokens += input;
@@ -971,6 +1002,7 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
             cost REAL NOT NULL DEFAULT 0,
+            model_breakdowns_json TEXT NOT NULL DEFAULT '[]',
             row_json TEXT NOT NULL,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
@@ -1009,8 +1041,9 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     migrate_legacy_cursor_source(connection)?;
     migrate_message_level_hourly(connection)?;
     migrate_token_occurrence_dates(connection)?;
+    migrate_block_model_breakdowns(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '4')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '5')",
         [],
     )?;
     Ok(())
@@ -1069,6 +1102,58 @@ fn migrate_token_occurrence_dates(connection: &mut Connection) -> Result<(), rus
     transaction.execute("DELETE FROM ingest_state WHERE source = 'claude'", [])?;
     transaction.execute(
         "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '4')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Schema v5 preserves every model represented in a mixed Claude activity
+/// block. Historical block rows contain only one scalar model name, so their
+/// per-model token split cannot be reconstructed without re-reading the source
+/// logs.
+fn migrate_block_model_breakdowns(connection: &mut Connection) -> Result<(), rusqlite::Error> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: i64 = transaction
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 5 {
+        transaction.commit()?;
+        return Ok(());
+    }
+
+    let has_breakdowns_column = {
+        let mut statement = transaction.prepare("PRAGMA table_info(usage_blocks)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for column in columns {
+            if column? == "model_breakdowns_json" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_breakdowns_column {
+        transaction.execute(
+            "ALTER TABLE usage_blocks ADD COLUMN model_breakdowns_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+
+    transaction.execute("DELETE FROM usage_sessions WHERE source = 'claude'", [])?;
+    transaction.execute("DELETE FROM usage_blocks WHERE source = 'claude'", [])?;
+    transaction.execute("DELETE FROM usage_messages WHERE source = 'claude'", [])?;
+    transaction.execute("DELETE FROM ingest_state WHERE source = 'claude'", [])?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '5')",
         [],
     )?;
     transaction.commit()?;
@@ -1520,7 +1605,7 @@ mod tests {
                     json!({
                         "blockId": "claude-2026-07-26",
                         "sessionId": "claude-session",
-                        "modelName": "claude-opus",
+                        "modelName": "claude-haiku",
                         "timestamp": "2026-07-26T00:00:00+08:00",
                         "date": "2026-07-26",
                         "time": "00:00",
@@ -1530,6 +1615,24 @@ mod tests {
                         "cacheReadTokens": 0,
                         "totalTokens": 200,
                         "cost": 0.2,
+                        "modelBreakdowns": [
+                            {
+                                "modelName": "claude-haiku",
+                                "inputTokens": 20,
+                                "outputTokens": 0,
+                                "cacheCreationTokens": 0,
+                                "cacheReadTokens": 0,
+                                "cost": 0.02,
+                            },
+                            {
+                                "modelName": "claude-opus",
+                                "inputTokens": 180,
+                                "outputTokens": 0,
+                                "cacheCreationTokens": 0,
+                                "cacheReadTokens": 0,
+                                "cost": 0.18,
+                            }
+                        ],
                     }),
                 ],
             )
@@ -1557,6 +1660,15 @@ mod tests {
         assert_eq!(claude_daily[0]["totalTokens"], 100);
         assert_eq!(claude_daily[1]["date"], "2026-07-26");
         assert_eq!(claude_daily[1]["totalTokens"], 200);
+        assert_eq!(claude_daily[1]["modelsUsed"], json!(["claude-haiku", "claude-opus"]));
+        assert_eq!(
+            claude_daily[1]["modelBreakdowns"][0]["inputTokens"],
+            20
+        );
+        assert_eq!(
+            claude_daily[1]["modelBreakdowns"][1]["inputTokens"],
+            180
+        );
 
         let daily = ledger
             .daily_usage_rollup("2026-07-25", "2026-07-26")
@@ -1578,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_migration_rebuilds_all_claude_derived_rows() {
+    fn migrations_rebuild_all_claude_derived_rows() {
         let ledger = test_ledger();
         let path = ledger.path.clone();
         ledger
@@ -1656,7 +1768,94 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "4");
+        assert_eq!(schema_version, "5");
+    }
+
+    #[test]
+    fn v5_migration_adds_block_breakdowns_and_preserves_other_sources() {
+        let ledger = test_ledger();
+        let path = ledger.path.clone();
+        ledger
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    r#"
+                    DROP TABLE usage_blocks;
+                    CREATE TABLE usage_blocks (
+                        source TEXT NOT NULL,
+                        block_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL DEFAULT '',
+                        model_name TEXT NOT NULL DEFAULT 'unknown',
+                        timestamp TEXT NOT NULL DEFAULT '',
+                        date TEXT NOT NULL,
+                        time TEXT NOT NULL DEFAULT '',
+                        input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                        total_tokens INTEGER NOT NULL DEFAULT 0,
+                        cost REAL NOT NULL DEFAULT 0,
+                        row_json TEXT NOT NULL,
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        PRIMARY KEY (source, block_id)
+                    );
+                    INSERT INTO usage_blocks (
+                        source, block_id, date, total_tokens, row_json,
+                        first_seen_at, last_seen_at
+                    ) VALUES
+                        ('claude', 'legacy-claude', '2026-07-26', 10, '{}', '', ''),
+                        ('cursor', 'cursor-block', '2026-07-26', 20, '{}', '', '');
+                    INSERT OR REPLACE INTO ingest_state (source, last_ingest_at)
+                    VALUES ('claude', 1000);
+                    UPDATE ledger_meta SET value = '4' WHERE key = 'schema_version';
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(ledger);
+
+        let migrated = UsageLedger::new(path.clone()).unwrap();
+
+        let columns: Vec<String> = migrated
+            .with_connection(|connection| {
+                let mut statement = connection.prepare("PRAGMA table_info(usage_blocks)")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert!(columns.contains(&"model_breakdowns_json".to_string()));
+        assert_eq!(migrated.ingest_watermark(Source::Claude).unwrap(), None);
+        let counts: (i64, i64) = migrated
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM usage_blocks WHERE source = 'claude'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM usage_blocks WHERE source = 'cursor'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(counts, (0, 1));
+        drop(migrated);
+
+        let reopened = UsageLedger::new(path).unwrap();
+        let cursor_count: i64 = reopened
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM usage_blocks WHERE source = 'cursor'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(cursor_count, 1);
     }
 
     #[test]
