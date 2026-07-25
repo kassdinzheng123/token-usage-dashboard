@@ -507,11 +507,28 @@ pub struct TodayBriefSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct TodayBriefHourProject {
+    pub source: String,
+    pub project: String,
+    pub tokens: i64,
+    pub session_count: usize,
+    /// Per-project headline for this hour. Absent in briefs saved before this
+    /// field existed; clients fall back to the hour's top-level headline.
+    #[serde(default)]
+    pub headline: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TodayBriefHour {
     pub hour: i64,
     pub headline: String,
     pub session_count: usize,
     pub tokens: i64,
+    /// Per-project breakdown of this hour's activity. Absent in briefs saved
+    /// before this field existed; clients fall back to per-CLI chips.
+    #[serde(default)]
+    pub projects: Vec<TodayBriefHourProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -569,18 +586,33 @@ pub fn build_board_summary(cards: &[TodayBriefCard]) -> String {
     if cards.is_empty() {
         return "今日暂无项目摘要".to_string();
     }
-    let previews: Vec<String> = cards
+    // Collapse CLIs working on the same project so the summary reads
+    // "Summer；token-usage" instead of "Codex·summer；Cursor·summer；…".
+    let mut seen: Vec<String> = Vec::new();
+    let unique_projects: Vec<&str> = cards
         .iter()
+        .filter_map(|card| {
+            if seen.iter().any(|p| p == &card.project) {
+                None
+            } else {
+                seen.push(card.project.clone());
+                Some(card.project.as_str())
+            }
+        })
         .take(3)
-        .map(|card| format!("{}·{}", short_source(&card.source), card.project))
         .collect();
-    if cards.len() <= 3 {
-        format!("{} 个项目：{}", cards.len(), previews.join("；"))
+    let total_projects = cards
+        .iter()
+        .map(|card| &card.project)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if unique_projects.len() >= total_projects {
+        format!("{} 个项目：{}", total_projects, unique_projects.join("；"))
     } else {
         format!(
             "{} 个项目：{} 等",
-            cards.len(),
-            previews.join("；")
+            total_projects,
+            unique_projects.join("；")
         )
     }
 }

@@ -18,6 +18,8 @@ private let modelDistributionLegendRowHeight: CGFloat = 40
 private let modelDistributionLegendRowSpacing: CGFloat = 12
 private let modelDistributionLegendMaxPageSize = 5
 private let cliConsumptionPageSize = 5
+private let modelConsumptionRowHeight: CGFloat = 37
+private let modelConsumptionMaxPageSize = 10
 private let allRangeBarPageSize = 60
 private let todayOverviewContentHeight = 340.0
 private let todaySourceRowHeight = 76.0
@@ -324,7 +326,10 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     @State private var modelCostMixPane: DashboardModelCostMixPane = .cost
     @State private var dailyUsageAggregation: DashboardDailyUsageAggregation = .cli
     @State private var modelConsumptionGrouping: ModelConsumptionGrouping = .model
-    @State private var modelConsumptionFilter = ""
+    @State private var modelConsumptionModelFilter: String?
+    @State private var modelConsumptionCLIFilter: UsageSource?
+    @State private var modelConsumptionPage = 0
+    @State private var modelConsumptionPageCapacity = 4
     /// Day drill-down: when set, Overview/Activity show this single day.
     @State private var focusedDay: Date?
     @State private var isDayJumpPresented = false
@@ -426,6 +431,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 updateDashboardData()
                 tokenTrendLegendPage = 0
             }
+            .onChange(of: modelConsumptionGrouping) {
+                modelConsumptionPage = 0
+            }
+            .onChange(of: modelConsumptionModelFilter) {
+                modelConsumptionPage = 0
+            }
+            .onChange(of: modelConsumptionCLIFilter) {
+                modelConsumptionPage = 0
+            }
             .onChange(of: tokenTrendColorDomain) {
                 tokenTrendLegendPage = 0
             }
@@ -491,6 +505,16 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         modelCostLegendPage = 0
         tokenMixLegendPage = 0
         cliConsumptionPage = 0
+        modelConsumptionPage = 0
+
+        if let modelConsumptionModelFilter,
+           !dashboardData.modelUsageRows.contains(where: { $0.modelName == modelConsumptionModelFilter }) {
+            self.modelConsumptionModelFilter = nil
+        }
+        if let modelConsumptionCLIFilter,
+           !dashboardData.modelUsageRows.contains(where: { $0.source == modelConsumptionCLIFilter }) {
+            self.modelConsumptionCLIFilter = nil
+        }
     }
 
     // MARK: - Sidebar
@@ -655,18 +679,26 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var modelsPage: some View {
-        ScrollView(.vertical) {
-            LazyVStack(alignment: .leading, spacing: 20) {
-                if store.isLoading && store.records.isEmpty {
-                    dashboardLoadingView
-                } else {
-                    modelConsumptionSection
+        GeometryReader { geometry in
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    if store.isLoading && store.records.isEmpty {
+                        dashboardLoadingView
+                    } else {
+                        modelConsumptionSection
+                    }
                 }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .scrollIndicators(.visible)
+            .onAppear {
+                updateModelConsumptionPageCapacity(for: geometry.size.height)
+            }
+            .onChange(of: geometry.size.height) { _, height in
+                updateModelConsumptionPageCapacity(for: height)
+            }
         }
-        .scrollIndicators(.visible)
     }
 
     private var briefPage: some View {
@@ -1437,7 +1469,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
 
     private var modelConsumptionSection: some View {
         ChartCard(title: "Model Consumption") {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Picker("Group by", selection: $modelConsumptionGrouping) {
                     ForEach(ModelConsumptionGrouping.allCases) { grouping in
                         Text(grouping.label).tag(grouping)
@@ -1445,57 +1477,49 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 140)
+                .frame(width: 128)
 
-                modelConsumptionFilterField
+                modelConsumptionModelFilterPicker
+                modelConsumptionCLIFilterPicker
+                modelConsumptionPager
             }
         } content: {
             dashboardModelConsumption
         }
     }
 
-    private var modelConsumptionFilterField: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "magnifyingglass")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            TextField(
-                modelConsumptionGrouping == .model ? "Filter models" : "Filter CLIs",
-                text: $modelConsumptionFilter
-            )
-            .textFieldStyle(.plain)
-            .font(.caption)
-            if !modelConsumptionFilter.isEmpty {
-                Button {
-                    modelConsumptionFilter = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
+    private var modelConsumptionModelFilterPicker: some View {
+        Picker("Model", selection: $modelConsumptionModelFilter) {
+            Text("All Models").tag(String?.none)
+            ForEach(modelConsumptionModels, id: \.self) { model in
+                Text(displayModelName(model)).tag(Optional(model))
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(
-            Color(nsColor: .textBackgroundColor),
-            in: Capsule()
-        )
-        .overlay(
-            Capsule()
-                .stroke(AppDesign.hairline.opacity(0.45), lineWidth: 1)
-                .allowsHitTesting(false)
-        )
-        .frame(width: 170)
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 116)
+        .help("Filter by model")
+    }
+
+    private var modelConsumptionCLIFilterPicker: some View {
+        Picker("CLI", selection: $modelConsumptionCLIFilter) {
+            Text("All CLIs").tag(UsageSource?.none)
+            ForEach(modelConsumptionCLIs) { source in
+                Text(source.label).tag(Optional(source))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 104)
+        .help("Filter by CLI")
     }
 
     @ViewBuilder
     private var dashboardModelConsumption: some View {
-        let rows = filteredModelConsumptionRows
+        let rows = visibleModelConsumptionRows
         if dashboardData.modelUsageRows.isEmpty {
             emptyTodayState(text: store.isLoading ? "Loading models..." : "No model usage recorded")
-        } else if rows.isEmpty {
+        } else if filteredModelConsumptionRows.isEmpty {
             emptyTodayState(text: "No matching entries")
         } else {
             VStack(alignment: .leading, spacing: 0) {
@@ -1537,7 +1561,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     /// keeps the other dimension as hoverable icon parts.
     private var groupedModelConsumptionRows: [ModelConsumptionGroupRow] {
         var totals: [String: ModelConsumptionTotals] = [:]
-        for row in dashboardData.modelUsageRows {
+        for row in modelConsumptionFilteredUsageRows {
             let key = modelConsumptionGrouping == .model ? row.modelName : row.source.rawValue
             var entry = totals[key] ?? ModelConsumptionTotals()
             entry.total += row.totalTokens
@@ -1586,12 +1610,68 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
     }
 
     private var filteredModelConsumptionRows: [ModelConsumptionGroupRow] {
-        let query = modelConsumptionFilter.trimmingCharacters(in: .whitespaces)
-        guard !query.isEmpty else { return groupedModelConsumptionRows }
-        return groupedModelConsumptionRows.filter { row in
-            row.title.localizedCaseInsensitiveContains(query)
-                || row.parts.contains { $0.label.localizedCaseInsensitiveContains(query) }
+        groupedModelConsumptionRows
+    }
+
+    private var modelConsumptionFilteredUsageRows: [TodayModelUsageRow] {
+        dashboardData.modelUsageRows.filter { row in
+            (modelConsumptionModelFilter == nil || row.modelName == modelConsumptionModelFilter)
+                && (modelConsumptionCLIFilter == nil || row.source == modelConsumptionCLIFilter)
         }
+    }
+
+    private var modelConsumptionModels: [String] {
+        Array(Set(dashboardData.modelUsageRows.map(\.modelName))).sorted {
+            displayModelName($0).localizedCaseInsensitiveCompare(displayModelName($1)) == .orderedAscending
+        }
+    }
+
+    private var modelConsumptionCLIs: [UsageSource] {
+        Array(Set(dashboardData.modelUsageRows.map(\.source))).sorted {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }
+    }
+
+    private var modelConsumptionPageCount: Int {
+        max(Int(ceil(Double(filteredModelConsumptionRows.count) / Double(modelConsumptionPageCapacity))), 1)
+    }
+
+    private var clampedModelConsumptionPage: Int {
+        min(max(modelConsumptionPage, 0), modelConsumptionPageCount - 1)
+    }
+
+    private var visibleModelConsumptionRows: [ModelConsumptionGroupRow] {
+        let rows = filteredModelConsumptionRows
+        let start = clampedModelConsumptionPage * modelConsumptionPageCapacity
+        guard start < rows.count else { return rows }
+        let end = min(start + modelConsumptionPageCapacity, rows.count)
+        return Array(rows[start..<end])
+    }
+
+    @ViewBuilder
+    private var modelConsumptionPager: some View {
+        let rows = filteredModelConsumptionRows
+        if !rows.isEmpty {
+            LegendPageControls(
+                currentPage: clampedModelConsumptionPage,
+                pageCount: modelConsumptionPageCount,
+                totalCount: rows.count,
+                onPrevious: {
+                    modelConsumptionPage = max(clampedModelConsumptionPage - 1, 0)
+                },
+                onNext: {
+                    modelConsumptionPage = min(clampedModelConsumptionPage + 1, modelConsumptionPageCount - 1)
+                }
+            )
+        }
+    }
+
+    private func updateModelConsumptionPageCapacity(for availableHeight: CGFloat) {
+        let availableRowsHeight = max(availableHeight - 170, modelConsumptionRowHeight)
+        let fitted = max(Int(availableRowsHeight / modelConsumptionRowHeight), 1)
+        let capacity = min(fitted, modelConsumptionMaxPageSize)
+        guard capacity != modelConsumptionPageCapacity else { return }
+        modelConsumptionPageCapacity = capacity
     }
 
     // MARK: - Activity insight sections (Daily Cost / By Weekday / Cache Efficiency)
@@ -3855,7 +3935,7 @@ private struct TodayHourlyTimelineView: View {
                         Text(brief.headline)
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.primary)
-                            .lineLimit(2)
+                            .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
                         Text("Activity")
@@ -3873,7 +3953,11 @@ private struct TodayHourlyTimelineView: View {
                 }
 
                 if total > 0 {
-                    seriesChipRow(for: hour)
+                    if !briefProjectCards(for: hour).isEmpty {
+                        projectCardRow(for: hour)
+                    } else {
+                        seriesChipRow(for: hour)
+                    }
                 }
 
                 if let brief, brief.sessionCount > 0 {
@@ -3919,6 +4003,47 @@ private struct TodayHourlyTimelineView: View {
             }
             if series.count > 5 {
                 Text("+\(series.count - 5)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// Per-project breakdown for the hour, if the brief carries it. Empty for
+    /// briefs generated before `projects` existed — the caller falls back to
+    /// `seriesChipRow` (per-CLI chips) in that case.
+    private func briefProjectCards(for hour: Int) -> [HourlyBriefProject] {
+        briefByHour[hour]?.projects ?? []
+    }
+
+    private func projectCardRow(for hour: Int) -> some View {
+        let projects = briefProjectCards(for: hour)
+        return HStack(spacing: 6) {
+            ForEach(projects.prefix(3)) { project in
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(seriesColor(for: project.source))
+                        .frame(width: 6, height: 6)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(project.project)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text("\(project.tokens.tokenText) · \(project.sessionCount) sess")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.primary.opacity(0.04))
+                )
+            }
+            if projects.count > 3 {
+                Text("+\(projects.count - 3)")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }

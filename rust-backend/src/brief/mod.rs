@@ -5,13 +5,16 @@ pub mod store;
 use crate::{
     ledger::UsageLedger,
     protocol::{
-        build_board_summary, short_source, BriefDayEntry, BriefGenerateRequest, BriefModelInfo,
-        BriefMonthEntry, Source, TodayBriefCard, TodayBriefHour, TodayBriefResponse, View,
+        build_board_summary, BriefDayEntry, BriefGenerateRequest, BriefModelInfo,
+        BriefMonthEntry, Source, TodayBriefCard, TodayBriefHour, TodayBriefHourProject,
+        TodayBriefResponse, View,
     },
     sources,
 };
 use chrono::{Datelike, Local, NaiveDate, SecondsFormat};
-use extract::{extract_for_source, ExtractedSession, SourceExtract};
+use extract::{
+    extract_for_source, filter_texts_for_hour, plain_user_texts, ExtractedSession, SourceExtract,
+};
 use llm::{summarize_hour, summarize_project, LlmConfig};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -399,6 +402,9 @@ fn collect_day_extracts(
 /// Groups extracted sessions by hour. Sessions recorded only in the ledger
 /// (dropped by extraction) still appear as usage-only entries so every hour
 /// with usage shows up in the timeline.
+///
+/// Dialog text is filtered to the target hour so a long-running session does
+/// not feed the same day-long `userTexts` into every hour's LLM summary.
 fn hour_groups(
     extracts: &[SourceExtract],
     session_hours: &SessionHours,
@@ -414,10 +420,11 @@ fn hour_groups(
                 continue;
             };
             for (hour, tokens) in hours {
-                groups
-                    .entry(*hour)
-                    .or_default()
-                    .push((extract.source.clone(), session.clone(), *tokens));
+                groups.entry(*hour).or_default().push((
+                    extract.source.clone(),
+                    session_for_hour(session, *hour, hours),
+                    *tokens,
+                ));
             }
         }
     }
@@ -446,15 +453,116 @@ fn hour_groups(
     groups
 }
 
+/// Clone of `session` scoped to `hour`: only that hour's user texts, and the
+/// day-level title only when this hour still has dialog (otherwise every hour
+/// of a long session would share the same title-driven headline).
+fn session_for_hour(
+    session: &ExtractedSession,
+    hour: i64,
+    session_hours: &BTreeMap<i64, i64>,
+) -> ExtractedSession {
+    let user_texts = filter_texts_for_hour(&session.user_texts, hour, session_hours);
+    let title = if user_texts.is_empty() {
+        None
+    } else {
+        session.title.clone()
+    };
+    ExtractedSession {
+        session_id: session.session_id.clone(),
+        project: session.project.clone(),
+        project_key: session.project_key.clone(),
+        title,
+        user_texts,
+        token_hint: session.token_hint,
+        usage_only: session.usage_only,
+    }
+}
+
 fn row_hour(row: &Value) -> Option<i64> {
     let time = row.get("time").and_then(Value::as_str)?;
     let (hour, _) = time.split_once(':')?;
     hour.trim().parse::<i64>().ok().filter(|hour| (0..24).contains(hour))
 }
 
-/// Summarizes each hour group. Hours without any dialog content skip the LLM
-/// call; LLM failures keep the hour with a fallback headline instead of
-/// failing the whole brief.
+/// An hour's sessions grouped into a single project bucket. Sessions across
+/// multiple CLIs working on the same project name collapse into one bucket so
+/// the timeline reads as "[summer] …" rather than one row per (CLI, project).
+struct HourProjectBucket {
+    project: String,
+    /// CLI that contributed the most tokens — used as the bucket's accent
+    /// color in the UI.
+    source: String,
+    tokens: i64,
+    session_count: usize,
+    /// (source, session) pairs feeding the per-project LLM summary. Only
+    /// sessions with dialog content are kept; usage-only rows are dropped.
+    text_sessions: Vec<(String, ExtractedSession)>,
+}
+
+/// Aggregates an hour's sessions into per-project buckets, merging CLIs that
+/// share a project name. Buckets are sorted by tokens descending.
+fn aggregate_hour_projects(
+    sessions: &[(String, ExtractedSession, i64)],
+) -> Vec<HourProjectBucket> {
+    // First-seen project name wins (matches SourceExtract::projects).
+    struct Acc {
+        project: String,
+        tokens_by_source: BTreeMap<String, i64>,
+        session_count: usize,
+        text_sessions: Vec<(String, ExtractedSession)>,
+    }
+    let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
+    for (source, session, tokens) in sessions {
+        let project_name = if session.project.trim().is_empty() {
+            "General".to_string()
+        } else {
+            session.project.clone()
+        };
+        let entry = groups.entry(project_name.clone()).or_insert_with(|| Acc {
+            project: project_name,
+            tokens_by_source: BTreeMap::new(),
+            session_count: 0,
+            text_sessions: Vec::new(),
+        });
+        *entry.tokens_by_source.entry(source.clone()).or_insert(0) += tokens;
+        entry.session_count += 1;
+        if !session.usage_only
+            && (session.title.is_some() || !session.user_texts.is_empty())
+        {
+            entry.text_sessions.push((source.clone(), session.clone()));
+        }
+    }
+    let mut buckets: Vec<HourProjectBucket> = groups
+        .into_iter()
+        .map(|(_, acc)| {
+            let (source, _) = acc
+                .tokens_by_source
+                .iter()
+                .max_by_key(|(_, tokens)| *tokens)
+                .map(|(source, tokens)| (source.clone(), *tokens))
+                .unwrap_or_default();
+            let tokens: i64 = acc.tokens_by_source.values().sum();
+            HourProjectBucket {
+                project: acc.project,
+                source,
+                tokens,
+                session_count: acc.session_count,
+                text_sessions: acc.text_sessions,
+            }
+        })
+        .collect();
+    // Drop buckets with no tokens: these are usage-only placeholder sessions
+    // (no extractable content) that carry no signal for the timeline.
+    buckets.retain(|b| b.tokens > 0);
+    buckets.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    buckets
+}
+
+/// Summarizes each hour group into a single headline. The model is prompted
+/// to distinguish projects inline ("在 X 项目上，…；在 Y 项目上，…") rather than
+/// us splitting per project. `projects` carries only token stats (no
+/// headline) for the UI's project tags. Hours without dialog content skip the
+/// LLM call and fall back to the usage-only marker.
 fn summarize_hours(
     groups: BTreeMap<i64, Vec<(String, ExtractedSession, i64)>>,
     llm: &LlmConfig,
@@ -465,55 +573,74 @@ fn summarize_hours(
     for (hour, sessions) in groups {
         let session_count = sessions.len();
         let tokens: i64 = sessions.iter().map(|(_, _, tokens)| tokens).sum();
-        let text_sessions: Vec<&(String, ExtractedSession, i64)> = sessions
+        let buckets = aggregate_hour_projects(&sessions);
+        // Token-only breakdown for the UI; no per-project headline.
+        let projects: Vec<TodayBriefHourProject> = buckets
             .iter()
-            .filter(|(_, session, _)| {
-                !session.usage_only
-                    && (session.title.is_some() || !session.user_texts.is_empty())
+            .map(|bucket| TodayBriefHourProject {
+                source: bucket.source.clone(),
+                project: bucket.project.clone(),
+                tokens: bucket.tokens,
+                session_count: bucket.session_count,
+                headline: String::new(),
             })
             .collect();
-        if text_sessions.is_empty() {
+
+        let text_buckets: Vec<&HourProjectBucket> =
+            buckets.iter().filter(|b| !b.text_sessions.is_empty()).collect();
+        if text_buckets.is_empty() {
             hours.push(TodayBriefHour {
                 hour,
                 headline: "仅有用量记录，无对话内容".into(),
                 session_count,
                 tokens,
+                projects,
             });
             continue;
         }
+
+        // Group text sessions by project so the model can tell them apart.
         let payload = json!({
             "hour": hour,
-            "sessions": text_sessions.iter().map(|(source, session, _)| {
+            "projects": text_buckets.iter().map(|bucket| {
                 json!({
-                    "source": source,
-                    "project": session.project,
-                    "title": session.title,
-                    "userTexts": session.user_texts,
+                    "project": bucket.project,
+                    "sessions": bucket.text_sessions.iter().map(|(source, session)| {
+                        json!({
+                            "source": source,
+                            "title": session.title,
+                            "userTexts": plain_user_texts(&session.user_texts),
+                        })
+                    }).collect::<Vec<_>>(),
                 })
             }).collect::<Vec<_>>(),
         });
         let llm = llm.clone();
         handles.push(std::thread::spawn(move || {
             let summary = summarize_hour(&llm, hour, &payload);
-            (hour, session_count, tokens, summary)
+            (hour, session_count, tokens, projects, summary)
         }));
     }
 
     for handle in handles {
         match handle.join() {
-            Ok((hour, session_count, tokens, Ok(headline))) => hours.push(TodayBriefHour {
-                hour,
-                headline,
-                session_count,
-                tokens,
-            }),
-            Ok((hour, session_count, tokens, Err(err))) => {
+            Ok((hour, session_count, tokens, projects, Ok(headline))) => hours.push(
+                TodayBriefHour {
+                    hour,
+                    headline,
+                    session_count,
+                    tokens,
+                    projects,
+                },
+            ),
+            Ok((hour, session_count, tokens, projects, Err(err))) => {
                 llm_errors.push(format!("hour {hour}: {err}"));
                 hours.push(TodayBriefHour {
                     hour,
                     headline: "本小时摘要生成失败".into(),
                     session_count,
                     tokens,
+                    projects,
                 });
             }
             Err(_) => llm_errors.push("LLM hour worker panicked".to_string()),
@@ -663,20 +790,25 @@ pub fn all_months() -> Result<Vec<BriefMonthEntry>, String> {
 /// Top projects across the given briefs, ranked by total session count,
 /// rendered as "CLI·project".
 fn top_projects<'a>(briefs: impl Iterator<Item = &'a TodayBriefResponse>, limit: usize) -> Vec<String> {
-    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    // Aggregate by project name across CLIs (first-seen display name wins),
+    // so "summer" worked on via codex + cursor + opencode surfaces once as
+    // "summer" rather than three "Codex·summer" / "Cursor·summer" entries.
+    let mut counts: HashMap<String, (String, usize)> = HashMap::new();
     for brief in briefs {
         for card in &brief.cards {
-            *counts
-                .entry((card.source.clone(), card.project.clone()))
-                .or_default() += card.session_count;
+            let entry = counts
+                .entry(card.project.clone())
+                .or_insert_with(|| (card.project.clone(), 0));
+            entry.1 += card.session_count;
         }
     }
     let mut ranked: Vec<_> = counts.into_iter().collect();
-    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.sort_by(|left, right| left.0.cmp(&right.0));
+    ranked.sort_by(|left, right| right.1.1.cmp(&left.1.1));
     ranked
         .into_iter()
         .take(limit)
-        .map(|((source, project), _)| format!("{}·{}", short_source(&source), project))
+        .map(|(_, (project, _))| project)
         .collect()
 }
 
@@ -880,12 +1012,14 @@ mod tests {
                     headline: "旧 9 点".into(),
                     session_count: 1,
                     tokens: 100,
+                    projects: Vec::new(),
                 },
                 TodayBriefHour {
                     hour: 14,
                     headline: "旧 14 点".into(),
                     session_count: 1,
                     tokens: 200,
+                    projects: Vec::new(),
                 },
             ]),
             error: None,
@@ -968,5 +1102,172 @@ mod tests {
         let projects = extract.projects();
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0].sessions.len() + projects[1].sessions.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_hour_projects_merges_clis_by_project_name() {
+        let mk = |project: &str, project_key: &str, source: &str, usage_only: bool, tokens: i64| {
+            (
+                source.to_string(),
+                ExtractedSession {
+                    session_id: format!("{source}-{project}"),
+                    project: project.into(),
+                    project_key: project_key.into(),
+                    title: None,
+                    user_texts: vec![],
+                    token_hint: 0,
+                    usage_only,
+                },
+                tokens,
+            )
+        };
+        let sessions: Vec<(String, ExtractedSession, i64)> = vec![
+            // summer spans two CLIs → must merge into one bucket.
+            mk("summer", "codex:summer", "codex", false, 500),
+            mk("summer", "claude:summer", "claude", false, 130),
+            mk("token-usage", "claude:token-usage", "claude", false, 200),
+            // usage-only, empty project → "General", kept (has tokens).
+            (
+                "kimi".into(),
+                ExtractedSession {
+                    session_id: "kimi-d".into(),
+                    project: String::new(),
+                    project_key: String::new(),
+                    title: None,
+                    user_texts: vec![],
+                    token_hint: 0,
+                    usage_only: true,
+                },
+                50,
+            ),
+        ];
+        let buckets = aggregate_hour_projects(&sessions);
+        // Sorted by tokens desc: summer (630), token-usage (200), General (50).
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].project, "summer");
+        assert_eq!(buckets[0].tokens, 630);
+        assert_eq!(buckets[0].session_count, 2);
+        // Primary source is the CLI that contributed the most tokens (codex).
+        assert_eq!(buckets[0].source, "codex");
+        assert_eq!(buckets[1].project, "token-usage");
+        assert_eq!(buckets[1].source, "claude");
+        assert_eq!(buckets[2].project, "General");
+        // No sessions carried dialog content, so text_sessions stay empty.
+        assert!(buckets.iter().all(|b| b.text_sessions.is_empty()));
+    }
+
+    #[test]
+    fn aggregate_hour_projects_collects_text_sessions_for_llm() {
+        let sessions: Vec<(String, ExtractedSession, i64)> = vec![
+            (
+                "codex".into(),
+                ExtractedSession {
+                    session_id: "a".into(),
+                    project: "summer".into(),
+                    project_key: "codex:summer".into(),
+                    title: Some("t".into()),
+                    user_texts: vec!["hi".into()],
+                    token_hint: 0,
+                    usage_only: false,
+                },
+                100,
+            ),
+            // usage-only sibling of the same project → merged, no text.
+            (
+                "codex".into(),
+                ExtractedSession {
+                    session_id: "b".into(),
+                    project: "summer".into(),
+                    project_key: "codex:summer".into(),
+                    title: None,
+                    user_texts: vec![],
+                    token_hint: 0,
+                    usage_only: true,
+                },
+                20,
+            ),
+        ];
+        let buckets = aggregate_hour_projects(&sessions);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].project, "summer");
+        assert_eq!(buckets[0].tokens, 120);
+        assert_eq!(buckets[0].session_count, 2);
+        // Only the text-bearing session is kept for the LLM payload.
+        assert_eq!(buckets[0].text_sessions.len(), 1);
+        assert_eq!(buckets[0].text_sessions[0].0, "codex");
+    }
+
+    #[test]
+    fn hour_groups_filters_texts_per_hour() {
+        let extract = SourceExtract {
+            source: "claude".into(),
+            sessions: vec![ExtractedSession {
+                session_id: "long".into(),
+                project: "summer".into(),
+                project_key: "claude:summer".into(),
+                title: Some("Perturb Wiki".into()),
+                user_texts: vec![
+                    extract::TimedUserText::at_hour("整理交接文档", 6),
+                    extract::TimedUserText::at_hour("验证因果链", 11),
+                ],
+                token_hint: 1000,
+                usage_only: false,
+            }],
+        };
+        let mut session_hours: SessionHours = HashMap::new();
+        session_hours.insert(
+            ("claude".into(), "long".into()),
+            BTreeMap::from([(6, 100), (11, 200)]),
+        );
+        let groups = hour_groups(&[extract], &session_hours);
+        let six = &groups[&6];
+        assert_eq!(six.len(), 1);
+        assert_eq!(
+            six[0]
+                .1
+                .user_texts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["整理交接文档"]
+        );
+        assert_eq!(six[0].1.title.as_deref(), Some("Perturb Wiki"));
+
+        let eleven = &groups[&11];
+        assert_eq!(
+            eleven[0]
+                .1
+                .user_texts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["验证因果链"]
+        );
+
+        // Hour with tokens but no matching texts → title cleared so LLM
+        // does not reuse the day title as a fake per-hour narrative.
+        let mut session_hours2: SessionHours = HashMap::new();
+        session_hours2.insert(
+            ("claude".into(), "long".into()),
+            BTreeMap::from([(6, 100), (7, 50), (11, 200)]),
+        );
+        let extract2 = SourceExtract {
+            source: "claude".into(),
+            sessions: vec![ExtractedSession {
+                session_id: "long".into(),
+                project: "summer".into(),
+                project_key: "claude:summer".into(),
+                title: Some("Perturb Wiki".into()),
+                user_texts: vec![
+                    extract::TimedUserText::at_hour("整理交接文档", 6),
+                    extract::TimedUserText::at_hour("验证因果链", 11),
+                ],
+                token_hint: 1000,
+                usage_only: false,
+            }],
+        };
+        let groups2 = hour_groups(&[extract2], &session_hours2);
+        assert!(groups2[&7][0].1.user_texts.is_empty());
+        assert!(groups2[&7][0].1.title.is_none());
     }
 }

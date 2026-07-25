@@ -261,12 +261,40 @@ impl UsageLedger {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 r#"
+                WITH block_sources AS (
+                    SELECT DISTINCT source FROM usage_blocks
+                ),
+                token_rows AS (
+                    SELECT source,
+                           date,
+                           CASE
+                               WHEN session_id != '' THEN session_id
+                               ELSE block_id
+                           END AS session_key,
+                           total_tokens,
+                           cost AS total_cost
+                    FROM usage_blocks
+
+                    UNION ALL
+
+                    SELECT sessions.source,
+                           sessions.date,
+                           sessions.session_id AS session_key,
+                           sessions.total_tokens,
+                           sessions.total_cost
+                    FROM usage_sessions AS sessions
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM block_sources
+                        WHERE block_sources.source = sessions.source
+                    )
+                )
                 SELECT date,
                        SUM(total_tokens),
                        SUM(total_cost),
-                       COUNT(*),
+                       COUNT(DISTINCT source || char(31) || session_key),
                        GROUP_CONCAT(DISTINCT source)
-                FROM usage_sessions
+                FROM token_rows
                 WHERE date >= ?1 AND date <= ?2
                 GROUP BY date
                 ORDER BY date
@@ -300,13 +328,41 @@ impl UsageLedger {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 r#"
+                WITH block_sources AS (
+                    SELECT DISTINCT source FROM usage_blocks
+                ),
+                token_rows AS (
+                    SELECT source,
+                           date,
+                           CASE
+                               WHEN session_id != '' THEN session_id
+                               ELSE block_id
+                           END AS session_key,
+                           total_tokens,
+                           cost AS total_cost
+                    FROM usage_blocks
+
+                    UNION ALL
+
+                    SELECT sessions.source,
+                           sessions.date,
+                           sessions.session_id AS session_key,
+                           sessions.total_tokens,
+                           sessions.total_cost
+                    FROM usage_sessions AS sessions
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM block_sources
+                        WHERE block_sources.source = sessions.source
+                    )
+                )
                 SELECT substr(date, 1, 7) AS month,
                        SUM(total_tokens),
                        SUM(total_cost),
-                       COUNT(*),
+                       COUNT(DISTINCT source || char(31) || session_key),
                        COUNT(DISTINCT date),
                        GROUP_CONCAT(DISTINCT source)
-                FROM usage_sessions
+                FROM token_rows
                 WHERE length(date) >= 7
                 GROUP BY month
                 ORDER BY month
@@ -952,8 +1008,9 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     )?;
     migrate_legacy_cursor_source(connection)?;
     migrate_message_level_hourly(connection)?;
+    migrate_token_occurrence_dates(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '3')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '4')",
         [],
     )?;
     Ok(())
@@ -984,6 +1041,37 @@ fn migrate_message_level_hourly(connection: &Connection) -> Result<(), rusqlite:
         "#,
         [],
     )?;
+    Ok(())
+}
+
+/// Schema v4 makes Claude's date-based totals follow each usage-bearing
+/// message's local date. Rebuild all derived Claude rows so cross-midnight
+/// blocks written by older versions cannot survive alongside the new split
+/// blocks.
+fn migrate_token_occurrence_dates(connection: &mut Connection) -> Result<(), rusqlite::Error> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 4 {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM usage_sessions WHERE source = 'claude'", [])?;
+    transaction.execute("DELETE FROM usage_blocks WHERE source = 'claude'", [])?;
+    transaction.execute("DELETE FROM usage_messages WHERE source = 'claude'", [])?;
+    transaction.execute("DELETE FROM ingest_state WHERE source = 'claude'", [])?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '4')",
+        [],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1390,6 +1478,185 @@ mod tests {
         assert_eq!(sessions[0]["sessionId"], stable_session_id);
         assert_eq!(sessions[0]["inputTokens"], 28245);
         assert_eq!(sessions[0]["totalTokens"], 103895);
+    }
+
+    #[test]
+    fn date_rollups_use_occurrence_dated_blocks_instead_of_session_date() {
+        let ledger = test_ledger();
+        ledger
+            .ingest_live_sessions(
+                Source::Claude,
+                &[json!({
+                    "sessionId": "claude-session",
+                    "date": "2026-07-26",
+                    "time": "00:10",
+                    "inputTokens": 300,
+                    "outputTokens": 0,
+                    "cacheCreationTokens": 0,
+                    "cacheReadTokens": 0,
+                    "totalTokens": 300,
+                    "totalCost": 0.3,
+                })],
+            )
+            .unwrap();
+        ledger
+            .ingest_live_blocks(
+                Source::Claude,
+                &[
+                    json!({
+                        "blockId": "claude-2026-07-25",
+                        "sessionId": "claude-session",
+                        "modelName": "claude-opus",
+                        "timestamp": "2026-07-25T23:00:00+08:00",
+                        "date": "2026-07-25",
+                        "time": "23:00",
+                        "inputTokens": 100,
+                        "outputTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "cacheReadTokens": 0,
+                        "totalTokens": 100,
+                        "cost": 0.1,
+                    }),
+                    json!({
+                        "blockId": "claude-2026-07-26",
+                        "sessionId": "claude-session",
+                        "modelName": "claude-opus",
+                        "timestamp": "2026-07-26T00:00:00+08:00",
+                        "date": "2026-07-26",
+                        "time": "00:00",
+                        "inputTokens": 200,
+                        "outputTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "cacheReadTokens": 0,
+                        "totalTokens": 200,
+                        "cost": 0.2,
+                    }),
+                ],
+            )
+            .unwrap();
+        ledger
+            .ingest_live_sessions(
+                Source::Cursor,
+                &[json!({
+                    "sessionId": "cursor-session",
+                    "date": "2026-07-25",
+                    "time": "12:00",
+                    "inputTokens": 50,
+                    "outputTokens": 0,
+                    "cacheCreationTokens": 0,
+                    "cacheReadTokens": 0,
+                    "totalTokens": 50,
+                    "totalCost": 0.05,
+                })],
+            )
+            .unwrap();
+
+        let claude_daily = ledger.load_view(Source::Claude, View::Daily).unwrap();
+        assert_eq!(claude_daily.len(), 2);
+        assert_eq!(claude_daily[0]["date"], "2026-07-25");
+        assert_eq!(claude_daily[0]["totalTokens"], 100);
+        assert_eq!(claude_daily[1]["date"], "2026-07-26");
+        assert_eq!(claude_daily[1]["totalTokens"], 200);
+
+        let daily = ledger
+            .daily_usage_rollup("2026-07-25", "2026-07-26")
+            .unwrap();
+        assert_eq!(daily.len(), 2);
+        assert_eq!(daily[0]["date"], "2026-07-25");
+        assert_eq!(daily[0]["totalTokens"], 150);
+        assert_eq!(daily[0]["sessions"], 2);
+        assert_eq!(daily[1]["date"], "2026-07-26");
+        assert_eq!(daily[1]["totalTokens"], 200);
+        assert_eq!(daily[1]["sessions"], 1);
+
+        let monthly = ledger.monthly_usage_rollup().unwrap();
+        assert_eq!(monthly.len(), 1);
+        assert_eq!(monthly[0]["month"], "2026-07");
+        assert_eq!(monthly[0]["totalTokens"], 350);
+        assert_eq!(monthly[0]["sessions"], 2);
+        assert_eq!(monthly[0]["activeDays"], 2);
+    }
+
+    #[test]
+    fn v4_migration_rebuilds_all_claude_derived_rows() {
+        let ledger = test_ledger();
+        let path = ledger.path.clone();
+        ledger
+            .ingest_live_sessions(
+                Source::Claude,
+                &[json!({
+                    "sessionId": "s1",
+                    "date": "2026-07-26",
+                    "time": "00:10",
+                    "totalTokens": 30,
+                    "totalCost": 0.03,
+                })],
+            )
+            .unwrap();
+        ledger
+            .ingest_live_blocks(
+                Source::Claude,
+                &[json!({
+                    "blockId": "2026-07-25T23:00:00+08:00",
+                    "sessionId": "s1",
+                    "date": "2026-07-25",
+                    "time": "23:00",
+                    "totalTokens": 30,
+                    "cost": 0.03,
+                })],
+            )
+            .unwrap();
+        ledger
+            .ingest_live_messages(
+                Source::Claude,
+                &[json!({
+                    "messageId": "m1",
+                    "sessionId": "s1",
+                    "date": "2026-07-26",
+                    "time": "00:10",
+                    "totalTokens": 30,
+                    "cost": 0.03,
+                })],
+            )
+            .unwrap();
+        ledger
+            .record_ingest_watermark(Source::Claude, 1_000)
+            .unwrap();
+        ledger
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE ledger_meta SET value = '3' WHERE key = 'schema_version'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(ledger);
+
+        let migrated = UsageLedger::new(path).unwrap();
+
+        assert!(!migrated.has_source_rows(Source::Claude).unwrap());
+        assert_eq!(migrated.ingest_watermark(Source::Claude).unwrap(), None);
+        let message_count: i64 = migrated
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM usage_messages WHERE source = 'claude'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(message_count, 0);
+        let schema_version: String = migrated
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(schema_version, "4");
     }
 
     #[test]

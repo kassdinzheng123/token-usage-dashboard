@@ -10,7 +10,7 @@
 
 use super::{
     display_project_name, push_capped_text, session_id_of, session_token_hint, ExtractedSession,
-    SourceExtract, MAX_USER_MESSAGES,
+    SourceExtract, TimedUserText, MAX_USER_MESSAGES,
 };
 use crate::sources::home_dir;
 use chrono::{Duration, Local, TimeZone};
@@ -202,7 +202,7 @@ fn parse_session_ids(session_id: &str) -> SessionIds {
 struct ResolvedContent {
     project_path: Option<String>,
     title: Option<String>,
-    user_texts: Vec<String>,
+    user_texts: Vec<TimedUserText>,
 }
 
 #[derive(Debug, Default)]
@@ -674,7 +674,7 @@ fn json_string_field_after(line: &str, field: &str) -> Option<String> {
     }
 }
 
-fn load_transcript_user_texts(project_path: Option<&str>, composer_id: &str) -> Vec<String> {
+fn load_transcript_user_texts(project_path: Option<&str>, composer_id: &str) -> Vec<TimedUserText> {
     let Some(projects_dir) = discover_projects_dir() else {
         return Vec::new();
     };
@@ -717,7 +717,7 @@ fn encode_project_slug(project_path: &str) -> String {
     without_leading.replace('/', "-")
 }
 
-fn read_transcript_jsonl(path: &Path) -> Result<Vec<String>, String> {
+fn read_transcript_jsonl(path: &Path) -> Result<Vec<TimedUserText>, String> {
     let text = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let mut user_texts = Vec::new();
@@ -901,7 +901,14 @@ mod tests {
         assert_eq!(session.session_id, "cursor:composer:comp-scan");
         assert!(!session.usage_only);
         assert_eq!(session.project, "token-usage");
-        assert_eq!(session.user_texts, vec!["按今日活跃 composer 扫本地"]);
+        assert_eq!(
+            session
+                .user_texts
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["按今日活跃 composer 扫本地"]
+        );
     }
 
     #[test]

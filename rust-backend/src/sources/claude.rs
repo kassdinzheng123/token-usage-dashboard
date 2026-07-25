@@ -616,7 +616,8 @@ fn entries_to_blocks(entries: &[UsageEntry]) -> Vec<Value> {
                     .last()
                     .map(|current| current.timestamp)
                     .unwrap_or(start);
-                if entry.timestamp - start > session_duration
+                if entry.timestamp.date_naive() != start.date_naive()
+                    || entry.timestamp - start > session_duration
                     || entry.timestamp - last_timestamp > session_duration
                 {
                     rows.push(block_row(start, &current_entries));
@@ -903,12 +904,29 @@ not-json
         let fixture = TestFixture::new();
         let projects_dir = fixture.path.join("claude").join(PROJECTS_DIR).join("proj");
         fs::create_dir_all(&projects_dir).unwrap();
+        let first = Local
+            .with_ymd_and_hms(2024, 1, 1, 12, 15, 0)
+            .single()
+            .unwrap();
+        let second = Local
+            .with_ymd_and_hms(2024, 1, 1, 16, 59, 0)
+            .single()
+            .unwrap();
+        let third = Local
+            .with_ymd_and_hms(2024, 1, 1, 18, 1, 0)
+            .single()
+            .unwrap();
         fs::write(
             projects_dir.join("session-a.jsonl"),
-            r#"{"timestamp":"2024-01-01T12:15:00Z","sessionId":"s1","requestId":"r1","costUSD":0.01,"message":{"id":"m1","model":"claude-sonnet","usage":{"input_tokens":100,"output_tokens":40}}}
-{"timestamp":"2024-01-01T16:59:00Z","sessionId":"s1","requestId":"r2","costUSD":0.02,"message":{"id":"m2","model":"claude-sonnet","usage":{"input_tokens":20,"output_tokens":10}}}
-{"timestamp":"2024-01-01T18:01:00Z","sessionId":"s1","requestId":"r3","costUSD":0.03,"message":{"id":"m3","model":"claude-opus","usage":{"input_tokens":30,"output_tokens":10}}}
+            format!(
+                r#"{{"timestamp":"{}","sessionId":"s1","requestId":"r1","costUSD":0.01,"message":{{"id":"m1","model":"claude-sonnet","usage":{{"input_tokens":100,"output_tokens":40}}}}}}
+{{"timestamp":"{}","sessionId":"s1","requestId":"r2","costUSD":0.02,"message":{{"id":"m2","model":"claude-sonnet","usage":{{"input_tokens":20,"output_tokens":10}}}}}}
+{{"timestamp":"{}","sessionId":"s1","requestId":"r3","costUSD":0.03,"message":{{"id":"m3","model":"claude-opus","usage":{{"input_tokens":30,"output_tokens":10}}}}}}
 "#,
+                first.to_rfc3339(),
+                second.to_rfc3339(),
+                third.to_rfc3339(),
+            ),
         )
         .unwrap();
 
@@ -922,6 +940,60 @@ not-json
         assert_eq!(blocks[0]["inputTokens"], 120);
         assert_eq!(blocks[0]["outputTokens"], 50);
         assert_eq!(blocks[1]["inputTokens"], 30);
+    }
+
+    #[test]
+    fn splits_blocks_at_local_midnight() {
+        let before_midnight = Local
+            .with_ymd_and_hms(2026, 7, 25, 23, 50, 0)
+            .single()
+            .unwrap();
+        let after_midnight = Local
+            .with_ymd_and_hms(2026, 7, 26, 0, 10, 0)
+            .single()
+            .unwrap();
+        let entries = vec![
+            UsageEntry {
+                timestamp: before_midnight,
+                session_id: "s1".to_string(),
+                model: "claude-opus".to_string(),
+                usage: UsageCounts {
+                    input_tokens: 100,
+                    output_tokens: 40,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+                cost_usd: 0.01,
+                message_key: "m1".to_string(),
+            },
+            UsageEntry {
+                timestamp: after_midnight,
+                session_id: "s1".to_string(),
+                model: "claude-opus".to_string(),
+                usage: UsageCounts {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+                cost_usd: 0.02,
+                message_key: "m2".to_string(),
+            },
+        ];
+
+        let blocks = entries_to_blocks(&entries);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0]["date"],
+            before_midnight.format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(blocks[0]["totalTokens"], 140);
+        assert_eq!(
+            blocks[1]["date"],
+            after_midnight.format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(blocks[1]["totalTokens"], 30);
     }
 
     #[test]

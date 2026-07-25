@@ -199,13 +199,76 @@ struct TodayBriefSection: Codable, Hashable, Identifiable {
     var id: String { "\(source)-\(headline)" }
 }
 
+struct HourlyBriefProject: Codable, Hashable, Identifiable {
+    var source: String
+    var project: String
+    var tokens: Int
+    var sessionCount: Int
+    var headline: String
+
+    var id: String { "\(source):\(project)" }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        source = try container.decode(String.self, forKey: .source)
+        project = try container.decode(String.self, forKey: .project)
+        tokens = try container.decode(Int.self, forKey: .tokens)
+        sessionCount = try container.decode(Int.self, forKey: .sessionCount)
+        headline = try container.decodeIfPresent(String.self, forKey: .headline) ?? ""
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source, project, tokens, sessionCount, headline
+    }
+
+    init(source: String, project: String, tokens: Int, sessionCount: Int, headline: String = "") {
+        self.source = source
+        self.project = project
+        self.tokens = tokens
+        self.sessionCount = sessionCount
+        self.headline = headline
+    }
+}
+
 struct HourlyBriefItem: Codable, Hashable, Identifiable {
     var hour: Int
     var headline: String
     var sessionCount: Int
     var tokens: Int
+    var projects: [HourlyBriefProject]
 
     var id: Int { hour }
+
+    /// Older briefs (saved before `projects` existed) omit the field; decode
+    /// it as an empty array so the UI degrades to per-CLI chips.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hour = try container.decode(Int.self, forKey: .hour)
+        headline = try container.decode(String.self, forKey: .headline)
+        sessionCount = try container.decode(Int.self, forKey: .sessionCount)
+        tokens = try container.decode(Int.self, forKey: .tokens)
+        projects = try container.decodeIfPresent([HourlyBriefProject].self, forKey: .projects) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hour, headline, sessionCount, tokens, projects
+    }
+
+    /// Memberwise initializer; `projects` defaults to empty for call sites
+    /// (e.g. previews) that don't carry per-project data.
+    init(
+        hour: Int,
+        headline: String,
+        sessionCount: Int,
+        tokens: Int,
+        projects: [HourlyBriefProject] = []
+    ) {
+        self.hour = hour
+        self.headline = headline
+        self.sessionCount = sessionCount
+        self.tokens = tokens
+        self.projects = projects
+    }
 }
 
 struct TodayBriefResponse: Codable, Hashable {

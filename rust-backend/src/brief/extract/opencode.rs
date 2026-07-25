@@ -1,6 +1,6 @@
 use super::{
-    display_project_name, push_capped_text, session_id_of, session_token_hint, ExtractedSession,
-    SourceExtract,
+    display_project_name, local_hour_from_millis, push_timed_text, session_id_of,
+    session_token_hint, ExtractedSession, SourceExtract, TimedUserText,
 };
 use crate::sources::opencode::{opencode_db_path, open_opencode_readonly, storage_dir};
 use serde_json::Value;
@@ -132,10 +132,10 @@ fn load_session_metas(connection: &rusqlite::Connection) -> HashMap<String, Open
         .collect()
 }
 
-fn load_user_texts(connection: &rusqlite::Connection, session_id: &str) -> Vec<String> {
+fn load_user_texts(connection: &rusqlite::Connection, session_id: &str) -> Vec<TimedUserText> {
     let Ok(mut statement) = connection.prepare(
         r#"
-        SELECT p.data
+        SELECT p.data, p.time_created
         FROM part p
         JOIN message m ON p.message_id = m.id
         WHERE p.session_id = ?1
@@ -146,18 +146,22 @@ fn load_user_texts(connection: &rusqlite::Connection, session_id: &str) -> Vec<S
     ) else {
         return Vec::new();
     };
-    let rows = statement.query_map([session_id], |row| row.get::<_, String>(0));
+    let rows = statement.query_map([session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+    });
     let Ok(rows) = rows else {
         return Vec::new();
     };
 
     let mut texts = Vec::new();
-    for data in rows.flatten() {
+    for row in rows.flatten() {
+        let (data, time_created) = row;
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
         if let Some(text) = value.get("text").and_then(Value::as_str) {
-            push_capped_text(&mut texts, text);
+            let hour = time_created.and_then(local_hour_from_millis);
+            push_timed_text(&mut texts, text, hour);
         }
     }
     texts

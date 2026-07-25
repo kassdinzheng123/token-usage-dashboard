@@ -1,5 +1,6 @@
 use super::{
-    push_capped_text, session_id_of, session_token_hint, ExtractedSession, SourceExtract,
+    local_hour_from_json, push_timed_text, session_id_of, session_token_hint, ExtractedSession,
+    SourceExtract, TimedUserText,
 };
 use crate::sources::home_dir;
 use serde_json::Value;
@@ -113,7 +114,7 @@ fn find_session_file(files: &[PathBuf], session_id: &str) -> Option<PathBuf> {
     })
 }
 
-fn read_user_messages(path: &Path) -> Result<Vec<String>, String> {
+fn read_user_messages(path: &Path) -> Result<Vec<TimedUserText>, String> {
     let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
     let mut texts = Vec::new();
@@ -137,7 +138,8 @@ fn read_user_messages(path: &Path) -> Result<Vec<String>, String> {
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            push_capped_text(&mut texts, message);
+            let hour = value.get("timestamp").and_then(local_hour_from_json);
+            push_timed_text(&mut texts, message, hour);
         }
     }
     Ok(texts)
@@ -276,7 +278,11 @@ mod tests {
 
         assert_eq!(extract.sessions.len(), 1);
         assert_eq!(
-            extract.sessions[0].user_texts,
+            extract.sessions[0]
+                .user_texts
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["检查日志健康度", "继续"]
         );
     }

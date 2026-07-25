@@ -1,5 +1,6 @@
 use super::{
-    push_capped_text, session_id_of, session_token_hint, ExtractedSession, SourceExtract,
+    local_hour_from_json, push_timed_text, session_id_of, session_token_hint, ExtractedSession,
+    SourceExtract, TimedUserText,
 };
 use crate::sources::home_dir;
 use serde_json::Value;
@@ -148,7 +149,7 @@ fn clean_title(title: &str) -> Option<String> {
     }
 }
 
-fn read_user_texts(dir: &Path) -> Vec<String> {
+fn read_user_texts(dir: &Path) -> Vec<TimedUserText> {
     let mut prompt_texts = Vec::new();
     let mut message_texts = Vec::new();
     let Ok(agents) = fs::read_dir(dir.join("agents")) else {
@@ -169,6 +170,7 @@ fn read_user_texts(dir: &Path) -> Vec<String> {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            let hour = value.get("time").and_then(local_hour_from_json);
             match value.get("type").and_then(Value::as_str) {
                 Some("turn.prompt") => {
                     if value.pointer("/origin/kind").and_then(Value::as_str) != Some("user") {
@@ -177,7 +179,7 @@ fn read_user_texts(dir: &Path) -> Vec<String> {
                     if let Some(input) = value.get("input").and_then(Value::as_array) {
                         for part in input {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                push_capped_text(&mut prompt_texts, text);
+                                push_timed_text(&mut prompt_texts, text, hour);
                             }
                         }
                     }
@@ -196,7 +198,7 @@ fn read_user_texts(dir: &Path) -> Vec<String> {
                     if let Some(content) = message.get("content").and_then(Value::as_array) {
                         for part in content {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                push_capped_text(&mut message_texts, text);
+                                push_timed_text(&mut message_texts, text, hour);
                             }
                         }
                     }
@@ -294,7 +296,7 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("修复小时摘要"));
         assert_eq!(session.project, "token-usage");
         assert_eq!(session.project_key, "kimi:/Users/demo/token-usage");
-        assert_eq!(session.user_texts, vec!["帮我修复小时摘要"]);
+        assert_eq!(session.user_texts.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), vec!["帮我修复小时摘要"]);
         assert!(!session.usage_only);
         assert!(extract.sessions[1].usage_only);
     }

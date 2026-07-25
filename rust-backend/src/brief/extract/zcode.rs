@@ -1,6 +1,6 @@
 use super::{
-    push_capped_text, session_id_of, session_token_hint, truncate_chars, ExtractedSession,
-    SourceExtract, MAX_USER_CHARS, MAX_USER_MESSAGES,
+    local_hour_from_millis, push_timed_text, session_id_of, session_token_hint, truncate_chars,
+    ExtractedSession, SourceExtract, TimedUserText, MAX_USER_CHARS, MAX_USER_MESSAGES,
 };
 use crate::sources::home_dir;
 use rusqlite::{Connection, OpenFlags};
@@ -61,10 +61,8 @@ pub fn extract(session_rows: &[Value]) -> Result<SourceExtract, String> {
             _ => ("General".to_string(), "zcode:general".to_string()),
         };
         let mut user_texts = load_user_parts(&connection, &native_id)?;
-        if user_texts.len() < MAX_USER_MESSAGES {
-            for text in load_input_history(&connection, &native_id)? {
-                push_capped_text(&mut user_texts, &text);
-            }
+        if user_texts.is_empty() {
+            user_texts = load_input_history(&connection, &native_id)?;
         }
         let usage_only = title.is_none() && user_texts.is_empty();
         sessions.push(ExtractedSession {
@@ -121,11 +119,11 @@ fn load_title(connection: &Connection, native_id: &str) -> Result<Option<String>
         .filter(|text| !text.is_empty()))
 }
 
-fn load_user_parts(connection: &Connection, native_id: &str) -> Result<Vec<String>, String> {
+fn load_user_parts(connection: &Connection, native_id: &str) -> Result<Vec<TimedUserText>, String> {
     let mut statement = connection
         .prepare(
             r#"
-            SELECT p.data, m.data
+            SELECT p.data, m.data, p.time_created
             FROM part p
             JOIN message m ON m.id = p.message_id
             WHERE p.session_id = ?1
@@ -135,13 +133,17 @@ fn load_user_parts(connection: &Connection, native_id: &str) -> Result<Vec<Strin
         .map_err(|err| err.to_string())?;
     let rows = statement
         .query_map([native_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
         })
         .map_err(|err| err.to_string())?;
 
     let mut texts = Vec::new();
     for row in rows {
-        let (part_data, message_data) = row.map_err(|err| err.to_string())?;
+        let (part_data, message_data, time_created) = row.map_err(|err| err.to_string())?;
         let Ok(message) = serde_json::from_str::<Value>(&message_data) else {
             continue;
         };
@@ -160,20 +162,18 @@ fn load_user_parts(connection: &Connection, native_id: &str) -> Result<Vec<Strin
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            push_capped_text(&mut texts, text);
-            if texts.len() >= MAX_USER_MESSAGES {
-                break;
-            }
+            let hour = time_created.and_then(local_hour_from_millis);
+            push_timed_text(&mut texts, text, hour);
         }
     }
     Ok(texts)
 }
 
-fn load_input_history(connection: &Connection, native_id: &str) -> Result<Vec<String>, String> {
+fn load_input_history(connection: &Connection, native_id: &str) -> Result<Vec<TimedUserText>, String> {
     let mut statement = connection
         .prepare(
             r#"
-            SELECT text
+            SELECT text, time_created
             FROM input_history
             WHERE session_id = ?1
             ORDER BY time_created ASC, id ASC
@@ -183,18 +183,22 @@ fn load_input_history(connection: &Connection, native_id: &str) -> Result<Vec<St
         .map_err(|err| err.to_string())?;
     let rows = statement
         .query_map(
-            rusqlite::params![native_id, MAX_USER_MESSAGES as i64],
-            |row| row.get::<_, String>(0),
+            rusqlite::params![native_id, (MAX_USER_MESSAGES * 4) as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
         )
         .map_err(|err| err.to_string())?;
 
     let mut texts = Vec::new();
     for row in rows {
-        let text = row.map_err(|err| err.to_string())?;
+        let (text, time_created) = row.map_err(|err| err.to_string())?;
         let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            texts.push(truncate_chars(trimmed, MAX_USER_CHARS));
+        if trimmed.is_empty() {
+            continue;
         }
+        texts.push(TimedUserText {
+            text: truncate_chars(trimmed, MAX_USER_CHARS),
+            hour: time_created.and_then(local_hour_from_millis),
+        });
     }
     Ok(texts)
 }
@@ -326,6 +330,6 @@ mod tests {
         assert!(extract.sessions[0]
             .user_texts
             .iter()
-            .any(|text| text.contains("模型选择器")));
+            .any(|entry| entry.text.contains("模型选择器")));
     }
 }

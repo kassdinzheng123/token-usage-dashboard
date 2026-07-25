@@ -23,6 +23,12 @@ struct DailyBriefCard: View {
     @State private var isSourcePickerPresented = false
     @State private var selectedHours: Set<Int> = []
     @State private var selectedSources: Set<String> = []
+    /// Active kanban page (one page shows up to 4 CLI columns).
+    @State private var cliPage: Int = 0
+    /// Currently hovered hour node (drives the debounced popover).
+    @State private var hoveredHour: Int?
+    /// Hour whose detail popover is currently presented.
+    @State private var popoverHour: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -41,10 +47,17 @@ struct DailyBriefCard: View {
         .onChange(of: brief?.date) { _, _ in
             syncOrderFromBrief()
             expandedProjectIDs = []
+            cliPage = 0
         }
         .onChange(of: brief?.contentFingerprint) { _, _ in
             syncOrderFromBrief()
             expandedProjectIDs = []
+            cliPage = 0
+        }
+        .onChange(of: orderedCLIGroups.count) { _, _ in
+            if cliPage > max(0, cliPageCount - 1) {
+                cliPage = max(0, cliPageCount - 1)
+            }
         }
         .onAppear {
             syncOrderFromBrief()
@@ -288,47 +301,141 @@ struct DailyBriefCard: View {
     @ViewBuilder
     private var hourlyTimeline: some View {
         if let hours = brief?.hours, !hours.isEmpty {
+            let sorted = hours.sorted { $0.hour < $1.hour }
             VStack(alignment: .leading, spacing: 8) {
                 Text("Hour by Hour")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(hours.sorted { $0.hour < $1.hour }) { item in
-                        hourlyRow(item)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .bottom, spacing: 10) {
+                        ForEach(sorted) { item in
+                            hourTimelineNode(item, maxTokens: sorted.map(\.tokens).max() ?? 1)
+                                .popover(
+                                    isPresented: Binding(
+                                        get: { popoverHour == item.hour },
+                                        set: { presented in
+                                            if !presented, popoverHour == item.hour {
+                                                popoverHour = nil
+                                                hoveredHour = nil
+                                            }
+                                        }
+                                    ),
+                                    arrowEdge: .top
+                                ) {
+                                    hourDetailCard(item)
+                                }
+                        }
                     }
+                    .padding(.horizontal, 2)
+                    .padding(.vertical, 4)
                 }
             }
         }
     }
 
-    private func hourlyRow(_ item: HourlyBriefItem) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+    /// Compact, glanceable node — hour label, a bar scaled by relative token
+    /// volume, and the source color dots. All detail moves to the hover card.
+    private func hourTimelineNode(_ item: HourlyBriefItem, maxTokens: Int) -> some View {
+        let isUsageOnly = item.headline == Self.usageOnlyHeadline
+        let fraction = maxTokens > 0
+            ? min(1, max(0.12, Double(item.tokens) / Double(maxTokens)))
+            : 0.12
+        let barHeight: CGFloat = 8 + 36 * CGFloat(fraction)
+        let sourceLabels = Array(NSOrderedSet(array: item.projects.map(\.source))) as! [String]
+
+        return VStack(spacing: 6) {
             Text(Self.hourLabel(item.hour))
-                .font(.system(.caption, design: .monospaced))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .frame(width: 40, alignment: .leading)
+
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(
+                    isUsageOnly
+                        ? AppPalette.semanticWarning.opacity(0.55)
+                        : Color.accentColor.opacity(0.35 + 0.5 * fraction)
+                )
+                .frame(width: 10, height: barHeight)
+
+            HStack(spacing: 2) {
+                ForEach(sourceLabels.prefix(3), id: \.self) { source in
+                    Circle()
+                        .fill(AppPalette.cliColor(forLabel: sourceLabel(for: source)))
+                        .frame(width: 5, height: 5)
+                }
+            }
+            .frame(height: 5)
+        }
+        .frame(width: 34)
+        .opacity(isUsageOnly ? 0.7 : 1)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering {
+                hoveredHour = item.hour
+                let target = item.hour
+                Task {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    if hoveredHour == target {
+                        popoverHour = target
+                    }
+                }
+            } else if hoveredHour == item.hour, popoverHour != item.hour {
+                hoveredHour = nil
+            }
+        }
+    }
+
+    /// Liquid-glass detail card shown on hover: full headline plus the hour's
+    /// project mix as compact tags.
+    @ViewBuilder
+    private func hourDetailCard(_ item: HourlyBriefItem) -> some View {
+        let isUsageOnly = item.headline == Self.usageOnlyHeadline
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(Self.hourLabel(item.hour))
+                    .font(.system(.subheadline, design: .monospaced).weight(.semibold))
+                Spacer(minLength: 4)
+                Text(item.tokens.briefTokenText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
 
             Text(item.headline)
                 .font(.subheadline)
-                .foregroundStyle(item.headline == Self.usageOnlyHeadline ? .tertiary : .primary)
-                .lineLimit(2)
+                .foregroundStyle(isUsageOnly ? .secondary : .primary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if item.headline == Self.usageOnlyHeadline {
-                Image(systemName: "exclamationmark.circle")
+            if isUsageOnly {
+                Label("可用「按小时」重新生成解析", systemImage: "exclamationmark.circle")
                     .font(.caption2)
                     .foregroundStyle(AppPalette.semanticWarning)
-                    .help("该小时只有用量记录，可用「按小时」重新生成解析")
             }
 
-            Spacer(minLength: 8)
-
-            Text(item.tokens.briefTokenText)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            if !item.projects.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(item.projects) { project in
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(AppPalette.cliColor(forLabel: sourceLabel(for: project.source)))
+                                .frame(width: 6, height: 6)
+                            Text(sourceLabel(for: project.source))
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Text(project.project)
+                                .font(.caption2)
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Text(project.tokens.briefTokenText)
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
         }
-        .frame(minHeight: 24)
+        .padding(12)
+        .frame(width: 260, alignment: .topLeading)
     }
 
     private static func hourLabel(_ hour: Int) -> String {
@@ -363,6 +470,13 @@ struct DailyBriefCard: View {
                         boardColumns
                     }
                     .fixedSize(horizontal: false, vertical: true)
+
+                    if cliPageCount > 1 {
+                        HStack {
+                            Spacer(minLength: 0)
+                            boardPager
+                        }
+                    }
 
                     if let error = brief.error, !error.isEmpty {
                         Text(error)
@@ -400,13 +514,15 @@ struct DailyBriefCard: View {
     /// grouped surface, while each project card keeps an opaque background.
     private var boardColumns: some View {
         HStack(alignment: .top, spacing: 14) {
-            ForEach(orderedCLIGroups) { group in
+            ForEach(visibleCLIGroups) { group in
                 cliColumn(group)
                     .opacity(draggingSourceID == group.id ? 0.55 : 1)
                     .animation(.easeOut(duration: 0.15), value: draggingSourceID)
                     .onDrag {
                         draggingSourceID = group.id
                         return NSItemProvider(object: group.id as NSString)
+                    } preview: {
+                        Color.clear.frame(width: 1, height: 1)
                     }
                     .onDrop(
                         of: [UTType.text],
@@ -414,6 +530,7 @@ struct DailyBriefCard: View {
                             targetSource: group.id,
                             sourceOrder: $sourceOrder,
                             draggingSourceID: $draggingSourceID,
+                            draggingProjectID: $draggingProjectID,
                             onReorder: persistOrder
                         )
                     )
@@ -423,6 +540,16 @@ struct DailyBriefCard: View {
         .padding(.top, 2)
         .padding(.horizontal, 2)
         .padding(.bottom, 8)
+        // Catch drops that land between columns so the dragging state always
+        // resets, even when no column delegate claims the drop.
+        .onDrop(
+            of: [UTType.text],
+            delegate: BriefDragResetDelegate(
+                draggingSourceID: $draggingSourceID,
+                draggingProjectID: $draggingProjectID,
+                onReorder: persistOrder
+            )
+        )
     }
 
     private func cliColumn(_ group: BriefCLIGroup) -> some View {
@@ -454,6 +581,8 @@ struct DailyBriefCard: View {
                         .onDrag {
                             draggingProjectID = card.id
                             return NSItemProvider(object: card.id as NSString)
+                        } preview: {
+                            Color.clear.frame(width: 1, height: 1)
                         }
                         .onDrop(
                             of: [UTType.text],
@@ -462,6 +591,7 @@ struct DailyBriefCard: View {
                                 targetProjectID: card.id,
                                 projectOrderBySource: $projectOrderBySource,
                                 draggingProjectID: $draggingProjectID,
+                                draggingSourceID: $draggingSourceID,
                                 onReorder: persistOrder
                             )
                         )
@@ -582,6 +712,78 @@ struct DailyBriefCard: View {
         orderedCLIGroups.reduce(0) { $0 + $1.projects.count }
     }
 
+    /// Maximum CLI columns per kanban page.
+    private static let cliColumnsPerPage = 4
+
+    private var cliPageCount: Int {
+        max(1, Int(ceil(Double(orderedCLIGroups.count) / Double(Self.cliColumnsPerPage))))
+    }
+
+    /// CLI columns visible on the current page.
+    private var visibleCLIGroups: [BriefCLIGroup] {
+        let groups = orderedCLIGroups
+        guard !groups.isEmpty else { return [] }
+        let start = min(cliPage * Self.cliColumnsPerPage, groups.count)
+        let end = min(start + Self.cliColumnsPerPage, groups.count)
+        return Array(groups[start..<end])
+    }
+
+    /// ‹ ●●○ › pager mirroring the dashboard's `LegendPageControls` styling.
+    private var boardPager: some View {
+        let showsDots = cliPageCount <= 8
+        return HStack(alignment: .center, spacing: 8) {
+            Button {
+                if cliPage > 0 { cliPage -= 1 }
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(cliPage == 0 ? Color.primary.opacity(0.25) : Color.primary.opacity(0.75))
+            .disabled(cliPage == 0)
+            .help("上一轮")
+
+            if showsDots {
+                HStack(spacing: 4) {
+                    ForEach(0..<cliPageCount, id: \.self) { page in
+                        Circle()
+                            .fill(page == cliPage ? Color.accentColor : Color.primary.opacity(0.18))
+                            .frame(width: page == cliPage ? 6 : 4,
+                                   height: page == cliPage ? 6 : 4)
+                            .animation(.easeInOut(duration: 0.15), value: cliPage)
+                    }
+                }
+                .frame(minWidth: 34)
+                .help("\(orderedCLIGroups.count) CLI · 第 \(cliPage + 1)/\(cliPageCount) 轮")
+            } else {
+                Text("\(cliPage + 1)/\(cliPageCount)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 34)
+                    .help("\(orderedCLIGroups.count) CLI")
+            }
+
+            Button {
+                if cliPage < cliPageCount - 1 { cliPage += 1 }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(cliPage >= cliPageCount - 1 ? Color.primary.opacity(0.25) : Color.primary.opacity(0.75))
+            .disabled(cliPage >= cliPageCount - 1)
+            .help("下一轮")
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .appInteractiveGlassControl()
+        .fixedSize()
+    }
+
     private func syncOrderFromBrief() {
         guard let brief else {
             sourceOrder = []
@@ -664,6 +866,7 @@ private struct BriefSourceDropDelegate: DropDelegate {
     let targetSource: String
     @Binding var sourceOrder: [String]
     @Binding var draggingSourceID: String?
+    @Binding var draggingProjectID: String?
     let onReorder: () -> Void
 
     func dropEntered(info: DropInfo) {
@@ -679,6 +882,7 @@ private struct BriefSourceDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         draggingSourceID = nil
+        draggingProjectID = nil
         onReorder()
         return true
     }
@@ -693,6 +897,7 @@ private struct BriefProjectDropDelegate: DropDelegate {
     let targetProjectID: String
     @Binding var projectOrderBySource: [String: [String]]
     @Binding var draggingProjectID: String?
+    @Binding var draggingSourceID: String?
     let onReorder: () -> Void
 
     func dropEntered(info: DropInfo) {
@@ -710,6 +915,26 @@ private struct BriefProjectDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        draggingProjectID = nil
+        draggingSourceID = nil
+        onReorder()
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+}
+
+/// Fallback delegate on the board container: claims drops that land on gaps
+/// no card/column delegate covers, so the dragging state never gets stuck.
+private struct BriefDragResetDelegate: DropDelegate {
+    @Binding var draggingSourceID: String?
+    @Binding var draggingProjectID: String?
+    let onReorder: () -> Void
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingSourceID = nil
         draggingProjectID = nil
         onReorder()
         return true

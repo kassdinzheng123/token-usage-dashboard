@@ -56,14 +56,19 @@ headline 一句概括该项目今天做了什么；bullets 3 到 5 条，每条�
     parse_section_summary(&content)
 }
 
+/// Summarizes one hour of activity into a single headline. When the hour
+/// spans multiple projects, the model is asked to distinguish them inline,
+/// e.g. "在 summer 项目上，…；在 token-usage 项目上，…".
 pub fn summarize_hour(
     config: &LlmConfig,
     hour: i64,
     extract_payload: &Value,
 ) -> Result<String, String> {
     let system = format!(
-        "你是 Token Usage Dashboard 的 Daily Brief 助手。根据用户在 {}（{}:00–{}:59）各 CLI 会话的标题与用户原文，用中文一句话概括这一小时用户在做什么。\
-只依据提供的 titles/userTexts，禁止编造未出现的事实。输出严格 JSON：{{\"headline\":\"...\"}}。headline 为一句不超过 40 字的短句。",
+        "你是 Token Usage Dashboard 的 Daily Brief 助手。根据用户在 {}（{}:00–{}:59）各 CLI 会话的标题与用户原文，用中文概括这一小时用户在做什么。\
+只依据提供的 titles/userTexts，禁止编造未出现的事实。这些 userTexts 已按本小时过滤，不要把其他时段的工作写进来。\
+输出严格 JSON：{{\"headline\":\"...\"}}。\
+headline 为一段不超过 60 字的短句。若该小时涉及多个项目，按项目分段，每段以「在 <项目名> 项目上，…」开头，段间用「；」连接；只有一个项目时不必显式点名。",
         hour_label(hour),
         hour,
         hour

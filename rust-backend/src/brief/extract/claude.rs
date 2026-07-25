@@ -1,5 +1,6 @@
 use super::{
-    push_capped_text, session_id_of, session_token_hint, ExtractedSession, SourceExtract,
+    local_hour_from_json, push_timed_text, session_id_of, session_token_hint, ExtractedSession,
+    SourceExtract, TimedUserText,
 };
 use crate::sources::home_dir;
 use serde_json::Value;
@@ -80,7 +81,7 @@ fn find_session_file(session_id: &str) -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
-fn read_session_file(path: &Path) -> Result<(Option<String>, Vec<String>), String> {
+fn read_session_file(path: &Path) -> Result<(Option<String>, Vec<TimedUserText>), String> {
     let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
     let mut title = None;
@@ -118,7 +119,8 @@ fn read_session_file(path: &Path) -> Result<(Option<String>, Vec<String>), Strin
             }
             Some("user") => {
                 if let Some(text) = extract_user_text(&value) {
-                    push_capped_text(&mut user_texts, &text);
+                    let hour = value.get("timestamp").and_then(local_hour_from_json);
+                    push_timed_text(&mut user_texts, &text, hour);
                 }
             }
             _ => {}
@@ -289,8 +291,70 @@ mod tests {
 
         assert_eq!(extract.sessions.len(), 1);
         assert_eq!(extract.sessions[0].title.as_deref(), Some("磁盘清理"));
-        assert_eq!(extract.sessions[0].user_texts, vec!["帮我清理磁盘", "继续"]);
+        assert_eq!(
+            extract.sessions[0]
+                .user_texts
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["帮我清理磁盘", "继续"]
+        );
         assert!(!extract.sessions[0].usage_only);
         assert_eq!(extract.coverage(), "full");
+    }
+
+    #[test]
+    fn stamps_local_hour_from_user_timestamp() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "token-usage-claude-brief-hour-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("projects").join("demo");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "sess-brief-hour";
+        let path = project.join(format!("{session_id}.jsonl"));
+        // Fixed offset so the hour assertion is timezone-stable: 06:30 and 11:15 local+00.
+        let lines = [
+            json!({"type":"user","timestamp":"2026-07-21T06:30:00+00:00","message":{"content":"早上做交接"}}),
+            json!({"type":"user","timestamp":"2026-07-21T11:15:00+00:00","message":{"content":"上午验因果链"}}),
+        ];
+        let body = lines
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, body).unwrap();
+
+        let previous = std::env::var_os(CLAUDE_CONFIG_DIR);
+        std::env::set_var(CLAUDE_CONFIG_DIR, &root);
+
+        let extract = extract(&[json!({
+            "sessionId": session_id,
+            "totalTokens": 42
+        })])
+        .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var(CLAUDE_CONFIG_DIR, value),
+            None => std::env::remove_var(CLAUDE_CONFIG_DIR),
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        let texts = &extract.sessions[0].user_texts;
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0].text, "早上做交接");
+        assert_eq!(texts[1].text, "上午验因果链");
+        assert_eq!(
+            texts[0].hour,
+            super::super::local_hour_from_rfc3339("2026-07-21T06:30:00+00:00")
+        );
+        assert_eq!(
+            texts[1].hour,
+            super::super::local_hour_from_rfc3339("2026-07-21T11:15:00+00:00")
+        );
     }
 }
