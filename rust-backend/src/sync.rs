@@ -15,6 +15,7 @@ use std::{
 
 const FORMAT_VERSION: u32 = 1;
 const SYNC_DIRECTORY: &str = ".token-usage-sync/v1/devices";
+const MAX_SNAPSHOT_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,21 +122,51 @@ pub fn export_to_git_repo(
     }
     records.sort_by_key(record_key);
 
-    let mut contents = String::new();
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
     let mut summary = SyncSummary::default();
     for record in records {
         summary.add_kind(record.kind);
-        contents.push_str(
-            &serde_json::to_string(&record)
-                .map_err(|err| format!("failed to serialize sync record: {err}"))?,
-        );
-        contents.push('\n');
+        let line = serde_json::to_string(&record)
+            .map_err(|err| format!("failed to serialize sync record: {err}"))?;
+        append_snapshot_line(
+            &mut chunks,
+            &mut current_chunk,
+            &line,
+            MAX_SNAPSHOT_FILE_BYTES,
+        )?;
+    }
+    if !current_chunk.is_empty() || chunks.is_empty() {
+        chunks.push(current_chunk);
     }
 
-    let snapshot_path = devices_directory.join(format!("{device_id}.jsonl"));
-    atomic_write(&snapshot_path, contents.as_bytes())?;
-    summary.files = 1;
-    Ok((snapshot_path, summary))
+    let existing_paths = device_snapshot_paths(&devices_directory, device_id)?;
+    let mut snapshot_paths = Vec::with_capacity(chunks.len());
+    for (index, contents) in chunks.iter().enumerate() {
+        let snapshot_path =
+            devices_directory.join(format!("{device_id}.part-{:04}.jsonl", index + 1));
+        atomic_write(&snapshot_path, contents.as_bytes())?;
+        snapshot_paths.push(snapshot_path);
+    }
+    for path in existing_paths {
+        if !snapshot_paths.contains(&path) {
+            fs::remove_file(&path).map_err(|err| {
+                format!(
+                    "failed to remove stale sync snapshot {}: {err}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+
+    summary.files = snapshot_paths.len();
+    Ok((
+        snapshot_paths
+            .into_iter()
+            .next()
+            .expect("snapshot export always writes at least one file"),
+        summary,
+    ))
 }
 
 pub fn import_from_git_repo(
@@ -329,6 +360,55 @@ fn append_records(
         records.push(record);
     }
     Ok(())
+}
+
+fn append_snapshot_line(
+    chunks: &mut Vec<String>,
+    current_chunk: &mut String,
+    line: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let line_bytes = line.len() + 1;
+    if line_bytes > max_bytes {
+        return Err(format!(
+            "one sync record is {line_bytes} bytes, exceeding the {max_bytes}-byte snapshot file limit"
+        ));
+    }
+    if !current_chunk.is_empty() && current_chunk.len() + line_bytes > max_bytes {
+        chunks.push(std::mem::take(current_chunk));
+    }
+    current_chunk.push_str(line);
+    current_chunk.push('\n');
+    Ok(())
+}
+
+fn device_snapshot_paths(directory: &Path, device_id: &str) -> Result<Vec<PathBuf>, String> {
+    let legacy_name = format!("{device_id}.jsonl");
+    let chunk_prefix = format!("{device_id}.part-");
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|err| {
+        format!(
+            "failed to read sync directory {}: {err}",
+            directory.display()
+        )
+    })? {
+        let entry = entry
+            .map_err(|err| format!("failed to read an entry in {}: {err}", directory.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect sync snapshot {}: {err}", path.display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == legacy_name || (name.starts_with(&chunk_prefix) && name.ends_with(".jsonl")) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 fn validate_record(mut record: SyncRecord) -> Result<Candidate, String> {
@@ -736,6 +816,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn snapshot_lines_split_without_breaking_jsonl_records() {
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        append_snapshot_line(&mut chunks, &mut current, "1234", 10).expect("first line");
+        append_snapshot_line(&mut chunks, &mut current, "5678", 10).expect("second line");
+        append_snapshot_line(&mut chunks, &mut current, "90", 10).expect("third line");
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+
+        assert_eq!(chunks, vec!["1234\n5678\n", "90\n"]);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 10));
+        assert!(append_snapshot_line(&mut Vec::new(), &mut String::new(), "12345", 5).is_err());
     }
 
     #[test]

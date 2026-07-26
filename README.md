@@ -77,11 +77,12 @@ cargo test --manifest-path rust-backend/Cargo.toml
 
 Use a private Git repository as the transport for ledger records. The SQLite
 ledger's usage sessions, blocks, and message-level rows are exported as a
-deterministic JSONL snapshot under `.token-usage-sync/v1/devices/`. Imports
-write the merged records back into the local SQLite ledger. The binary
-SQLite/WAL files and the machine-local source scan watermark are not copied,
-so concurrent devices remain mergeable and local source scans cannot be
-skipped accidentally.
+deterministic JSONL snapshot under `.token-usage-sync/v1/devices/`. Large
+device snapshots are split into 32 MiB files so they stay below Git hosting
+limits. Imports write the merged records back into the local SQLite ledger and
+remain compatible with the earlier single-file layout. The binary SQLite/WAL
+files and the machine-local source scan watermark are not copied, so concurrent
+devices remain mergeable and local source scans cannot be skipped accidentally.
 
 Clone the private repository on every device, choose a different lowercase
 device ID for each one, and make sure the current branch has an upstream.
