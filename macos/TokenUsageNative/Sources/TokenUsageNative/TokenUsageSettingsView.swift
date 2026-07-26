@@ -16,8 +16,82 @@ struct TokenUsageSettingsView: View {
                 .tabItem {
                     Label("Brief", systemImage: "sparkles")
                 }
+
+            SyncSettingsTab(preferences: preferences)
+                .tabItem {
+                    Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                }
         }
         .frame(width: 520, height: 440)
+    }
+}
+
+private struct SyncSettingsTab: View {
+    @ObservedObject var preferences: TokenUsagePreferencesController
+
+    var body: some View {
+        Form {
+            Section {
+                TextField(
+                    "Git repository",
+                    text: $preferences.syncRepositoryPath,
+                    prompt: Text("/path/to/private-sync-repository")
+                )
+                TextField(
+                    "Device ID",
+                    text: $preferences.syncDeviceID,
+                    prompt: Text("macbook-pro")
+                )
+                Toggle(
+                    "Automatically sync every 15 minutes",
+                    isOn: $preferences.automaticSyncEnabled
+                )
+                .toggleStyle(.switch)
+            } header: {
+                Text("Git Sync")
+            } footer: {
+                Text("Use a clean clone with an upstream branch. SQLite usage records are merged; local source scan state stays on this device.")
+            }
+
+            Section {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await preferences.syncNow() }
+                    } label: {
+                        if preferences.isSyncing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Sync Now")
+                        }
+                    }
+                    .disabled(
+                        preferences.isSyncing
+                            || preferences.syncRepositoryPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || preferences.syncDeviceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+
+                    Spacer()
+
+                    if let message = preferences.syncStatusMessage {
+                        Label {
+                            Text(message)
+                        } icon: {
+                            Image(systemName: preferences.syncStatusIsError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                                .foregroundStyle(preferences.syncStatusIsError ? Color.red : Color.green)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    } else if let lastSyncAt = preferences.lastSyncAt {
+                        Text("Last synced \(lastSyncAt, style: .relative)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 

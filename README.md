@@ -60,6 +60,7 @@ Common API routes:
 ```text
 GET /api/health
 GET /api/refresh
+POST /api/sync
 GET /api/today
 GET /api/{source}/{view}
 ```
@@ -71,6 +72,53 @@ Supported `source` values include `claude`, `codex`, `opencode`, `hermes`, `open
 ```bash
 cargo test --manifest-path rust-backend/Cargo.toml
 ```
+
+## Sync Usage Across Devices With Git
+
+Use a private Git repository as the transport for ledger records. The SQLite
+ledger's usage sessions, blocks, and message-level rows are exported as a
+deterministic JSONL snapshot under `.token-usage-sync/v1/devices/`. Imports
+write the merged records back into the local SQLite ledger. The binary
+SQLite/WAL files and the machine-local source scan watermark are not copied,
+so concurrent devices remain mergeable and local source scans cannot be
+skipped accidentally.
+
+Clone the private repository on every device, choose a different lowercase
+device ID for each one, and make sure the current branch has an upstream.
+The automatic command requires a clean working tree and performs
+`pull --rebase`, SQLite import, snapshot export, commit, and push:
+
+```bash
+cargo run --release --manifest-path rust-backend/Cargo.toml -- \
+  sync run --repo "$TOKEN_SYNC_REPO" --device macbook-pro
+```
+
+It never force-pushes. A concurrent non-fast-forward push is pulled and
+retried once; authentication failures, conflicts, detached HEAD, missing
+upstream branches, and unrelated working-tree changes are reported without
+discarding data. `sync export` and `sync import` remain available for manual
+workflows.
+
+The macOS app exposes the same operation in **Settings → Sync**. Configure the
+local repository path and device ID, then use **Sync Now** or enable automatic
+sync every 15 minutes.
+
+The Rust binary is also a headless, cross-platform sync client. On a non-macOS
+device, build it with Cargo and point it at the SQLite ledger without starting
+the HTTP server or UI. The one-shot command is suitable for cron or a systemd
+timer:
+
+```bash
+cargo build --release --manifest-path rust-backend/Cargo.toml
+TOKEN_USAGE_LEDGER_PATH=/path/to/usage-ledger.sqlite \
+  rust-backend/target/release/token-usage-server \
+  sync run --repo "$TOKEN_SYNC_REPO" --device linux-workstation
+```
+
+`TOKEN_USAGE_SYNC_DEVICE_ID=macbook-pro` can replace `--device`. The sync
+commands use the normal ledger path and honor `TOKEN_USAGE_LEDGER_PATH`.
+Snapshot files can contain local session identifiers and usage metadata; keep
+the repository private.
 
 ## Build The Native macOS App
 

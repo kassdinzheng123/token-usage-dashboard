@@ -22,6 +22,13 @@ struct TokenUsageNativeApp: App {
             )
             .onAppear {
                 appDelegate.configureMenuBar(store: store, currencyController: currencyController)
+                preferences.startAutomaticSync()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .tokenUsageDidSync)) { _ in
+                Task {
+                    await store.refreshDashboard(force: true)
+                    await store.refreshToday(force: true)
+                }
             }
         }
         .defaultSize(width: 1160, height: 780)

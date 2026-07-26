@@ -17,7 +17,7 @@ use std::{
 static INGEST_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<StdMutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-const APP_SUPPORT_DIR: &str = "Library/Application Support/Token Usage Dashboard";
+const APP_DIRECTORY_NAME: &str = "Token Usage Dashboard";
 const LEDGER_FILE_NAME: &str = "usage-ledger.sqlite";
 const LEDGER_PATH_ENV: &str = "TOKEN_USAGE_LEDGER_PATH";
 
@@ -152,6 +152,42 @@ impl UsageLedger {
             View::Sessions => self.load_sessions(source),
             View::Blocks => self.load_blocks(source),
         }
+    }
+
+    pub fn load_message_sync_rows(&self, source: Source) -> Result<Vec<Value>, String> {
+        self.with_connection(|connection| {
+            let source_name = source.to_string();
+            let mut statement = connection.prepare(
+                r#"
+                SELECT message_id, session_id, date, time,
+                       input_tokens, output_tokens, cache_creation_tokens,
+                       cache_read_tokens, total_tokens, cost
+                FROM usage_messages
+                WHERE source = ?1
+                ORDER BY date, time, message_id
+                "#,
+            )?;
+            let rows = statement.query_map(params![source_name], |row| {
+                Ok(json!({
+                    "messageId": row.get::<_, String>(0)?,
+                    "sessionId": row.get::<_, String>(1)?,
+                    "date": row.get::<_, String>(2)?,
+                    "time": row.get::<_, String>(3)?,
+                    "inputTokens": row.get::<_, i64>(4)?,
+                    "outputTokens": row.get::<_, i64>(5)?,
+                    "cacheCreationTokens": row.get::<_, i64>(6)?,
+                    "cacheReadTokens": row.get::<_, i64>(7)?,
+                    "totalTokens": row.get::<_, i64>(8)?,
+                    "cost": row.get::<_, f64>(9)?,
+                }))
+            })?;
+
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
+        })
     }
 
     /// Hourly usage for a single day, grouped by the local hour of each row's
@@ -1334,10 +1370,44 @@ fn ledger_path() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
 
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Err("HOME is not set; cannot locate token usage ledger".to_string());
-    };
-    Ok(home.join(APP_SUPPORT_DIR).join(LEDGER_FILE_NAME))
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return Err("HOME is not set; cannot locate token usage ledger".to_string());
+        };
+        Ok(home
+            .join("Library/Application Support")
+            .join(APP_DIRECTORY_NAME)
+            .join(LEDGER_FILE_NAME))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else {
+            return Err("LOCALAPPDATA is not set; cannot locate token usage ledger".to_string());
+        };
+        Ok(local_app_data
+            .join(APP_DIRECTORY_NAME)
+            .join(LEDGER_FILE_NAME))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Some(data_home) =
+            std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty())
+        {
+            return Ok(PathBuf::from(data_home)
+                .join(APP_DIRECTORY_NAME)
+                .join(LEDGER_FILE_NAME));
+        }
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return Err("HOME is not set; cannot locate token usage ledger".to_string());
+        };
+        Ok(home
+            .join(".local/share")
+            .join(APP_DIRECTORY_NAME)
+            .join(LEDGER_FILE_NAME))
+    }
 }
 
 pub fn current_date() -> String {

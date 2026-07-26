@@ -76,6 +76,11 @@ impl Default for UsageCache {
 }
 
 impl UsageCache {
+    pub async fn clear(&self) {
+        self.data.write().await.clear();
+        self.errors.write().await.clear();
+    }
+
     pub async fn has(&self, key: &str) -> bool {
         let mut data = self.data.write().await;
         prune_expired(&mut data, self.ttl);

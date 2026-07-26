@@ -6,7 +6,7 @@ use crate::{
         BriefGenerateRequest, HourlyResponse, HourlyRow, RefreshResponse, Source, TodayModelRow,
         TodayResponse, TodaySourceRow, View, ALL_TASKS,
     },
-    sources,
+    sources, sync,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -200,6 +200,8 @@ pub struct AppState {
     today_cache: Arc<Mutex<HashMap<(Source, String), Arc<Vec<Value>>>>>,
     providers: Arc<HashMap<Source, Arc<dyn SourceProvider>>>,
     refresh_locks: Arc<Mutex<HashMap<&'static str, Arc<Mutex<()>>>>>,
+    sync_lock: Arc<Mutex<()>>,
+    ledger_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -227,6 +229,8 @@ impl AppState {
             today_cache: Arc::new(Mutex::new(HashMap::new())),
             providers: Arc::new(providers),
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            sync_lock: Arc::new(Mutex::new(())),
+            ledger_path: None,
         }
     }
 
@@ -241,7 +245,14 @@ impl AppState {
             today_cache: self.today_cache,
             providers: Arc::new(providers),
             refresh_locks: self.refresh_locks,
+            sync_lock: self.sync_lock,
+            ledger_path: self.ledger_path,
         }
+    }
+
+    pub fn with_ledger_path(mut self, path: PathBuf) -> Self {
+        self.ledger_path = Some(path);
+        self
     }
 
     pub async fn refresh_all(&self, visible: bool) {
@@ -562,6 +573,7 @@ pub fn create_app(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/refresh", get(refresh_handler))
+        .route("/api/sync", axum::routing::post(sync_handler))
         .route("/api/today", get(today_handler))
         .route("/api/hourly", get(hourly_handler))
         .route(
@@ -631,6 +643,55 @@ async fn refresh_handler(State(state): State<AppState>) -> Json<RefreshResponse>
     Json(RefreshResponse {
         status: "refreshing",
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRequest {
+    repository: String,
+    device_id: String,
+}
+
+async fn sync_handler(State(state): State<AppState>, Json(request): Json<SyncRequest>) -> Response {
+    let repository = request.repository.trim();
+    let device_id = request.device_id.trim();
+    if repository.is_empty() || device_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "error": "repository and deviceId are required",
+            })),
+        )
+            .into_response();
+    }
+
+    let _guard = state.sync_lock.lock().await;
+    let ledger_path = state.ledger_path.clone();
+    let repository = PathBuf::from(repository);
+    let device_id = device_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let ledger = open_usage_ledger(ledger_path)?;
+        sync::sync_with_git(&ledger, &repository, &device_id)
+    })
+    .await
+    {
+        Ok(Ok(result)) => {
+            state.cache.clear().await;
+            state.today_cache.lock().await.clear();
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn today_handler(
@@ -1532,6 +1593,58 @@ mod tests {
         assert!(value["keys"].as_array().unwrap().is_empty());
         assert!(value["errors"].as_object().unwrap().is_empty());
         assert_eq!(value["warm"]["warming"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn sync_requires_repository_and_device_id() {
+        let response = create_app(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sync")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"repository":"","deviceId":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn sync_surfaces_git_repository_errors() {
+        let root = temp_codex_home().join("sync-api");
+        fs::create_dir_all(&root).unwrap();
+        let state = test_state().with_ledger_path(root.join("usage-ledger.sqlite"));
+        let body = json!({
+            "repository": root.to_string_lossy(),
+            "deviceId": "test-device",
+        })
+        .to_string();
+
+        let response = create_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sync")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not a git repository")));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

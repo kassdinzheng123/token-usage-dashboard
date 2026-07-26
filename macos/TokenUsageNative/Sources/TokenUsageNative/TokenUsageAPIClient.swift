@@ -4,6 +4,7 @@ actor TokenUsageAPIClient {
     enum ClientError: LocalizedError {
         case invalidURL
         case unexpectedStatus(Int)
+        case server(String)
 
         var errorDescription: String? {
             switch self {
@@ -11,6 +12,8 @@ actor TokenUsageAPIClient {
                 "Invalid API URL."
             case let .unexpectedStatus(statusCode):
                 "Unexpected API status code: \(statusCode)."
+            case let .server(message):
+                message
             }
         }
     }
@@ -120,6 +123,27 @@ actor TokenUsageAPIClient {
         try await fetchIgnoringBody("refresh")
     }
 
+    func runGitSync(repository: String, deviceID: String) async throws -> GitSyncResponse {
+        let url = try makeURL(path: "sync", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            GitSyncRequest(repository: repository, deviceId: deviceID)
+        )
+
+        let (data, response) = try await session.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            if let payload = try? decoder.decode(GitSyncErrorResponse.self, from: data) {
+                throw ClientError.server(payload.error)
+            }
+            throw ClientError.unexpectedStatus(httpResponse.statusCode)
+        }
+        return try decoder.decode(GitSyncResponse.self, from: data)
+    }
+
     func fetchDaily(
         source: UsageSource,
         since: String? = nil,
@@ -219,4 +243,13 @@ actor TokenUsageAPIClient {
         }
         return result
     }
+}
+
+private struct GitSyncRequest: Encodable {
+    var repository: String
+    var deviceId: String
+}
+
+private struct GitSyncErrorResponse: Decodable {
+    var error: String
 }

@@ -74,6 +74,26 @@ struct WarmStatus: Codable, Equatable {
     var finishedAt: String?
 }
 
+struct GitSyncSummary: Codable, Hashable {
+    var files: Int
+    var sessions: Int
+    var blocks: Int
+    var messages: Int
+
+    var records: Int {
+        sessions + blocks + messages
+    }
+}
+
+struct GitSyncResponse: Codable, Hashable {
+    var imported: GitSyncSummary
+    var exported: GitSyncSummary
+    var committed: Bool
+    var pushed: Bool
+    var commit: String?
+    var attempts: Int
+}
+
 struct ModelBreakdown: Codable, Hashable {
     var modelName: String
     var inputTokens: Int
