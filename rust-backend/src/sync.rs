@@ -223,6 +223,9 @@ pub fn import_from_git_repo(
                     line_index + 1
                 )
             })?;
+            if is_legacy_pi_generic_record(&record) {
+                continue;
+            }
             if let Some(session_id) = legacy_pi_workflow_session_id(&record) {
                 legacy_pi_workflow_sessions.insert(session_id.to_string());
                 continue;
@@ -371,6 +374,9 @@ fn append_records(
             source: source.to_string(),
             row,
         };
+        if is_legacy_pi_generic_record(&record) {
+            continue;
+        }
         validate_record(record.clone())?;
         records.push(record);
     }
@@ -481,6 +487,12 @@ fn legacy_pi_workflow_session_id(record: &SyncRecord) -> Option<&str> {
     (is_pi && is_legacy_workflow_message)
         .then(|| record.row.get("sessionId").and_then(Value::as_str))
         .flatten()
+}
+
+fn is_legacy_pi_generic_record(record: &SyncRecord) -> bool {
+    Source::from_str(&record.source).ok() == Some(Source::Pi)
+        && matches!(record.kind, RecordKind::Session | RecordKind::Message)
+        && record.row.get("sessionId").and_then(Value::as_str) == Some("session")
 }
 
 fn should_replace(current: &Candidate, candidate: &Candidate) -> bool {
@@ -1119,6 +1131,86 @@ mod tests {
         let messages = target
             .load_message_sync_rows(Source::Pi)
             .expect("load messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["messageId"], "pi:normal");
+    }
+
+    #[test]
+    fn sync_filters_legacy_pi_generic_session_records() {
+        let generic_session = session_row("session", "2026-08-05", "12:00", 150);
+        let normal_session = session_row("real-session", "2026-08-04", "13:00", 20);
+        let generic_message =
+            message_row("pi:generic", "session", "2026-08-05", "12:00", 150);
+        let normal_message =
+            message_row("pi:normal", "real-session", "2026-08-04", "13:00", 20);
+
+        let mut exported = Vec::new();
+        append_records(
+            &mut exported,
+            Source::Pi,
+            RecordKind::Session,
+            vec![generic_session.clone(), normal_session.clone()],
+        )
+        .unwrap();
+        append_records(
+            &mut exported,
+            Source::Pi,
+            RecordKind::Message,
+            vec![generic_message.clone(), normal_message.clone()],
+        )
+        .unwrap();
+        assert_eq!(exported.len(), 2);
+        assert!(exported
+            .iter()
+            .all(|record| record.row["sessionId"] == "real-session"));
+
+        let directory = TestDirectory::new("legacy-pi-generic-session");
+        let repository = directory.path().join("repo");
+        init_git_repository(&repository);
+        let devices = repository.join(SYNC_DIRECTORY);
+        fs::create_dir_all(&devices).expect("create devices");
+        let records = [
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Session,
+                source: "pi".to_string(),
+                row: generic_session,
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Message,
+                source: "pi".to_string(),
+                row: generic_message,
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Session,
+                source: "pi".to_string(),
+                row: normal_session,
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Message,
+                source: "pi".to_string(),
+                row: normal_message,
+            },
+        ];
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize record"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(devices.join("old-device.jsonl"), contents).expect("write snapshot");
+
+        let target =
+            UsageLedger::new(directory.path().join("target.sqlite")).expect("target ledger");
+        let imported = import_from_git_repo(&target, &repository).expect("import snapshot");
+
+        assert_eq!(imported.records(), 2);
+        let sessions = target.load_view(Source::Pi, View::Sessions).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "real-session");
+        let messages = target.load_message_sync_rows(Source::Pi).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["messageId"], "pi:normal");
     }

@@ -326,14 +326,13 @@ fn append_entries_from_file(
     entries: &mut Vec<UsageEntry>,
     workflow_runs_by_cwd: &mut BTreeMap<PathBuf, Vec<WorkflowRunUsage>>,
 ) -> Result<(), String> {
+    let (session_id, session_cwd) = extract_session_metadata(file_path);
     let file = match File::open(file_path) {
         Ok(file) => file,
         Err(_) => return Ok(()),
     };
 
-    let session_id = extract_session_id(file_path);
     let project_path = extract_project_path(sessions_dir, file_path);
-    let mut session_cwd: Option<PathBuf> = None;
 
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
@@ -347,9 +346,6 @@ fn append_entries_from_file(
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if session_cwd.is_none() {
-            session_cwd = extract_session_cwd(&value);
-        }
         for (entry_index, entry) in parse_usage_entries(&value, &session_id, &project_path)
             .into_iter()
             .enumerate()
@@ -1017,6 +1013,34 @@ pub(crate) fn extract_session_id(file_path: &Path) -> String {
         .map(|(_, session_id)| session_id)
         .unwrap_or(stem)
         .to_owned()
+}
+
+fn extract_session_metadata(file_path: &Path) -> (String, Option<PathBuf>) {
+    let fallback_session_id = extract_session_id(file_path);
+    let Ok(file) = File::open(file_path) else {
+        return (fallback_session_id, None);
+    };
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session") {
+            continue;
+        }
+        let session_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.is_empty())
+            .unwrap_or(&fallback_session_id)
+            .to_owned();
+        return (session_id, extract_session_cwd(&value));
+    }
+
+    (fallback_session_id, None)
 }
 
 pub(crate) fn extract_project_path(sessions_dir: &Path, file_path: &Path) -> String {
@@ -1704,6 +1728,69 @@ mod tests {
         let path = Path::new("/tmp/sessions/project/2025-12-19T08-12-33-794Z_2c16ab69.jsonl");
 
         assert_eq!(extract_session_id(path), "2c16ab69");
+    }
+
+    #[test]
+    fn nested_session_files_use_embedded_ids_and_keep_dates_separate() {
+        let root = temp_root("pi-nested-session-id");
+        let sessions_dir = root.join("sessions");
+        let project_dir = sessions_dir.join("project-1");
+        let first = project_dir.join("parent-a/agent-a/run-0/session.jsonl");
+        let second = project_dir.join("parent-b/agent-b/run-0/session.jsonl");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        for (path, id, timestamp, tokens) in [
+            (&first, "nested-session-a", "2026-01-02T12:00:00Z", 30),
+            (&second, "nested-session-b", "2026-01-03T12:00:00Z", 70),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    json!({
+                        "type": "session",
+                        "id": id,
+                        "timestamp": timestamp,
+                        "cwd": root.join("project")
+                    }),
+                    json!({
+                        "type": "message",
+                        "timestamp": timestamp,
+                        "message": {
+                            "role": "assistant",
+                            "model": "model-a",
+                            "usage": { "input": tokens, "output": 0 }
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut entries = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut workflow_runs_by_cwd = BTreeMap::new();
+        for path in [&first, &second] {
+            append_entries_from_file(
+                &sessions_dir,
+                path,
+                &mut seen,
+                &mut entries,
+                &mut workflow_runs_by_cwd,
+            )
+            .unwrap();
+        }
+
+        let sessions = entries_to_sessions(&entries);
+        let daily = entries_to_daily(&entries);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["sessionId"], "nested-session-a");
+        assert_eq!(sessions[1]["sessionId"], "nested-session-b");
+        assert_eq!(daily.len(), 2);
+        assert_eq!(daily[0]["totalTokens"], 30);
+        assert_eq!(daily[1]["totalTokens"], 70);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root(label: &str) -> PathBuf {

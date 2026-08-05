@@ -1081,8 +1081,9 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     migrate_token_occurrence_dates(connection)?;
     migrate_block_model_breakdowns(connection)?;
     migrate_pi_workflow_agent_breakdowns(connection)?;
+    migrate_pi_nested_session_ids(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '7')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '8')",
         [],
     )?;
     Ok(())
@@ -1224,6 +1225,41 @@ fn migrate_pi_workflow_agent_breakdowns(
     transaction.execute("DELETE FROM ingest_state WHERE source = 'pi'", [])?;
     transaction.execute(
         "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '7')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Schema v8 makes the embedded Pi session UUID authoritative for nested
+/// `run-N/session.jsonl` transcripts. Older readers assigned all of those
+/// files the literal ID `session`, merging unrelated dates and projects.
+fn migrate_pi_nested_session_ids(connection: &mut Connection) -> Result<(), rusqlite::Error> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 8 {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM usage_sessions WHERE source = 'pi' AND session_id = 'session'",
+        [],
+    )?;
+    transaction.execute(
+        "DELETE FROM usage_messages WHERE source = 'pi' AND session_id = 'session'",
+        [],
+    )?;
+    transaction.execute("DELETE FROM ingest_state WHERE source = 'pi'", [])?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '8')",
         [],
     )?;
     transaction.commit()?;
@@ -1876,7 +1912,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "7");
+        assert_eq!(schema_version, "8");
     }
 
     #[test]
@@ -2028,6 +2064,79 @@ mod tests {
             })
             .unwrap();
         assert_eq!(message_counts, (0, 1));
+    }
+
+    #[test]
+    fn v8_migration_removes_only_generic_pi_session_rows() {
+        let ledger = test_ledger();
+        let path = ledger.path.clone();
+        ledger
+            .ingest_live_sessions(
+                Source::Pi,
+                &[
+                    json!({
+                        "sessionId": "session",
+                        "date": "2026-08-05",
+                        "totalTokens": 150,
+                    }),
+                    json!({
+                        "sessionId": "real-pi-session",
+                        "date": "2026-08-04",
+                        "totalTokens": 75,
+                    }),
+                ],
+            )
+            .unwrap();
+        ledger
+            .ingest_live_messages(
+                Source::Pi,
+                &[
+                    json!({
+                        "messageId": "generic-message",
+                        "sessionId": "session",
+                        "date": "2026-08-05",
+                        "totalTokens": 150,
+                    }),
+                    json!({
+                        "messageId": "real-message",
+                        "sessionId": "real-pi-session",
+                        "date": "2026-08-04",
+                        "totalTokens": 75,
+                    }),
+                ],
+            )
+            .unwrap();
+        ledger.record_ingest_watermark(Source::Pi, 1_000).unwrap();
+        ledger
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE ledger_meta SET value = '7' WHERE key = 'schema_version'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(ledger);
+
+        let migrated = UsageLedger::new(path).unwrap();
+
+        assert_eq!(migrated.ingest_watermark(Source::Pi).unwrap(), None);
+        let sessions = migrated.load_view(Source::Pi, View::Sessions).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "real-pi-session");
+        let messages = migrated.load_message_sync_rows(Source::Pi).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["messageId"], "real-message");
+        let schema_version: String = migrated
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(schema_version, "8");
     }
 
     #[test]
