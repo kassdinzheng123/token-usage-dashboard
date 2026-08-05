@@ -411,7 +411,7 @@ fn append_workflow_entries_from_cwd(
     {
         let entry = workflow_run.to_usage_entry(project_path);
         let hash = format!(
-            "pi-workflow:{}:{}:{}:{}:{}:{}",
+            "pi-workflow-agent:{}:{}:{}:{}:{}:{}",
             project_path,
             session_id,
             workflow_run.run_id,

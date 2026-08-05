@@ -1082,7 +1082,7 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     migrate_block_model_breakdowns(connection)?;
     migrate_pi_workflow_agent_breakdowns(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '6')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '7')",
         [],
     )?;
     Ok(())
@@ -1199,9 +1199,9 @@ fn migrate_block_model_breakdowns(connection: &mut Connection) -> Result<(), rus
     Ok(())
 }
 
-/// Schema v6 replaces one synthetic Pi workflow row with the workflow's
-/// persisted per-agent model/token rows. Their message IDs differ, so an
-/// upsert alone would retain and double-count the legacy whole-run row.
+/// Schema v7 replaces one synthetic Pi workflow row with the workflow's
+/// persisted per-agent model/token rows and removes rows reintroduced by an
+/// older Git sync snapshot. Their IDs differ, so upserts cannot reconcile them.
 fn migrate_pi_workflow_agent_breakdowns(
     connection: &mut Connection,
 ) -> Result<(), rusqlite::Error> {
@@ -1214,7 +1214,7 @@ fn migrate_pi_workflow_agent_breakdowns(
         .optional()?
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
-    if version >= 6 {
+    if version >= 7 {
         return Ok(());
     }
 
@@ -1223,7 +1223,7 @@ fn migrate_pi_workflow_agent_breakdowns(
     transaction.execute("DELETE FROM usage_messages WHERE source = 'pi'", [])?;
     transaction.execute("DELETE FROM ingest_state WHERE source = 'pi'", [])?;
     transaction.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '6')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '7')",
         [],
     )?;
     transaction.commit()?;
@@ -1876,7 +1876,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "6");
+        assert_eq!(schema_version, "7");
     }
 
     #[test]
@@ -1967,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_migration_rebuilds_pi_rows_and_preserves_other_sources() {
+    fn v7_migration_rebuilds_pi_rows_and_preserves_other_sources() {
         let ledger = test_ledger();
         let path = ledger.path.clone();
         for source in [Source::Pi, Source::Codex] {
@@ -1997,7 +1997,7 @@ mod tests {
         ledger
             .with_connection(|connection| {
                 connection.execute(
-                    "UPDATE ledger_meta SET value = '5' WHERE key = 'schema_version'",
+                    "UPDATE ledger_meta SET value = '6' WHERE key = 'schema_version'",
                     [],
                 )?;
                 Ok(())

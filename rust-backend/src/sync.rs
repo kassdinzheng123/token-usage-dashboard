@@ -208,6 +208,7 @@ pub fn import_from_git_repo(
     snapshot_paths.sort();
 
     let mut merged = BTreeMap::new();
+    let mut legacy_pi_workflow_sessions = std::collections::BTreeSet::new();
     for path in &snapshot_paths {
         let contents = fs::read_to_string(path)
             .map_err(|err| format!("failed to read sync snapshot {}: {err}", path.display()))?;
@@ -222,6 +223,10 @@ pub fn import_from_git_repo(
                     line_index + 1
                 )
             })?;
+            if let Some(session_id) = legacy_pi_workflow_session_id(&record) {
+                legacy_pi_workflow_sessions.insert(session_id.to_string());
+                continue;
+            }
             let candidate = validate_record(record).map_err(|err| {
                 format!(
                     "invalid sync record at {}:{}: {err}",
@@ -243,6 +248,16 @@ pub fn import_from_git_repo(
             }
         }
     }
+    merged.retain(|_, candidate| {
+        candidate.source != Source::Pi
+            || candidate.record.kind != RecordKind::Session
+            || candidate
+                .record
+                .row
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_none_or(|session_id| !legacy_pi_workflow_sessions.contains(session_id))
+    });
 
     let mut summary = SyncSummary {
         files: snapshot_paths.len(),
@@ -453,6 +468,19 @@ fn validate_record(mut record: SyncRecord) -> Result<Candidate, String> {
         total_tokens,
         canonical,
     })
+}
+
+fn legacy_pi_workflow_session_id(record: &SyncRecord) -> Option<&str> {
+    let is_pi = Source::from_str(&record.source).ok() == Some(Source::Pi);
+    let is_legacy_workflow_message = record.kind == RecordKind::Message
+        && record
+            .row
+            .get("messageId")
+            .and_then(Value::as_str)
+            .is_some_and(|message_id| message_id.starts_with("pi-workflow:"));
+    (is_pi && is_legacy_workflow_message)
+        .then(|| record.row.get("sessionId").and_then(Value::as_str))
+        .flatten()
 }
 
 fn should_replace(current: &Candidate, candidate: &Candidate) -> bool {
@@ -1006,6 +1034,93 @@ mod tests {
             .expect("load unchanged rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["sessionId"], "local");
+    }
+
+    #[test]
+    fn import_skips_legacy_pi_workflow_rows_and_their_session_rollup() {
+        let directory = TestDirectory::new("legacy-pi-workflow");
+        let repository = directory.path().join("repo");
+        init_git_repository(&repository);
+        let devices = repository.join(SYNC_DIRECTORY);
+        fs::create_dir_all(&devices).expect("create devices");
+        let records = [
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Session,
+                source: "pi".to_string(),
+                row: json!({
+                    "sessionId": "affected",
+                    "date": "2026-08-05",
+                    "totalTokens": 150,
+                    "modelsUsed": ["session_tree_implementation"],
+                    "modelBreakdowns": []
+                }),
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Message,
+                source: "pi".to_string(),
+                row: message_row(
+                    "pi-workflow:project:affected:run:timestamp:150",
+                    "affected",
+                    "2026-08-05",
+                    "12:00",
+                    150,
+                ),
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Session,
+                source: "pi".to_string(),
+                row: session_row("normal", "2026-08-05", "13:00", 20),
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Message,
+                source: "pi".to_string(),
+                row: message_row("pi:normal", "normal", "2026-08-05", "13:00", 20),
+            },
+        ];
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize record"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(devices.join("old-device.jsonl"), contents).expect("write snapshot");
+
+        let target =
+            UsageLedger::new(directory.path().join("target.sqlite")).expect("target ledger");
+        target
+            .upsert_view_rows(
+                Source::Pi,
+                View::Sessions,
+                &[json!({
+                    "sessionId": "affected",
+                    "date": "2026-08-05",
+                    "totalTokens": 150,
+                    "modelsUsed": ["glm-5.2"],
+                    "modelBreakdowns": []
+                })],
+            )
+            .expect("insert corrected local session");
+
+        let imported = import_from_git_repo(&target, &repository).expect("import snapshot");
+
+        assert_eq!(imported.records(), 2);
+        let sessions = target
+            .load_view(Source::Pi, View::Sessions)
+            .expect("load sessions");
+        assert_eq!(sessions.len(), 2);
+        let affected = sessions
+            .iter()
+            .find(|row| row["sessionId"] == "affected")
+            .expect("corrected affected session");
+        assert_eq!(affected["modelsUsed"], json!(["glm-5.2"]));
+        let messages = target
+            .load_message_sync_rows(Source::Pi)
+            .expect("load messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["messageId"], "pi:normal");
     }
 
     #[test]
