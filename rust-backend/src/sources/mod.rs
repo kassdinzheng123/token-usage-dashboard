@@ -469,7 +469,7 @@ fn sort_key(value: &Value) -> String {
 }
 
 /// Drops a leading provider prefix (`CPA/`, `cliproxy/`, `openrouter/foo/`, etc.).
-fn strip_provider_prefix(model_name: &str) -> &str {
+pub(crate) fn strip_provider_prefix(model_name: &str) -> &str {
     model_name
         .rsplit('/')
         .next()

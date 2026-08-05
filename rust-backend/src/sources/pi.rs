@@ -65,6 +65,9 @@ impl UsageEntry {
 #[derive(Debug, Clone)]
 struct WorkflowRunUsage {
     run_id: String,
+    /// Identity of the agent (session) this entry represents, so multiple
+    /// agents in one run stay distinct in the ledger and dedup hashes.
+    agent_id: String,
     session_id: String,
     timestamp: DateTime<Local>,
     model_name: String,
@@ -76,10 +79,6 @@ struct WorkflowRunUsage {
 }
 
 impl WorkflowRunUsage {
-    fn total_tokens(&self) -> i64 {
-        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
-    }
-
     fn to_usage_entry(&self, project_path: &str) -> UsageEntry {
         UsageEntry {
             timestamp: self.timestamp,
@@ -412,10 +411,11 @@ fn append_workflow_entries_from_cwd(
     {
         let entry = workflow_run.to_usage_entry(project_path);
         let hash = format!(
-            "pi-workflow:{}:{}:{}:{}:{}",
+            "pi-workflow:{}:{}:{}:{}:{}:{}",
             project_path,
             session_id,
             workflow_run.run_id,
+            workflow_run.agent_id,
             entry.timestamp.to_rfc3339(),
             entry.total_tokens()
         );
@@ -465,10 +465,7 @@ fn load_workflow_run_usages_from_home(
             let Ok(value) = serde_json::from_str::<Value>(&contents) else {
                 continue;
             };
-            let Some(workflow_run) = workflow_run_usage_from_value(&value, &path) else {
-                continue;
-            };
-            workflow_runs.push(workflow_run);
+            workflow_runs.extend(workflow_run_usages_from_value(&value, &path));
         }
     }
 
@@ -509,7 +506,7 @@ fn workflow_project_key(cwd: &Path) -> String {
                 .collect();
             let trimmed = slug.trim_matches('-');
             if trimmed.is_empty() {
-                "project".to_string().into()
+                "project".to_string()
             } else {
                 trimmed.chars().take(48).collect()
             }
@@ -691,64 +688,62 @@ fn parse_subagent_usage_entries(
 }
 
 #[cfg(test)]
-fn workflow_usage_entry_from_value(
+fn workflow_usage_entries_from_value(
     value: &Value,
     session_id: &str,
     project_path: &str,
-) -> Option<UsageEntry> {
-    let workflow_run = workflow_run_usage_from_value(value, Path::new("unknown"))?;
-    if workflow_run.session_id != session_id {
-        return None;
-    }
-
-    Some(workflow_run.to_usage_entry(project_path))
+) -> Vec<UsageEntry> {
+    workflow_run_usages_from_value(value, Path::new("unknown"))
+        .into_iter()
+        .filter(|workflow_run| workflow_run.session_id == session_id)
+        .map(|workflow_run| workflow_run.to_usage_entry(project_path))
+        .collect()
 }
 
-fn workflow_run_usage_from_value(value: &Value, path: &Path) -> Option<WorkflowRunUsage> {
+fn workflow_run_usages_from_value(value: &Value, path: &Path) -> Vec<WorkflowRunUsage> {
     let session_id = value
         .get("sessionId")
         .and_then(Value::as_str)
-        .filter(|session_id| !session_id.is_empty())?
-        .to_owned();
-    let timestamp = ["completedAt", "updatedAt", "startedAt"]
+        .filter(|session_id| !session_id.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let run_timestamp = ["completedAt", "updatedAt", "startedAt"]
         .iter()
         .find_map(|key| {
             value
                 .get(*key)
                 .and_then(Value::as_str)
                 .and_then(parse_timestamp)
-        })?;
-    let usage = value.get("tokenUsage")?.as_object()?;
+        });
+    let Some(run_timestamp) = run_timestamp else {
+        return Vec::new();
+    };
+    let Some(usage) = value.get("tokenUsage").and_then(Value::as_object) else {
+        return Vec::new();
+    };
     let declared_total = usage.get("total").map(to_i64).unwrap_or_default();
-    let mut input_tokens = usage.get("input").map(to_i64).unwrap_or_default();
-    let output_tokens = usage.get("output").map(to_i64).unwrap_or_default();
-    let cache_creation_tokens = usage.get("cacheWrite").map(to_i64).unwrap_or_default();
-    let cache_read_tokens = usage.get("cacheRead").map(to_i64).unwrap_or_default();
-    let component_total = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens;
+    let mut run_input_tokens = usage.get("input").map(to_i64).unwrap_or_default();
+    let run_output_tokens = usage.get("output").map(to_i64).unwrap_or_default();
+    let run_cache_creation_tokens = usage.get("cacheWrite").map(to_i64).unwrap_or_default();
+    let run_cache_read_tokens = usage.get("cacheRead").map(to_i64).unwrap_or_default();
+    let component_total =
+        run_input_tokens + run_output_tokens + run_cache_creation_tokens + run_cache_read_tokens;
     if declared_total > component_total {
-        input_tokens += declared_total - component_total;
+        run_input_tokens += declared_total - component_total;
     }
-    let model_name = workflow_model_name(value);
+    let run_usage = TokenUsage {
+        input_tokens: run_input_tokens,
+        output_tokens: run_output_tokens,
+        cache_creation_tokens: run_cache_creation_tokens,
+        cache_read_tokens: run_cache_read_tokens,
+    };
     let explicit_cost = usage
         .get("cost")
         .and_then(|cost| cost.get("total").or(Some(cost)))
         .map(num)
         .unwrap_or_default();
-    // pi persists `tokenUsage.cost` as 0. Each agent is its own single-model
-    // session, so price per agent (allocating the run-level token split by each
-    // agent's token share) and sum; fall back to the whole run on the resolved
-    // workflow model when no per-agent split is available.
-    let run_usage = TokenUsage {
-        input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
-    };
-    let total_cost = if explicit_cost > 0.0 {
-        explicit_cost
-    } else {
-        workflow_run_cost_usd(value, run_usage)
-    };
     let run_id = value
         .get("runId")
         .and_then(Value::as_str)
@@ -761,19 +756,117 @@ fn workflow_run_usage_from_value(value: &Value, path: &Path) -> Option<WorkflowR
                 .to_owned()
         });
 
-    let workflow_run = WorkflowRunUsage {
-        run_id,
-        session_id,
-        timestamp,
-        model_name,
-        input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
-        total_cost,
-    };
+    let mut workflow_runs = Vec::new();
+    // A run with a real explicit cost is attributed to the whole run.
+    if explicit_cost > 0.0 {
+        workflow_runs.push(WorkflowRunUsage {
+            run_id,
+            agent_id: "workflow".to_string(),
+            session_id,
+            timestamp: run_timestamp,
+            model_name: super::strip_provider_prefix(&workflow_model_name(value)).to_string(),
+            input_tokens: run_input_tokens,
+            output_tokens: run_output_tokens,
+            cache_creation_tokens: run_cache_creation_tokens,
+            cache_read_tokens: run_cache_read_tokens,
+            total_cost: explicit_cost,
+        });
+        return workflow_runs;
+    }
 
-    (workflow_run.total_tokens() > 0 || workflow_run.total_cost > 0.0).then_some(workflow_run)
+    // Otherwise one entry per agent: each agent is its own single-model session
+    // with an exact persisted token split and cost.
+    if let Some(agents) = value.get("agents").and_then(Value::as_array) {
+        for agent in agents.iter().filter_map(Value::as_object) {
+            let Some(agent_usage) = agent.get("tokenUsage").and_then(Value::as_object) else {
+                continue;
+            };
+            let input_tokens = agent_usage.get("input").map(to_i64).unwrap_or_default();
+            let output_tokens = agent_usage.get("output").map(to_i64).unwrap_or_default();
+            let cache_creation_tokens = agent_usage
+                .get("cacheWrite")
+                .map(to_i64)
+                .unwrap_or_default();
+            let cache_read_tokens = agent_usage.get("cacheRead").map(to_i64).unwrap_or_default();
+            if input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens <= 0 {
+                continue;
+            }
+            let raw_model = agent
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+                .unwrap_or("workflow");
+            let model_name = super::strip_provider_prefix(raw_model).to_string();
+            let agent_cost = agent_usage.get("cost").map(num).unwrap_or_default();
+            let total_cost = if agent_cost > 0.0 {
+                agent_cost
+            } else {
+                model_cost_usd(
+                    raw_model,
+                    TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    },
+                )
+            };
+            let agent_id = agent
+                .get("label")
+                .and_then(Value::as_str)
+                .filter(|label| !label.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    agent
+                        .get("id")
+                        .map(to_i64)
+                        .filter(|id| *id > 0)
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "agent".to_string())
+                });
+            let timestamp = ["endedAt", "startedAt"]
+                .iter()
+                .find_map(|key| {
+                    agent
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .and_then(parse_timestamp)
+                })
+                .unwrap_or(run_timestamp);
+            workflow_runs.push(WorkflowRunUsage {
+                run_id: run_id.clone(),
+                agent_id,
+                session_id: session_id.clone(),
+                timestamp,
+                model_name,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                total_cost,
+            });
+        }
+    }
+
+    // No agent had a usable split: retain the whole-run usage under the sole
+    // known model, or `unknown` when a multi-model run cannot be attributed.
+    if workflow_runs.is_empty() {
+        let model_name = workflow_model_name(value);
+        workflow_runs.push(WorkflowRunUsage {
+            run_id,
+            agent_id: "workflow".to_string(),
+            session_id,
+            timestamp: run_timestamp,
+            model_name: super::strip_provider_prefix(&model_name).to_string(),
+            input_tokens: run_input_tokens,
+            output_tokens: run_output_tokens,
+            cache_creation_tokens: run_cache_creation_tokens,
+            cache_read_tokens: run_cache_read_tokens,
+            total_cost: model_cost_usd(&model_name, run_usage),
+        });
+    }
+
+    workflow_runs
 }
 
 fn entries_to_daily(entries: &[UsageEntry]) -> Vec<Value> {
@@ -902,64 +995,7 @@ fn workflow_model_name(value: &Value) -> String {
             .next()
             .unwrap_or_else(|| "workflow".to_string());
     }
-    value
-        .get("workflowName")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .map(|name| format!("workflow/{name}"))
-        .unwrap_or_else(|| "workflow".to_string())
-}
-
-/// Prices a workflow run whose recorded `cost` is absent. A workflow is made
-/// of per-agent sessions, each with its own callback model. The runtime
-/// persists each agent's exact token split (input/output/cacheRead/cacheWrite)
-/// under `agents[].tokenUsage` when the provider reported one, so each priced
-/// agent uses its own exact split and model. Agents without a breakdown (e.g.
-/// errored/skipped or still running) are skipped; if no agent has one, the
-/// whole run is priced on the resolved workflow model.
-fn workflow_run_cost_usd(value: &Value, run_usage: TokenUsage) -> f64 {
-    let Some(agents) = value.get("agents").and_then(Value::as_array) else {
-        return model_cost_usd(&workflow_model_name(value), run_usage);
-    };
-
-    let mut total_cost = 0.0;
-    let mut priced_any = false;
-    for agent in agents.iter().filter_map(Value::as_object) {
-        if let Some(cost) = agent_cost_usd(agent) {
-            total_cost += cost;
-            priced_any = true;
-        }
-    }
-    if priced_any {
-        total_cost
-    } else {
-        model_cost_usd(&workflow_model_name(value), run_usage)
-    }
-}
-
-/// Prices a single workflow agent from its exact persisted `tokenUsage` split
-/// (input/output/cacheRead/cacheWrite), which the runtime writes for every
-/// agent whose provider reported usage. Returns None when the agent has no
-/// breakdown.
-fn agent_cost_usd(agent: &serde_json::Map<String, Value>) -> Option<f64> {
-    let model = agent
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.is_empty())
-        .unwrap_or("workflow");
-    let agent_usage = agent.get("tokenUsage").and_then(Value::as_object)?;
-    let explicit_cost = agent_usage.get("cost").map(num).unwrap_or_default();
-    if explicit_cost > 0.0 {
-        return Some(explicit_cost);
-    }
-    let usage = TokenUsage {
-        input_tokens: agent_usage.get("input").map(to_i64)?,
-        output_tokens: agent_usage.get("output").map(to_i64)?,
-        cache_creation_tokens: agent_usage.get("cacheWrite").map(to_i64)?,
-        cache_read_tokens: agent_usage.get("cacheRead").map(to_i64)?,
-    };
-    (usage.input_tokens + usage.output_tokens + usage.cache_creation_tokens + usage.cache_read_tokens > 0)
-        .then(|| model_cost_usd(model, usage))
+    "unknown".to_string()
 }
 
 fn normalize_model_name(provider_name: Option<&str>, model_name: &str) -> String {
@@ -1236,7 +1272,7 @@ mod tests {
     fn workflow_usage_entry_counts_persisted_dynamic_workflow_run() {
         let raw = json!({
             "runId": "run-1",
-            "workflowName": "repo_audit",
+            "workflowName": "session_tree_implementation",
             "sessionId": "session-1",
             "status": "completed",
             "completedAt": "2026-01-02T05:04:05Z",
@@ -1254,11 +1290,13 @@ mod tests {
             }
         });
 
-        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+        let entries = workflow_usage_entries_from_value(&raw, "session-1", "project-1");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
 
         assert_eq!(entry.session_id, "session-1");
         assert_eq!(entry.project_path, "project-1");
-        assert_eq!(entry.model_name, "cliproxy/gpt-5.5");
+        assert_eq!(entry.model_name, "gpt-5.5");
         assert_eq!(entry.input_tokens, 125);
         assert_eq!(entry.output_tokens, 30);
         assert_eq!(entry.cache_read_tokens, 40);
@@ -1287,7 +1325,9 @@ mod tests {
             }
         });
 
-        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+        let entries = workflow_usage_entries_from_value(&raw, "session-1", "project-1");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
 
         assert_eq!(entry.model_name, "claude-sonnet-5");
         assert!(entry.total_cost > 0.0);
@@ -1321,7 +1361,9 @@ mod tests {
             }
         });
 
-        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+        let entries = workflow_usage_entries_from_value(&raw, "session-1", "project-1");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
 
         let expected = model_cost_usd(
             "claude-sonnet-5",
@@ -1334,8 +1376,8 @@ mod tests {
     #[test]
     fn workflow_usage_entry_prices_agents_by_exact_persisted_token_usage() {
         // Each agent carries its own exact tokenUsage split (input/output/cache)
-        // as persisted by the runtime; pricing uses it directly rather than
-        // allocating the run-level total proportionally.
+        // as persisted by the runtime; pricing uses it directly and the stored
+        // model name has the gateway provider prefix stripped.
         let raw = json!({
             "runId": "run-1",
             "workflowName": "repo_audit",
@@ -1344,13 +1386,13 @@ mod tests {
             "agents": [
                 {
                     "label": "scan",
-                    "model": "claude-sonnet-5",
+                    "model": "Omnimind/gpt-5.6-terra",
                     "tokens": 100,
                     "tokenUsage": { "input": 8000, "output": 2000, "cacheRead": 1000, "cacheWrite": 0, "total": 11000, "cost": 0 }
                 },
                 {
                     "label": "review",
-                    "model": "gpt-5.6-luna",
+                    "model": "Omnimind/gpt-5.6-luna",
                     "tokens": 100,
                     "tokenUsage": { "input": 1000, "output": 500, "cacheRead": 0, "cacheWrite": 100, "total": 1600, "cost": 0 }
                 }
@@ -1365,17 +1407,29 @@ mod tests {
             }
         });
 
-        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
-
+        let entries = workflow_usage_entries_from_value(&raw, "session-1", "project-1");
+        assert_eq!(entries.len(), 2);
+        let scan = &entries[0];
+        let review = &entries[1];
+        assert_eq!(scan.model_name, "gpt-5.6-terra");
+        assert_eq!(review.model_name, "gpt-5.6-luna");
+        assert_eq!(scan.input_tokens, 8000);
+        assert_eq!(review.input_tokens, 1000);
+        let rows = entries_to_sessions(&entries);
+        assert_eq!(rows[0]["totalTokens"], json!(12600));
+        assert_eq!(
+            rows[0]["modelsUsed"],
+            json!(["gpt-5.6-luna", "gpt-5.6-terra"])
+        );
         let expected = model_cost_usd(
-            "claude-sonnet-5",
+            "gpt-5.6-terra",
             TokenUsage { input_tokens: 8000, output_tokens: 2000, cache_creation_tokens: 0, cache_read_tokens: 1000 },
         ) + model_cost_usd(
             "gpt-5.6-luna",
             TokenUsage { input_tokens: 1000, output_tokens: 500, cache_creation_tokens: 100, cache_read_tokens: 0 },
         );
         assert!(expected > 0.0);
-        assert!((entry.total_cost - expected).abs() < 1e-9);
+        assert!(((scan.total_cost + review.total_cost) - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -1392,9 +1446,33 @@ mod tests {
             }
         });
 
-        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+        let entries = workflow_usage_entries_from_value(&raw, "session-1", "project-1");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].total_cost, 0.42);
+    }
 
-        assert_eq!(entry.total_cost, 0.42);
+    #[test]
+    fn workflow_usage_entry_never_uses_workflow_name_as_model() {
+        let raw = json!({
+            "runId": "run-1",
+            "workflowName": "session_tree_implementation",
+            "sessionId": "session-1",
+            "completedAt": "2026-01-02T05:04:05Z",
+            "agents": [
+                { "label": "scan", "model": "model-a" },
+                { "label": "review", "model": "model-b" }
+            ],
+            "tokenUsage": {
+                "input": 120,
+                "output": 30,
+                "total": 150,
+                "cost": 0
+            }
+        });
+
+        let entries = workflow_usage_entries_from_value(&raw, "session-1", "project-1");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model_name, "unknown");
     }
 
     #[test]
@@ -1410,7 +1488,7 @@ mod tests {
             }
         });
 
-        assert!(workflow_usage_entry_from_value(&raw, "session-1", "project-1").is_none());
+        assert!(workflow_usage_entries_from_value(&raw, "session-1", "project-1").is_empty());
     }
 
     #[test]

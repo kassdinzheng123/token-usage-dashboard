@@ -1080,8 +1080,9 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     migrate_message_level_hourly(connection)?;
     migrate_token_occurrence_dates(connection)?;
     migrate_block_model_breakdowns(connection)?;
+    migrate_pi_workflow_agent_breakdowns(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '5')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '6')",
         [],
     )?;
     Ok(())
@@ -1192,6 +1193,37 @@ fn migrate_block_model_breakdowns(connection: &mut Connection) -> Result<(), rus
     transaction.execute("DELETE FROM ingest_state WHERE source = 'claude'", [])?;
     transaction.execute(
         "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '5')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Schema v6 replaces one synthetic Pi workflow row with the workflow's
+/// persisted per-agent model/token rows. Their message IDs differ, so an
+/// upsert alone would retain and double-count the legacy whole-run row.
+fn migrate_pi_workflow_agent_breakdowns(
+    connection: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 6 {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM usage_sessions WHERE source = 'pi'", [])?;
+    transaction.execute("DELETE FROM usage_messages WHERE source = 'pi'", [])?;
+    transaction.execute("DELETE FROM ingest_state WHERE source = 'pi'", [])?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '6')",
         [],
     )?;
     transaction.commit()?;
@@ -1844,7 +1876,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "5");
+        assert_eq!(schema_version, "6");
     }
 
     #[test]
@@ -1932,6 +1964,70 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cursor_count, 1);
+    }
+
+    #[test]
+    fn v6_migration_rebuilds_pi_rows_and_preserves_other_sources() {
+        let ledger = test_ledger();
+        let path = ledger.path.clone();
+        for source in [Source::Pi, Source::Codex] {
+            ledger
+                .ingest_live_sessions(
+                    source,
+                    &[json!({
+                        "sessionId": format!("{source}-session"),
+                        "date": "2026-08-05",
+                        "totalTokens": 150,
+                    })],
+                )
+                .unwrap();
+            ledger
+                .ingest_live_messages(
+                    source,
+                    &[json!({
+                        "messageId": format!("{source}-message"),
+                        "sessionId": format!("{source}-session"),
+                        "date": "2026-08-05",
+                        "totalTokens": 150,
+                    })],
+                )
+                .unwrap();
+            ledger.record_ingest_watermark(source, 1_000).unwrap();
+        }
+        ledger
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE ledger_meta SET value = '5' WHERE key = 'schema_version'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(ledger);
+
+        let migrated = UsageLedger::new(path).unwrap();
+
+        assert!(!migrated.has_source_rows(Source::Pi).unwrap());
+        assert_eq!(migrated.ingest_watermark(Source::Pi).unwrap(), None);
+        assert!(migrated.has_source_rows(Source::Codex).unwrap());
+        assert_eq!(migrated.ingest_watermark(Source::Codex).unwrap(), Some(1_000));
+        let message_counts: (i64, i64) = migrated
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM usage_messages WHERE source = 'pi'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM usage_messages WHERE source = 'codex'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(message_counts, (0, 1));
     }
 
     #[test]
