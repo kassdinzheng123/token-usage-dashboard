@@ -112,6 +112,7 @@ fn frame_to_session(row: &FrameRow) -> Option<LocalSession> {
         cache_read_tokens: row.cache_read_tokens,
         total_tokens_override: None,
         total_cost,
+        model_breakdowns: Vec::new(),
     })
 }
 

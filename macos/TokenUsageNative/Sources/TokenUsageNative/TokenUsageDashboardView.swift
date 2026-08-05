@@ -39,6 +39,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
     case claudeScience = "claude-science"
     case zcode
     case kimi
+    case reasonix
 
     public var id: String { rawValue }
 
@@ -57,6 +58,7 @@ public enum TokenUsageSource: String, CaseIterable, Identifiable, Sendable {
         case .claudeScience: "Claude Science"
         case .zcode: "ZCode"
         case .kimi: "Kimi"
+        case .reasonix: "ReasonIX"
         }
     }
 }
@@ -5898,6 +5900,9 @@ func displayModelName(_ modelName: String) -> String {
         displayName = "kiro-claude-opus-4-7"
     } else if let canon = canonicalClaude4xModelName(stripped) {
         displayName = canon
+    } else if normalized.contains("gpt-5.6") || normalized.contains("gpt-5-6") {
+        // Absorb gpt-5.6 variants (e.g. `gpt-5.6-luna:medium`) into the base model.
+        displayName = String(stripped.split(separator: ":").first ?? Substring(stripped))
     } else if stripped.hasPrefix("[pi] ") {
         displayName = String(stripped.dropFirst(5))
     } else {
@@ -5927,6 +5932,7 @@ extension TokenUsageSource {
         case .claudeScience: .claudeScience
         case .zcode: .zcode
         case .kimi: .kimi
+        case .reasonix: .reasonix
         }
     }
 
@@ -5949,6 +5955,7 @@ extension TokenUsageSource {
         case .claudeScience: "flask"
         case .zcode: "bolt.horizontal.circle"
         case .kimi: "moon.stars.fill"
+        case .reasonix: "brain.head.profile"
         }
     }
 
@@ -5967,6 +5974,7 @@ extension TokenUsageSource {
         case .claudeScience: "anthropic-mark"
         case .zcode: "zai-mark"
         case .kimi: "kimi-mark"
+        case .reasonix: nil
         }
     }
 
@@ -6003,6 +6011,7 @@ extension UsageSource {
         case .claudeScience: "flask"
         case .zcode: "bolt.horizontal.circle"
         case .kimi: "moon.stars.fill"
+        case .reasonix: "brain.head.profile"
         }
     }
 
@@ -6020,6 +6029,7 @@ extension UsageSource {
         case .claudeScience: "anthropic-mark"
         case .zcode: "zai-mark"
         case .kimi: "kimi-mark"
+        case .reasonix: nil
         }
     }
 

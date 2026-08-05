@@ -4,6 +4,7 @@ use crate::{
 };
 use chrono::{DateTime, Local};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::TryFrom,
@@ -127,7 +128,8 @@ struct Aggregate {
 impl Aggregate {
     fn add_entry(&mut self, entry: &UsageEntry) {
         self.totals.add_entry(entry);
-        let model_name = super::cluster_model_name(&entry.model_name);
+        let date = entry.timestamp.format("%Y-%m-%d").to_string();
+        let model_name = super::cluster_model_name_at(&entry.model_name, Some(&date));
         self.by_model
             .entry(model_name.to_string())
             .or_default()
@@ -219,7 +221,7 @@ fn load_usage_entries(watermark_ms: Option<i64>) -> Result<Vec<UsageEntry>, Stri
     Ok(entries)
 }
 
-fn discover_sessions_dirs() -> Vec<PathBuf> {
+pub(crate) fn discover_sessions_dirs() -> Vec<PathBuf> {
     let home = home_dir();
     let pi_agent_dir = std::env::var_os(PI_AGENT_DIR_ENV).map(PathBuf::from);
     let oh_my_pi_agent_dir = std::env::var_os(OH_MY_PI_AGENT_DIR_ENV).map(PathBuf::from);
@@ -291,7 +293,7 @@ fn push_unique_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+pub(crate) fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -429,40 +431,99 @@ fn append_workflow_entries_from_cwd(
 }
 
 fn load_workflow_run_usages(session_cwd: &Path) -> Result<Vec<WorkflowRunUsage>, String> {
-    let runs_dir = session_cwd.join(".pi").join("workflows").join("runs");
-    let run_files = match fs::read_dir(&runs_dir) {
-        Ok(run_files) => run_files,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(format!("failed to read {}: {err}", runs_dir.display())),
-    };
+    load_workflow_run_usages_from_home(session_cwd, home_dir().as_deref())
+}
 
+fn load_workflow_run_usages_from_home(
+    session_cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Vec<WorkflowRunUsage>, String> {
     let mut workflow_runs = Vec::new();
-    for run_file in run_files {
-        let Ok(run_file) = run_file else {
-            continue;
+    for runs_dir in workflow_runs_dir_candidates(session_cwd, home) {
+        let run_files = match fs::read_dir(&runs_dir) {
+            Ok(run_files) => run_files,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("failed to read {}: {err}", runs_dir.display())),
         };
-        let path = run_file.path();
-        if !path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        {
-            continue;
-        }
 
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&contents) else {
-            continue;
-        };
-        let Some(workflow_run) = workflow_run_usage_from_value(&value, &path) else {
-            continue;
-        };
-        workflow_runs.push(workflow_run);
+        for run_file in run_files {
+            let Ok(run_file) = run_file else {
+                continue;
+            };
+            let path = run_file.path();
+            if !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                continue;
+            }
+
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+                continue;
+            };
+            let Some(workflow_run) = workflow_run_usage_from_value(&value, &path) else {
+                continue;
+            };
+            workflow_runs.push(workflow_run);
+        }
     }
 
     Ok(workflow_runs)
+}
+
+/// Candidate workflow-run directories for a session cwd. pi-dynamic-workflows
+/// writes runs to the user's workflow home (`~/.pi/workflows/projects/<key>/runs`)
+/// rather than the project; the legacy `<cwd>/.pi/workflows/runs` is kept for
+/// older runs.
+fn workflow_runs_dir_candidates(session_cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home {
+        dirs.push(
+            home.join(".pi")
+                .join("workflows")
+                .join("projects")
+                .join(workflow_project_key(session_cwd))
+                .join("runs"),
+        );
+    }
+    dirs.push(session_cwd.join(".pi").join("workflows").join("runs"));
+    dirs
+}
+
+/// Mirrors pi-dynamic-workflows `workflowProjectKey`: `<slug>-<hash>` where
+/// slug is the sanitized basename and hash is the first 12 hex chars of the
+/// sha256 of the resolved cwd.
+fn workflow_project_key(cwd: &Path) -> String {
+    let slug = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let slug: String = name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+                .collect();
+            let trimmed = slug.trim_matches('-');
+            if trimmed.is_empty() {
+                "project".to_string().into()
+            } else {
+                trimmed.chars().take(48).collect()
+            }
+        })
+        .unwrap_or_else(|| "project".to_string());
+    format!("{slug}-{}", workflow_cwd_hash(cwd))
+}
+
+fn workflow_cwd_hash(cwd: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cwd.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex.chars().take(12).collect()
 }
 
 fn parse_usage_entries(value: &Value, session_id: &str, project_path: &str) -> Vec<UsageEntry> {
@@ -667,12 +728,27 @@ fn workflow_run_usage_from_value(value: &Value, path: &Path) -> Option<WorkflowR
     if declared_total > component_total {
         input_tokens += declared_total - component_total;
     }
-    let total_cost = usage
+    let model_name = workflow_model_name(value);
+    let explicit_cost = usage
         .get("cost")
         .and_then(|cost| cost.get("total").or(Some(cost)))
         .map(num)
         .unwrap_or_default();
-    let model_name = workflow_model_name(value);
+    // pi persists `tokenUsage.cost` as 0. Each agent is its own single-model
+    // session, so price per agent (allocating the run-level token split by each
+    // agent's token share) and sum; fall back to the whole run on the resolved
+    // workflow model when no per-agent split is available.
+    let run_usage = TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    };
+    let total_cost = if explicit_cost > 0.0 {
+        explicit_cost
+    } else {
+        workflow_run_cost_usd(value, run_usage)
+    };
     let run_id = value
         .get("runId")
         .and_then(Value::as_str)
@@ -834,6 +910,58 @@ fn workflow_model_name(value: &Value) -> String {
         .unwrap_or_else(|| "workflow".to_string())
 }
 
+/// Prices a workflow run whose recorded `cost` is absent. A workflow is made
+/// of per-agent sessions, each with its own callback model. The runtime
+/// persists each agent's exact token split (input/output/cacheRead/cacheWrite)
+/// under `agents[].tokenUsage` when the provider reported one, so each priced
+/// agent uses its own exact split and model. Agents without a breakdown (e.g.
+/// errored/skipped or still running) are skipped; if no agent has one, the
+/// whole run is priced on the resolved workflow model.
+fn workflow_run_cost_usd(value: &Value, run_usage: TokenUsage) -> f64 {
+    let Some(agents) = value.get("agents").and_then(Value::as_array) else {
+        return model_cost_usd(&workflow_model_name(value), run_usage);
+    };
+
+    let mut total_cost = 0.0;
+    let mut priced_any = false;
+    for agent in agents.iter().filter_map(Value::as_object) {
+        if let Some(cost) = agent_cost_usd(agent) {
+            total_cost += cost;
+            priced_any = true;
+        }
+    }
+    if priced_any {
+        total_cost
+    } else {
+        model_cost_usd(&workflow_model_name(value), run_usage)
+    }
+}
+
+/// Prices a single workflow agent from its exact persisted `tokenUsage` split
+/// (input/output/cacheRead/cacheWrite), which the runtime writes for every
+/// agent whose provider reported usage. Returns None when the agent has no
+/// breakdown.
+fn agent_cost_usd(agent: &serde_json::Map<String, Value>) -> Option<f64> {
+    let model = agent
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("workflow");
+    let agent_usage = agent.get("tokenUsage").and_then(Value::as_object)?;
+    let explicit_cost = agent_usage.get("cost").map(num).unwrap_or_default();
+    if explicit_cost > 0.0 {
+        return Some(explicit_cost);
+    }
+    let usage = TokenUsage {
+        input_tokens: agent_usage.get("input").map(to_i64)?,
+        output_tokens: agent_usage.get("output").map(to_i64)?,
+        cache_creation_tokens: agent_usage.get("cacheWrite").map(to_i64)?,
+        cache_read_tokens: agent_usage.get("cacheRead").map(to_i64)?,
+    };
+    (usage.input_tokens + usage.output_tokens + usage.cache_creation_tokens + usage.cache_read_tokens > 0)
+        .then(|| model_cost_usd(model, usage))
+}
+
 fn normalize_model_name(provider_name: Option<&str>, model_name: &str) -> String {
     if provider_name.is_some_and(|provider| provider.eq_ignore_ascii_case("kiro"))
         && (model_name.eq_ignore_ascii_case("claude-opus-4.7")
@@ -844,7 +972,7 @@ fn normalize_model_name(provider_name: Option<&str>, model_name: &str) -> String
     model_name.to_owned()
 }
 
-fn extract_session_id(file_path: &Path) -> String {
+pub(crate) fn extract_session_id(file_path: &Path) -> String {
     let stem = file_path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -855,7 +983,7 @@ fn extract_session_id(file_path: &Path) -> String {
         .to_owned()
 }
 
-fn extract_project_path(sessions_dir: &Path, file_path: &Path) -> String {
+pub(crate) fn extract_project_path(sessions_dir: &Path, file_path: &Path) -> String {
     file_path
         .strip_prefix(sessions_dir)
         .ok()
@@ -1140,6 +1268,117 @@ mod tests {
     }
 
     #[test]
+    fn workflow_usage_entry_prices_run_when_cost_is_zero() {
+        let raw = json!({
+            "runId": "run-1",
+            "workflowName": "repo_audit",
+            "sessionId": "session-1",
+            "completedAt": "2026-01-02T05:04:05Z",
+            "agents": [
+                { "label": "scan", "model": "claude-sonnet-5", "tokens": 100 }
+            ],
+            "tokenUsage": {
+                "input": 8000,
+                "output": 2000,
+                "cacheRead": 1000,
+                "cacheWrite": 0,
+                "total": 11000,
+                "cost": 0
+            }
+        });
+
+        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+
+        assert_eq!(entry.model_name, "claude-sonnet-5");
+        assert!(entry.total_cost > 0.0);
+    }
+
+    #[test]
+    fn workflow_usage_entry_prices_each_agent_by_its_own_model() {
+        // Agents with an exact persisted `tokenUsage` are priced by their own
+        // model; agents without one (e.g. errored/skipped) are skipped.
+        let raw = json!({
+            "runId": "run-1",
+            "workflowName": "repo_audit",
+            "sessionId": "session-1",
+            "completedAt": "2026-01-02T05:04:05Z",
+            "agents": [
+                {
+                    "label": "scan",
+                    "model": "claude-sonnet-5",
+                    "tokens": 100,
+                    "tokenUsage": { "input": 8000, "output": 2000, "cacheRead": 1000, "cacheWrite": 0, "total": 11000, "cost": 0 }
+                },
+                { "label": "errored", "model": "gpt-5.6-luna", "tokens": 100 }
+            ],
+            "tokenUsage": {
+                "input": 9000,
+                "output": 2500,
+                "cacheRead": 1000,
+                "cacheWrite": 0,
+                "total": 12500,
+                "cost": 0
+            }
+        });
+
+        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+
+        let expected = model_cost_usd(
+            "claude-sonnet-5",
+            TokenUsage { input_tokens: 8000, output_tokens: 2000, cache_creation_tokens: 0, cache_read_tokens: 1000 },
+        );
+        assert!(expected > 0.0);
+        assert!((entry.total_cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn workflow_usage_entry_prices_agents_by_exact_persisted_token_usage() {
+        // Each agent carries its own exact tokenUsage split (input/output/cache)
+        // as persisted by the runtime; pricing uses it directly rather than
+        // allocating the run-level total proportionally.
+        let raw = json!({
+            "runId": "run-1",
+            "workflowName": "repo_audit",
+            "sessionId": "session-1",
+            "completedAt": "2026-01-02T05:04:05Z",
+            "agents": [
+                {
+                    "label": "scan",
+                    "model": "claude-sonnet-5",
+                    "tokens": 100,
+                    "tokenUsage": { "input": 8000, "output": 2000, "cacheRead": 1000, "cacheWrite": 0, "total": 11000, "cost": 0 }
+                },
+                {
+                    "label": "review",
+                    "model": "gpt-5.6-luna",
+                    "tokens": 100,
+                    "tokenUsage": { "input": 1000, "output": 500, "cacheRead": 0, "cacheWrite": 100, "total": 1600, "cost": 0 }
+                }
+            ],
+            "tokenUsage": {
+                "input": 9000,
+                "output": 2500,
+                "cacheRead": 1000,
+                "cacheWrite": 100,
+                "total": 12600,
+                "cost": 0
+            }
+        });
+
+        let entry = workflow_usage_entry_from_value(&raw, "session-1", "project-1").unwrap();
+
+        let expected = model_cost_usd(
+            "claude-sonnet-5",
+            TokenUsage { input_tokens: 8000, output_tokens: 2000, cache_creation_tokens: 0, cache_read_tokens: 1000 },
+        ) + model_cost_usd(
+            "gpt-5.6-luna",
+            TokenUsage { input_tokens: 1000, output_tokens: 500, cache_creation_tokens: 100, cache_read_tokens: 0 },
+        );
+        assert!(expected > 0.0);
+        assert!((entry.total_cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
     fn workflow_usage_entry_accepts_cost_total_object() {
         let raw = json!({
             "runId": "run-1",
@@ -1265,6 +1504,49 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_workflow_run_usages_reads_new_home_location() {
+        // pi-dynamic-workflows writes runs under the user's workflow home
+        // (~/.pi/workflows/projects/<key>/runs), not the project dir.
+        let root = temp_root("pi-workflow-home");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let key = workflow_project_key(&cwd);
+        let runs_dir = home
+            .join(".pi/workflows/projects")
+            .join(&key)
+            .join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+        fs::write(
+            runs_dir.join("run-1.json"),
+            json!({
+                "runId": "run-1",
+                "sessionId": "session-1",
+                "completedAt": "2026-01-02T05:04:05Z",
+                "tokenUsage": { "input": 120, "output": 30, "cacheRead": 40, "total": 200, "cost": 0 },
+                "agents": [
+                    {
+                        "label": "scan",
+                        "model": "claude-sonnet-5",
+                        "tokens": 200,
+                        "tokenUsage": { "input": 120, "output": 30, "cacheRead": 40, "cacheWrite": 0, "total": 190, "cost": 0 }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = load_workflow_run_usages_from_home(&cwd, Some(&home)).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].run_id, "run-1");
+        assert_eq!(loaded[0].session_id, "session-1");
+        assert!(loaded[0].total_cost > 0.0);
     }
 
     #[test]

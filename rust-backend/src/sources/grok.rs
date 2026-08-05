@@ -90,6 +90,7 @@ fn inference_to_session(
         cache_read_tokens,
         total_tokens_override: None,
         total_cost: model_cost_usd(&model_name, usage),
+        model_breakdowns: Vec::new(),
     })
 }
 
@@ -241,7 +242,7 @@ fn integer_field(value: &Value, key: &str) -> i64 {
         .unwrap_or_default()
 }
 
-fn discover_grok_home() -> Option<PathBuf> {
+pub(crate) fn discover_grok_home() -> Option<PathBuf> {
     if let Some(raw) = std::env::var_os(GROK_HOME_ENV) {
         return Some(PathBuf::from(raw));
     }
@@ -255,7 +256,7 @@ fn discover_log_root() -> Option<PathBuf> {
     discover_grok_home().map(|home| home.join("logs"))
 }
 
-fn discover_sessions_root() -> Option<PathBuf> {
+pub(crate) fn discover_sessions_root() -> Option<PathBuf> {
     discover_grok_home().map(|home| home.join("sessions"))
 }
 

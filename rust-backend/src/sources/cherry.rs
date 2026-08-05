@@ -1,5 +1,5 @@
 use crate::pricing::{model_cost_usd, TokenUsage};
-use crate::sources::{cluster_model_name, home_dir, LocalSession, SourceError};
+use crate::sources::{cluster_model_name_at, home_dir, LocalSession, SourceError};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use std::{
@@ -159,7 +159,7 @@ fn sqlite_row_to_session(
         .and_then(|value| value.get("cost"))
         .and_then(|value| value.as_f64())
         .filter(|cost| cost.is_finite() && *cost > 0.0)
-        .unwrap_or_else(|| model_cost_usd(&cluster_model_name(&model_name), usage));
+        .unwrap_or_else(|| model_cost_usd(&cluster_model_name_at(&model_name, Some(&date)), usage));
 
     Some(LocalSession {
         session_id: message_id.to_string(),
@@ -179,6 +179,7 @@ fn sqlite_row_to_session(
                     .and_then(|value| value.get("total_tokens").and_then(|value| value.as_i64()))
             }),
         total_cost: stored_cost,
+        model_breakdowns: Vec::new(),
     })
 }
 
@@ -265,7 +266,7 @@ fn load_indexeddb_sessions(data_dir: &Path) -> Result<Vec<LocalSession>, SourceE
             cache_read_tokens: 0,
         };
 
-        let clustered_model = cluster_model_name(&model_name);
+        let clustered_model = cluster_model_name_at(&model_name, Some(&date));
         sessions.push(LocalSession {
             session_id: message_id,
             date,
@@ -277,6 +278,7 @@ fn load_indexeddb_sessions(data_dir: &Path) -> Result<Vec<LocalSession>, SourceE
             cache_read_tokens: 0,
             total_tokens_override: None,
             total_cost: model_cost_usd(&clustered_model, usage),
+            model_breakdowns: Vec::new(),
         });
     }
 

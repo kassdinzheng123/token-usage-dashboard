@@ -126,6 +126,7 @@ fn usage_to_session(row: &UsageRow) -> Option<LocalSession> {
         cache_read_tokens,
         total_tokens_override: None,
         total_cost: model_cost_usd(&model_name, usage),
+        model_breakdowns: Vec::new(),
     })
 }
 

@@ -75,7 +75,10 @@ impl Aggregate {
         }
 
         self.by_model
-            .entry(super::cluster_model_name(&entry.model))
+            .entry(super::cluster_model_name_at(
+                &entry.model,
+                Some(&entry.timestamp.format("%Y-%m-%d").to_string()),
+            ))
             .or_default()
             .add_entry(entry);
     }

@@ -779,7 +779,7 @@ fn aggregate_entries(
     for entry in entries {
         let key = key_for(entry);
         let group = groups.entry(key.clone()).or_insert_with(|| AggregateUsage {
-            key,
+            key: key.clone(),
             ..AggregateUsage::default()
         });
 
@@ -790,7 +790,7 @@ fn aggregate_entries(
         group.total_tokens += entry.total_tokens();
         group.total_cost += entry.total_cost;
 
-        let model_name = super::cluster_model_name(&entry.model_name);
+        let model_name = super::cluster_model_name_at(&entry.model_name, Some(&key));
         if !group.models_used.contains(&model_name) {
             group.models_used.push(model_name.clone());
         }

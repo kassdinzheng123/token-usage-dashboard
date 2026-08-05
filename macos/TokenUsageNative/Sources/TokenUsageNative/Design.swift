@@ -132,6 +132,7 @@ enum AppPalette {
     static let cliClaudeScience = Color(red: 0.93, green: 0.66, blue: 0.40) // light clay
     static let cliZCode = Color(red: 0.26, green: 0.58, blue: 0.94)       // sky
     static let cliKimi = Color(red: 0.30, green: 0.42, blue: 0.98)        // indigo
+    static let cliReasonIX = Color(red: 0.39, green: 0.31, blue: 0.86)    // violet
 
     /// CLI colors keyed by `TokenUsageSource.label` (chart domains are label strings).
     static let cliColorsByLabel: [String: Color] = [
@@ -147,6 +148,7 @@ enum AppPalette {
         "Claude Science": cliClaudeScience,
         "ZCode": cliZCode,
         "Kimi": cliKimi,
+        "ReasonIX": cliReasonIX,
     ]
 
     static func cliColor(forLabel label: String) -> Color {

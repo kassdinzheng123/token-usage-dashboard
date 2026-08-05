@@ -21,13 +21,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
-pub const BRIEF_SOURCES: [Source; 6] = [
+pub const BRIEF_SOURCES: [Source; 8] = [
     Source::Claude,
     Source::Codex,
     Source::Opencode,
     Source::Cursor,
     Source::Zcode,
     Source::Kimi,
+    Source::Pi,
+    Source::Grok,
 ];
 
 pub fn local_today() -> String {
@@ -847,7 +849,7 @@ fn default_model_request() -> crate::protocol::BriefModelConfig {
     crate::protocol::BriefModelConfig {
         base_url: "http://127.0.0.1:8317/v1".into(),
         api_key: None,
-        model_id: "deepseek-v4-flash".into(),
+        model_id: "gpt-5.6-luna".into(),
     }
 }
 

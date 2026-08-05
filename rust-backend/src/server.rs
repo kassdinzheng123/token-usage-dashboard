@@ -906,6 +906,7 @@ fn today_task_key(source: Source) -> Option<&'static str> {
         Source::ClaudeScience => Some("claude-science:today"),
         Source::Zcode => Some("zcode:today"),
         Source::Kimi => Some("kimi:today"),
+        Source::Reasonix => Some("reasonix:today"),
     }
 }
 

@@ -396,6 +396,7 @@ fn usage_events_to_sessions(events: &[UsageEventRecord]) -> Vec<LocalSession> {
                 cache_read_tokens: event.cache_read_tokens,
                 total_tokens_override: None,
                 total_cost: model_cost_usd(&model_name, usage),
+                model_breakdowns: Vec::new(),
             }
         })
         .collect()
@@ -515,6 +516,7 @@ fn usage_to_sessions(usage: &UsageSnapshot) -> Vec<LocalSession> {
                 cache_read_tokens: 0,
                 total_tokens_override: Some(total_tokens),
                 total_cost: model_cost_usd(&model_name, usage),
+                model_breakdowns: Vec::new(),
             }
         })
         .collect()
@@ -548,6 +550,7 @@ fn invoice_to_sessions(year: i32, month: u32, items: &[InvoiceItem]) -> Vec<Loca
                 cache_read_tokens: 0,
                 total_tokens_override: Some(request_count),
                 total_cost: model_cost_usd(&model_name, usage),
+                model_breakdowns: Vec::new(),
             })
         })
         .collect()

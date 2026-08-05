@@ -13,6 +13,7 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
     case claudeScience = "claude-science"
     case zcode
     case kimi
+    case reasonix
 
     var id: String { rawValue }
 
@@ -42,6 +43,8 @@ enum UsageSource: String, CaseIterable, Codable, Identifiable {
             "ZCode"
         case .kimi:
             "Kimi"
+        case .reasonix:
+            "ReasonIX"
         }
     }
 }

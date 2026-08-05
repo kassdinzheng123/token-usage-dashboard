@@ -804,7 +804,7 @@ impl UsageLedger {
                                 .and_then(Value::as_str)
                                 .filter(|model| !model.is_empty())
                                 .unwrap_or("unknown");
-                            let clustered = sources::cluster_model_name(model_name);
+                            let clustered = sources::cluster_model_name_at(model_name, Some(key));
                             models.entry(clustered).or_default().add_breakdown(&item);
                             used_breakdowns = true;
                         }
@@ -812,7 +812,7 @@ impl UsageLedger {
                     if used_breakdowns {
                         continue;
                     }
-                    let clustered = sources::cluster_model_name(&raw_model);
+                    let clustered = sources::cluster_model_name_at(&raw_model, Some(key));
                     let entry = models.entry(clustered).or_default();
                     entry.input_tokens += input;
                     entry.output_tokens += output;
@@ -843,7 +843,7 @@ impl UsageLedger {
                             .and_then(Value::as_str)
                             .filter(|model| !model.is_empty())
                             .unwrap_or("unknown");
-                        let clustered = sources::cluster_model_name(model_name);
+                        let clustered = sources::cluster_model_name_at(model_name, Some(key));
                         models.entry(clustered).or_default().add_breakdown(item);
                     }
                 }
@@ -868,8 +868,10 @@ impl UsageLedger {
             let mut values = Vec::new();
             for row in rows {
                 if let Ok(mut value) = serde_json::from_str::<Value>(&row?) {
+                    let date = value.get("date").and_then(Value::as_str).map(str::to_owned);
                     if let Some(model) = value.get("modelName").and_then(Value::as_str) {
-                        value["modelName"] = json!(sources::cluster_model_name(model));
+                        value["modelName"] =
+                            json!(sources::cluster_model_name_at(model, date.as_deref()));
                     }
                     values.push(value);
                 }
@@ -1270,10 +1272,11 @@ fn migrate_legacy_cursor_source(connection: &Connection) -> Result<(), rusqlite:
 }
 
 fn normalize_clustered_models_in_row(row: &mut Value) {
+    let date = row.get("date").and_then(Value::as_str).map(str::to_owned);
     if let Some(models) = row.get_mut("modelsUsed").and_then(Value::as_array_mut) {
         for item in models.iter_mut() {
             if let Some(name) = item.as_str() {
-                *item = json!(sources::cluster_model_name(name));
+                *item = json!(sources::cluster_model_name_at(name, date.as_deref()));
             }
         }
     }
@@ -1284,7 +1287,10 @@ fn normalize_clustered_models_in_row(row: &mut Value) {
         for item in breakdowns.iter_mut() {
             if let Some(obj) = item.as_object_mut() {
                 if let Some(name) = obj.get("modelName").and_then(Value::as_str) {
-                    obj.insert("modelName".to_string(), json!(sources::cluster_model_name(name)));
+                    obj.insert(
+                        "modelName".to_string(),
+                        json!(sources::cluster_model_name_at(name, date.as_deref())),
+                    );
                 }
             }
         }

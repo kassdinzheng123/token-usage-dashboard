@@ -11,6 +11,7 @@ pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
+pub mod reasonix;
 pub mod zcode;
 
 use chrono::{DateTime, Local, TimeZone};
@@ -33,6 +34,7 @@ pub enum LocalSource {
     ClaudeScience,
     Zcode,
     Kimi,
+    Reasonix,
 }
 
 impl TryFrom<&str> for LocalSource {
@@ -52,6 +54,7 @@ impl TryFrom<&str> for LocalSource {
             "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
             "zcode" | "z-code" | "z_code" => Ok(Self::Zcode),
             "kimi" | "kimi-code" | "kimi-work" | "kimicode" | "kimiwork" => Ok(Self::Kimi),
+            "reasonix" | "reason-ix" => Ok(Self::Reasonix),
             other => Err(SourceError::UnsupportedSource(other.to_string())),
         }
     }
@@ -125,6 +128,16 @@ impl From<rusqlite::Error> for SourceError {
 }
 
 #[derive(Debug, Clone)]
+pub struct LocalModelUsage {
+    pub model_name: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalSession {
     pub session_id: String,
     pub date: String,
@@ -136,6 +149,7 @@ pub struct LocalSession {
     pub cache_read_tokens: i64,
     pub total_tokens_override: Option<i64>,
     pub total_cost: f64,
+    pub model_breakdowns: Vec<LocalModelUsage>,
 }
 
 impl LocalSession {
@@ -244,7 +258,8 @@ pub fn load_local_source_since(
         | LocalSource::Cherry
         | LocalSource::ClaudeScience
         | LocalSource::Zcode
-        | LocalSource::Kimi => {}
+        | LocalSource::Kimi
+        | LocalSource::Reasonix => {}
     }
 
     // Message-level rows only exist for sources with per-message timestamps in
@@ -260,8 +275,7 @@ pub fn load_local_source_since(
         | LocalSource::Codex
         | LocalSource::Opencode
         | LocalSource::OpenClaw
-        | LocalSource::Pi
-        => unreachable!(),
+        | LocalSource::Pi => unreachable!(),
         LocalSource::Hermes => hermes::load_sessions()?,
         LocalSource::Grok => grok::load_sessions(watermark_ms)?,
         LocalSource::Cursor => cursor::load_sessions(watermark_ms)?,
@@ -269,6 +283,7 @@ pub fn load_local_source_since(
         LocalSource::ClaudeScience => claude_science::load_sessions()?,
         LocalSource::Zcode => zcode::load_sessions()?,
         LocalSource::Kimi => kimi::load_sessions(watermark_ms)?,
+        LocalSource::Reasonix => reasonix::load_sessions(watermark_ms)?,
     };
 
     Ok(match view {
@@ -344,6 +359,7 @@ fn sessions_to_sessions(sessions: &[LocalSession]) -> Vec<Value> {
     let mut rows: Vec<_> = sessions
         .iter()
         .map(|session| {
+            let model_breakdowns = session_model_breakdowns(session);
             json!({
                 "sessionId": session.session_id.clone(),
                 "date": session.date.clone(),
@@ -354,8 +370,8 @@ fn sessions_to_sessions(sessions: &[LocalSession]) -> Vec<Value> {
                 "cacheReadTokens": session.cache_read_tokens,
                 "totalTokens": session.total_tokens(),
                 "totalCost": session.total_cost,
-                "modelsUsed": [cluster_model_name(&session.model_name)],
-                "modelBreakdowns": [model_breakdown(session)],
+                "modelsUsed": models_used_from_breakdowns(&model_breakdowns),
+                "modelBreakdowns": model_breakdowns,
             })
         })
         .collect();
@@ -383,11 +399,13 @@ fn aggregate_sessions(
         group.total_tokens += session.total_tokens();
         group.total_cost += session.total_cost;
 
-        let clustered = cluster_model_name(&session.model_name);
-        if !group.models_used.contains(&clustered) {
-            group.models_used.push(clustered);
+        let model_breakdowns = session_model_breakdowns(session);
+        for model_name in models_used_from_breakdowns(&model_breakdowns) {
+            if !group.models_used.contains(&model_name) {
+                group.models_used.push(model_name);
+            }
         }
-        group.model_breakdowns.push(model_breakdown(session));
+        group.model_breakdowns.extend(model_breakdowns);
     }
 
     groups.into_iter().map(|(_, group)| group).collect()
@@ -395,13 +413,47 @@ fn aggregate_sessions(
 
 fn model_breakdown(session: &LocalSession) -> Value {
     json!({
-        "modelName": cluster_model_name(&session.model_name),
+        "modelName": cluster_model_name_at(&session.model_name, Some(&session.date)),
         "inputTokens": session.input_tokens,
         "outputTokens": session.output_tokens,
         "cacheCreationTokens": session.cache_creation_tokens,
         "cacheReadTokens": session.cache_read_tokens,
         "cost": session.total_cost,
     })
+}
+
+fn session_model_breakdowns(session: &LocalSession) -> Vec<Value> {
+    if session.model_breakdowns.is_empty() {
+        return vec![model_breakdown(session)];
+    }
+
+    session
+        .model_breakdowns
+        .iter()
+        .map(|breakdown| {
+            json!({
+                "modelName": cluster_model_name_at(&breakdown.model_name, Some(&session.date)),
+                "inputTokens": breakdown.input_tokens,
+                "outputTokens": breakdown.output_tokens,
+                "cacheCreationTokens": breakdown.cache_creation_tokens,
+                "cacheReadTokens": breakdown.cache_read_tokens,
+                "cost": breakdown.cost,
+            })
+        })
+        .collect()
+}
+
+fn models_used_from_breakdowns(model_breakdowns: &[Value]) -> Vec<String> {
+    let mut models_used = Vec::new();
+    for model_name in model_breakdowns
+        .iter()
+        .filter_map(|breakdown| breakdown.get("modelName").and_then(Value::as_str))
+    {
+        if !models_used.iter().any(|existing| existing == model_name) {
+            models_used.push(model_name.to_string());
+        }
+    }
+    models_used
 }
 
 fn sort_key(value: &Value) -> String {
@@ -465,17 +517,26 @@ fn canonicalize_claude_4x_in_string(model_name: &str) -> String {
     format!("{prefix}{canon}")
 }
 
-/// Normalizes a model name by matching against known canonical model names.
-/// Variants like `custom:deepseek-v4-flash` or `dqweqwe:deepseek-v4-pro21312421h43jk`
-/// are merged into the canonical base model name.
-pub(crate) fn cluster_model_name(model_name: &str) -> String {
+/// Date (YYYY-MM-DD) on/after which `ark-code-latest` is treated as
+/// `deepseek-v4-flash` instead of `glm-5.2`.
+const ARK_CODE_DEEPSEEK_V4_FLASH_SINCE: &str = "2026-08-01";
+
+/// Same as [`cluster_model_name`] but lets the caller provide the record date so
+/// date-based mappings (e.g. `ark-code-latest` -> `deepseek-v4-flash` after
+/// Aug 1 2026) can be applied per record. `None` falls back to the current
+/// (post-cutoff) behavior.
+pub(crate) fn cluster_model_name_at(model_name: &str, date: Option<&str>) -> String {
     let lowered = model_name.trim().to_ascii_lowercase();
     if lowered == "zai-org/glm-5.2" || lowered == "zai-org/glm-5-2" {
         return "glm-5.2".to_string();
     }
     let stripped = strip_provider_prefix(&lowered);
     let mapped = if stripped.contains("ark-code-latest") || stripped == "ark-code" {
-        "glm-5.2"
+        if is_on_or_after(date, ARK_CODE_DEEPSEEK_V4_FLASH_SINCE) {
+            "deepseek-v4-flash"
+        } else {
+            "glm-5.2"
+        }
     } else if stripped.contains("glm-5.2") || stripped.contains("glm-5-2") {
         "glm-5.2"
     } else if stripped.contains("deepseek-v4-pro") {
@@ -503,15 +564,44 @@ pub(crate) fn cluster_model_name(model_name: &str) -> String {
         "composer-2.5"
     } else if stripped.contains("claude-sonnet-5") {
         "claude-sonnet-5"
+    } else if stripped.contains("gpt-5.6") || stripped.contains("gpt-5-6") {
+        // Absorb gpt-5.6 variants (e.g. `gpt-5.6-luna:medium`) into the base model.
+        stripped.split(':').next().unwrap_or(stripped)
     } else {
         stripped
     };
     canonicalize_claude_4x_in_string(mapped)
 }
 
+/// Normalizes a model name by matching against known canonical model names.
+/// Variants like `custom:deepseek-v4-flash` or `dqweqwe:deepseek-v4-pro21312421h43jk`
+/// are merged into the canonical base model name.
+pub(crate) fn cluster_model_name(model_name: &str) -> String {
+    cluster_model_name_at(model_name, None)
+}
+
+/// True when `date` (YYYY-MM-DD or YYYY-MM) is on/after `cutoff` (YYYY-MM-DD).
+/// A missing date is treated as before the cutoff (historical behavior).
+fn is_on_or_after(date: Option<&str>, cutoff: &str) -> bool {
+    let Some(date) = date else {
+        return false;
+    };
+    let date = date.trim();
+    if date.is_empty() {
+        return false;
+    }
+    // Normalize month keys (YYYY-MM) to YYYY-MM-01 so comparison is consistent.
+    let normalized = if date.len() == 7 {
+        format!("{date}-01")
+    } else {
+        date.to_string()
+    };
+    normalized.as_str() >= cutoff
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cluster_model_name, LocalSource};
+    use super::{cluster_model_name, cluster_model_name_at, LocalSource};
     use std::convert::TryFrom;
 
     #[test]
@@ -540,12 +630,64 @@ mod tests {
         assert_eq!(cluster_model_name("other-model"), "other-model");
         assert_eq!(cluster_model_name("GPT-5.5"), "gpt-5.5");
         assert_eq!(cluster_model_name("OTHER-MODEL"), "other-model");
-        assert_eq!(cluster_model_name("Grok-Composer-2.5-Fast"), "composer-2.5-fast");
+        assert_eq!(
+            cluster_model_name("Grok-Composer-2.5-Fast"),
+            "composer-2.5-fast"
+        );
         assert_eq!(cluster_model_name("cursor-composer-2-5"), "composer-2.5");
         assert_eq!(cluster_model_name("composer-2.5"), "composer-2.5");
         assert_eq!(cluster_model_name("k3"), "kimi-k3");
+        assert_eq!(cluster_model_name("k3-256k"), "kimi-k3");
         assert_eq!(cluster_model_name("kimi-code/k3"), "kimi-k3");
         assert_eq!(cluster_model_name("k3-agent"), "kimi-k3");
+    }
+
+    #[test]
+    fn cluster_model_name_absorbs_gpt_56_variants() {
+        assert_eq!(cluster_model_name("gpt-5.6-luna:medium"), "gpt-5.6-luna");
+        assert_eq!(cluster_model_name("gpt-5.6-luna"), "gpt-5.6-luna");
+        assert_eq!(cluster_model_name("gpt-5.6-sol:high"), "gpt-5.6-sol");
+        assert_eq!(cluster_model_name("gpt-5.6-terra:low"), "gpt-5.6-terra");
+        assert_eq!(cluster_model_name("gpt-5.6:medium"), "gpt-5.6");
+        assert_eq!(cluster_model_name("openai/gpt-5.6-luna:medium"), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn cluster_model_name_maps_ark_code_by_date() {
+        // Before the cutoff, ark-code-latest stays glm-5.2.
+        assert_eq!(
+            cluster_model_name_at("ark-code-latest", Some("2026-07-31")),
+            "glm-5.2"
+        );
+        assert_eq!(
+            cluster_model_name_at("CPA/ark-code-latest", Some("2026-07-01")),
+            "glm-5.2"
+        );
+        // On/after Aug 1 2026 it maps to deepseek-v4-flash.
+        assert_eq!(
+            cluster_model_name_at("ark-code-latest", Some("2026-08-01")),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            cluster_model_name_at("ark-code-latest", Some("2026-08-04")),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            cluster_model_name_at("CPA/ark-code-latest", Some("2026-08-15")),
+            "deepseek-v4-flash"
+        );
+        // Month-precision keys are handled.
+        assert_eq!(
+            cluster_model_name_at("ark-code-latest", Some("2026-07")),
+            "glm-5.2"
+        );
+        assert_eq!(
+            cluster_model_name_at("ark-code-latest", Some("2026-08")),
+            "deepseek-v4-flash"
+        );
+        // No date falls back to the pre-cutoff (historical) behavior.
+        assert_eq!(cluster_model_name("ark-code-latest"), "glm-5.2");
+        assert_eq!(cluster_model_name_at("ark-code-latest", None), "glm-5.2");
     }
 
     #[test]
@@ -553,9 +695,15 @@ mod tests {
         assert_eq!(cluster_model_name("claude-opus-4.8"), "claude-opus-4-8");
         assert_eq!(cluster_model_name("claude-opus-4-8"), "claude-opus-4-8");
         assert_eq!(cluster_model_name("claude-opus-4.7"), "claude-opus-4-7");
-        assert_eq!(cluster_model_name("anthropic/claude-opus-4.8"), "claude-opus-4-8");
+        assert_eq!(
+            cluster_model_name("anthropic/claude-opus-4.8"),
+            "claude-opus-4-8"
+        );
         assert_eq!(cluster_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
-        assert_eq!(cluster_model_name("kiro-claude-opus-4.7"), "kiro-claude-opus-4-7");
+        assert_eq!(
+            cluster_model_name("kiro-claude-opus-4.7"),
+            "kiro-claude-opus-4-7"
+        );
     }
 
     #[test]
@@ -595,6 +743,18 @@ mod tests {
         assert_eq!(LocalSource::try_from("oh-my-pi").unwrap(), LocalSource::Pi);
         assert_eq!(LocalSource::try_from("ohmypi").unwrap(), LocalSource::Pi);
         assert_eq!(LocalSource::try_from("omp").unwrap(), LocalSource::Pi);
+    }
+
+    #[test]
+    fn reasonix_aliases_map_to_reasonix() {
+        assert_eq!(
+            LocalSource::try_from("reasonix").unwrap(),
+            LocalSource::Reasonix
+        );
+        assert_eq!(
+            LocalSource::try_from("reason-ix").unwrap(),
+            LocalSource::Reasonix
+        );
     }
 
     #[test]

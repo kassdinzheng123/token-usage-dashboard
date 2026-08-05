@@ -1,8 +1,10 @@
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod grok;
 pub mod kimi;
 pub mod opencode;
+pub mod pi;
 pub mod zcode;
 
 use crate::protocol::Source;
@@ -199,6 +201,8 @@ pub fn extract_for_source(
         Source::Zcode => zcode::extract(session_rows),
         Source::Cursor => cursor::extract(session_rows),
         Source::Kimi => kimi::extract(session_rows),
+        Source::Pi => pi::extract(session_rows),
+        Source::Grok => grok::extract(session_rows),
         other => Err(format!("brief extraction not supported for {other}")),
     }
 }

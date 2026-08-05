@@ -1141,6 +1141,28 @@ mod tests {
     }
 
     #[test]
+    fn absorbs_gpt_56_variants_into_tier_pricing() {
+        let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
+        // Variants like `gpt-5.6-luna:medium` are absorbed into the base model.
+        assert_eq!(
+            model_cost_usd("gpt-5.6-luna:medium", usage),
+            model_cost_usd("gpt-5.6-luna", usage)
+        );
+        assert_eq!(
+            model_cost_usd("gpt-5.6-sol:high", usage),
+            model_cost_usd("gpt-5.6-sol", usage)
+        );
+        assert_eq!(
+            model_cost_usd("gpt-5.6-terra:low", usage),
+            model_cost_usd("gpt-5.6-terra", usage)
+        );
+        assert_eq!(
+            model_cost_usd("openai/gpt-5.6-luna:medium", usage),
+            model_cost_usd("gpt-5.6-luna", usage)
+        );
+    }
+
+    #[test]
     fn calculates_builtin_claude_sonnet_5_intro_cost() {
         let usage = usage(1_000_000, 1_000_000, 250_000, 500_000);
         let cost = model_cost_usd("claude-sonnet-5", usage);

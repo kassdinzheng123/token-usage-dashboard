@@ -213,6 +213,7 @@ fn session_from_message_event(
         cache_read_tokens,
         total_tokens_override,
         total_cost,
+        model_breakdowns: Vec::new(),
     };
 
     (session.total_tokens() > 0 || session.total_cost > 0.0).then_some(session)
@@ -261,6 +262,7 @@ fn session_from_summary(key: &str, entry: &serde_json::Map<String, Value>) -> Op
         cache_read_tokens,
         total_tokens_override,
         total_cost,
+        model_breakdowns: Vec::new(),
     };
 
     (session.total_tokens() > 0 || session.total_cost > 0.0).then_some(session)
@@ -358,7 +360,7 @@ fn aggregate_sessions(
             group.latest_time = session.time.clone();
         }
 
-        let clustered = super::cluster_model_name(&session.model_name);
+        let clustered = super::cluster_model_name_at(&session.model_name, Some(&session.date));
         if !group.models_used.contains(&clustered) {
             group.models_used.push(clustered);
         }
@@ -385,7 +387,7 @@ struct OpenClawAggregate {
 
 fn model_breakdown(session: &LocalSession) -> Value {
     json!({
-        "modelName": super::cluster_model_name(&session.model_name),
+        "modelName": super::cluster_model_name_at(&session.model_name, Some(&session.date)),
         "inputTokens": session.input_tokens,
         "outputTokens": session.output_tokens,
         "cacheCreationTokens": session.cache_creation_tokens,

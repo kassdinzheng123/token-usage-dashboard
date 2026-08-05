@@ -94,6 +94,7 @@ pub fn load_sessions() -> Result<Vec<LocalSession>, SourceError> {
             cache_read_tokens,
             total_tokens_override: None,
             total_cost,
+            model_breakdowns: Vec::new(),
         };
 
         if session.total_tokens() > 0 {

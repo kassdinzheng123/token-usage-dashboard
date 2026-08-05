@@ -3,6 +3,7 @@
 .idea/
 .vscode/
 *.swp
+.zcode/
 
 # Local env / secrets
 .env

@@ -16,10 +16,11 @@ pub enum Source {
     ClaudeScience,
     Zcode,
     Kimi,
+    Reasonix,
 }
 
 impl Source {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
@@ -32,6 +33,7 @@ impl Source {
         Self::ClaudeScience,
         Self::Zcode,
         Self::Kimi,
+        Self::Reasonix,
     ];
 
     pub fn label(self) -> &'static str {
@@ -48,6 +50,7 @@ impl Source {
             Self::ClaudeScience => "Claude Science",
             Self::Zcode => "ZCode",
             Self::Kimi => "Kimi",
+            Self::Reasonix => "ReasonIX",
         }
     }
 }
@@ -67,6 +70,7 @@ impl fmt::Display for Source {
             Self::ClaudeScience => "claude-science",
             Self::Zcode => "zcode",
             Self::Kimi => "kimi",
+            Self::Reasonix => "reasonix",
         })
     }
 }
@@ -88,6 +92,7 @@ impl FromStr for Source {
             "claude-science" | "claude_science" | "claudescience" => Ok(Self::ClaudeScience),
             "zcode" | "z-code" | "z_code" => Ok(Self::Zcode),
             "kimi" | "kimi-code" | "kimi-work" | "kimicode" | "kimiwork" => Ok(Self::Kimi),
+            "reasonix" | "reason-ix" => Ok(Self::Reasonix),
             _ => Err(ParseProtocolError::new("source", value)),
         }
     }
@@ -176,7 +181,7 @@ impl WarmTask {
     }
 }
 
-pub const ALL_TASKS: [WarmTask; 37] = [
+pub const ALL_TASKS: [WarmTask; 40] = [
     WarmTask {
         key: "claude:daily",
         source: Source::Claude,
@@ -360,6 +365,21 @@ pub const ALL_TASKS: [WarmTask; 37] = [
     WarmTask {
         key: "kimi:sessions",
         source: Source::Kimi,
+        view: View::Sessions,
+    },
+    WarmTask {
+        key: "reasonix:daily",
+        source: Source::Reasonix,
+        view: View::Daily,
+    },
+    WarmTask {
+        key: "reasonix:monthly",
+        source: Source::Reasonix,
+        view: View::Monthly,
+    },
+    WarmTask {
+        key: "reasonix:sessions",
+        source: Source::Reasonix,
         view: View::Sessions,
     },
 ];
@@ -625,6 +645,7 @@ pub fn short_source(source: &str) -> &str {
         "cursor" => "Cursor",
         "zcode" => "ZCode",
         "kimi" => "Kimi",
+        "reasonix" => "ReasonIX",
         other => other,
     }
 }
@@ -709,5 +730,11 @@ mod tests {
         assert_eq!(Source::from_str("kimi-work").unwrap(), Source::Kimi);
         assert_eq!(Source::from_str("kimicode").unwrap(), Source::Kimi);
         assert_eq!(Source::from_str("kimiwork").unwrap(), Source::Kimi);
+    }
+
+    #[test]
+    fn reasonix_aliases_parse_as_reasonix() {
+        assert_eq!(Source::from_str("reasonix").unwrap(), Source::Reasonix);
+        assert_eq!(Source::from_str("reason-ix").unwrap(), Source::Reasonix);
     }
 }

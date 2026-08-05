@@ -282,6 +282,7 @@ fn finalize_pending(file_id: &str, pending: PendingRun) -> Option<LocalSession> 
         cache_read_tokens: totals.cache_read_tokens,
         total_tokens_override: None,
         total_cost: model_cost_usd(&model_name, usage),
+        model_breakdowns: Vec::new(),
     })
 }
 
@@ -672,6 +673,7 @@ mod tests {
             cache_read_tokens: 0,
             total_tokens_override: None,
             total_cost: 0.0,
+            model_breakdowns: Vec::new(),
         };
         let mut duplicate = session.clone();
         duplicate.input_tokens = 20;

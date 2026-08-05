@@ -595,7 +595,7 @@ fn events_to_blocks(events: &[TokenUsageEvent]) -> Vec<Value> {
             json!({
                 "blockId": block_id,
                 "sessionId": event.session_id,
-                "modelName": super::cluster_model_name(&event.model_name),
+                "modelName": super::cluster_model_name_at(&event.model_name, Some(&event.date)),
                 "timestamp": event.timestamp_millis,
                 "date": event.date,
                 "time": event.time,
@@ -728,7 +728,7 @@ fn aggregate_events(
 
         let model = group
             .models
-            .entry(super::cluster_model_name(&event.model_name))
+            .entry(super::cluster_model_name_at(&event.model_name, Some(&event.date)))
             .or_insert_with(ModelUsage::default);
         model.input_tokens += event.input_tokens;
         model.output_tokens += event.output_tokens;

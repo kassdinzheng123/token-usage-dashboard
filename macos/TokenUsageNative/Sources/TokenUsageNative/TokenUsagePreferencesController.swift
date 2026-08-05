@@ -3,7 +3,7 @@ import Foundation
 @MainActor
 public final class TokenUsagePreferencesController: ObservableObject {
     public static let briefSupportedSources: Set<TokenUsageSource> = [
-        .claude, .codex, .opencode, .cursor, .zcode, .kimi
+        .claude, .codex, .opencode, .cursor, .zcode, .kimi, .pi, .grok
     ]
 
     @Published public var enabledSources: Set<TokenUsageSource> {
@@ -93,6 +93,14 @@ public final class TokenUsagePreferencesController: ObservableObject {
                 defaults.set(enabledSources.map(\.rawValue).sorted(), forKey: Self.enabledSourcesKey)
             }
             defaults.set(true, forKey: Self.enabledSourcesMigratedKimiKey)
+        }
+
+        if !defaults.bool(forKey: Self.enabledSourcesMigratedReasonIXKey) {
+            if !enabledSources.contains(.reasonix) {
+                enabledSources.insert(.reasonix)
+                defaults.set(enabledSources.map(\.rawValue).sorted(), forKey: Self.enabledSourcesKey)
+            }
+            defaults.set(true, forKey: Self.enabledSourcesMigratedReasonIXKey)
         }
     }
 
@@ -327,6 +335,7 @@ public final class TokenUsagePreferencesController: ObservableObject {
 
     private static let enabledSourcesKey = "TokenUsage.enabledSources"
     private static let enabledSourcesMigratedKimiKey = "TokenUsage.enabledSourcesMigratedKimi"
+    private static let enabledSourcesMigratedReasonIXKey = "TokenUsage.enabledSourcesMigratedReasonIX"
     private static let briefBaseURLKey = "TokenUsage.briefBaseURL"
     private static let briefModelIdKey = "TokenUsage.briefModelId"
     private static let briefApiKeyKey = "TokenUsage.briefApiKey"
@@ -335,7 +344,7 @@ public final class TokenUsagePreferencesController: ObservableObject {
     private static let automaticSyncEnabledKey = "TokenUsage.automaticSyncEnabled"
     private static let lastSyncAtKey = "TokenUsage.lastSyncAt"
     public static let defaultBriefBaseURL = "http://127.0.0.1:8317/v1"
-    public static let defaultBriefModelId = "deepseek-v4-flash"
+    public static let defaultBriefModelId = "gpt-5.6-luna"
 }
 
 extension Notification.Name {
