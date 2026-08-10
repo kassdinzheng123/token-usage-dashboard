@@ -100,6 +100,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     case activity
     case models
     case brief
+    case daily
     case logs
 
     var id: String { rawValue }
@@ -110,6 +111,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
         case .activity: "Activity"
         case .models: "Models"
         case .brief: "Brief"
+        case .daily: "Daily"
         case .logs: "Backend Logs"
         }
     }
@@ -120,6 +122,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
         case .activity: "chart.bar.xaxis"
         case .models: "cpu"
         case .brief: "sparkles"
+        case .daily: "calendar"
         case .logs: "terminal"
         }
     }
@@ -129,7 +132,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     var showsUsageControls: Bool {
         switch self {
         case .overview, .activity, .models: true
-        case .brief, .logs: false
+        case .brief, .daily, .logs: false
         }
     }
 }
@@ -540,6 +543,7 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 sidebarRow(for: .activity)
                 sidebarRow(for: .models)
                 sidebarRow(for: .brief)
+                sidebarRow(for: .daily)
             }
 
             Section("System") {
@@ -585,6 +589,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
                 modelsPage
             case .brief:
                 briefPage
+            case .daily:
+                dailyPage
             case .logs:
                 logsPage
             }
@@ -848,6 +854,8 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
         switch selectedPage {
         case .brief:
             await store.refreshTodayBrief()
+        case .daily:
+            await store.loadProjects()
         case .logs:
             break
         case .overview, .activity, .models:
