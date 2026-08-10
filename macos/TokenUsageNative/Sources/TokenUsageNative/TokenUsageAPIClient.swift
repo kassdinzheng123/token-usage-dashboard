@@ -119,6 +119,90 @@ actor TokenUsageAPIClient {
         return try decoder.decode(TodayBriefResponse.self, from: data)
     }
 
+    // MARK: - Daily reports
+
+    func fetchProjects() async throws -> [ProjectBinding] {
+        let response: ProjectsResponse = try await fetch("projects", queryItems: [])
+        return response.projects
+    }
+
+    func addProject(name: String, path: String) async throws -> ProjectBinding {
+        let url = try makeURL(path: "projects", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(ProjectUpsertRequest(name: name, path: path))
+
+        let (data, response) = try await session.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode),
+           let payload = try? decoder.decode(GitSyncErrorResponse.self, from: data) {
+            throw ClientError.server(payload.error)
+        }
+        try validate(response: response)
+        return try decoder.decode(ProjectBinding.self, from: data)
+    }
+
+    func removeProject(name: String) async throws -> [ProjectBinding] {
+        let url = try makeURL(path: "projects/\(name)", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+
+        let (data, response) = try await session.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode),
+           let payload = try? decoder.decode(GitSyncErrorResponse.self, from: data) {
+            throw ClientError.server(payload.error)
+        }
+        try validate(response: response)
+        let result: ProjectsResponse = try decoder.decode(ProjectsResponse.self, from: data)
+        return result.projects
+    }
+
+    func generateDailyReport(
+        project: String,
+        date: String?,
+        force: Bool,
+        model: BriefModelConfig
+    ) async throws -> DailyReport {
+        let requestBody = DailyGenerateRequest(
+            project: project,
+            date: date,
+            force: force ? true : nil,
+            model: model
+        )
+        let url = try makeURL(path: "daily/generate", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(requestBody)
+
+        let (data, response) = try await session.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode),
+           let payload = try? decoder.decode(GitSyncErrorResponse.self, from: data) {
+            throw ClientError.server(payload.error)
+        }
+        try validate(response: response)
+        return try decoder.decode(DailyReport.self, from: data)
+    }
+
+    /// Fetches a cached daily report; nil when none exists.
+    func fetchDailyReport(project: String, date: String) async throws -> DailyReport? {
+        let url = try makeURL(path: "daily/\(project)/\(date)", queryItems: [])
+        let (data, response) = try await session.data(from: url)
+        if let httpResponse = response as? HTTPURLResponse {
+            if httpResponse.statusCode == 404 {
+                return nil
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                throw ClientError.unexpectedStatus(httpResponse.statusCode)
+            }
+        }
+        return try decoder.decode(DailyReport.self, from: data)
+    }
+
     func warmDashboardCache() async throws {
         try await fetchIgnoringBody("refresh")
     }

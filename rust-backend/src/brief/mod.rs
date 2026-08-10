@@ -41,15 +41,30 @@ pub fn load_today_brief() -> Result<Option<TodayBriefResponse>, String> {
 }
 
 pub fn load_brief_for_date(date: &str) -> Result<Option<TodayBriefResponse>, String> {
-    Ok(store::load_brief(date)?.map(TodayBriefResponse::normalized))
+    let Some(mut brief) = store::load_brief(date)?.map(TodayBriefResponse::normalized) else {
+        return Ok(None);
+    };
+    if brief.status == "ok" {
+        let sources = if brief.enabled_sources.is_empty() {
+            Vec::new()
+        } else {
+            normalize_sources(Some(&brief.enabled_sources))
+        };
+        let ledger = UsageLedger::default()?;
+        let tokens = authoritative_hour_tokens(&ledger, date, &sources)?;
+        brief.hours = Some(reconcile_brief_hours(brief.hours.take(), &tokens));
+    }
+    Ok(Some(brief))
 }
 
 /// Hour attribution for a session: hour -> tokens spent in that hour.
 type SessionHours = HashMap<(String, String), BTreeMap<i64, i64>>;
+type HourTokens = BTreeMap<i64, i64>;
 
 struct DayExtract {
     extracts: Vec<SourceExtract>,
     session_hours: SessionHours,
+    hourly_tokens: HourTokens,
 }
 
 pub fn generate_today_brief(request: BriefGenerateRequest) -> Result<TodayBriefResponse, String> {
@@ -90,7 +105,7 @@ pub fn generate_today_brief(request: BriefGenerateRequest) -> Result<TodayBriefR
             .map(|sources| !sources.is_empty())
             .unwrap_or(false);
 
-    let existing = store::load_brief(&date)?.map(TodayBriefResponse::normalized);
+    let existing = load_brief_for_date(&date)?;
 
     if !force {
         if let Some(existing) = &existing {
@@ -174,6 +189,7 @@ pub fn generate_today_brief(request: BriefGenerateRequest) -> Result<TodayBriefR
     let content_fingerprint = fingerprint(&json!({
         "date": date,
         "extracts": day.extracts,
+        "hourlyTokens": day.hourly_tokens,
     }));
 
     let llm = LlmConfig {
@@ -295,7 +311,18 @@ pub fn generate_today_brief(request: BriefGenerateRequest) -> Result<TodayBriefR
                 .into_iter()
                 .filter(|(hour, _)| requested_set.contains(hour))
                 .collect();
-            let regenerated = summarize_hours(sub_groups, &llm, &mut llm_errors);
+            let sub_tokens: HourTokens = day
+                .hourly_tokens
+                .iter()
+                .filter(|(hour, _)| requested_set.contains(hour))
+                .map(|(hour, tokens)| (*hour, *tokens))
+                .collect();
+            let regenerated = summarize_hours(
+                sub_groups,
+                &sub_tokens,
+                &llm,
+                &mut llm_errors,
+            );
             let mut merged: Vec<TodayBriefHour> = existing
                 .as_ref()
                 .and_then(|brief| brief.hours.clone())
@@ -307,7 +334,7 @@ pub fn generate_today_brief(request: BriefGenerateRequest) -> Result<TodayBriefR
             merged.sort_by_key(|hour| hour.hour);
             merged
         }
-        None => summarize_hours(groups, &llm, &mut llm_errors),
+        None => summarize_hours(groups, &day.hourly_tokens, &llm, &mut llm_errors),
     };
 
     cards.sort_by(|left, right| {
@@ -395,9 +422,18 @@ fn collect_day_extracts(
         }
     }
 
+    let hourly_tokens = match authoritative_hour_tokens(ledger, date, sources) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            errors.push(format!("hourly usage failed: {err}"));
+            HourTokens::new()
+        }
+    };
+
     DayExtract {
         extracts,
         session_hours,
+        hourly_tokens,
     }
 }
 
@@ -566,15 +602,20 @@ fn aggregate_hour_projects(
 /// headline) for the UI's project tags. Hours without dialog content skip the
 /// LLM call and fall back to the usage-only marker.
 fn summarize_hours(
-    groups: BTreeMap<i64, Vec<(String, ExtractedSession, i64)>>,
+    mut groups: BTreeMap<i64, Vec<(String, ExtractedSession, i64)>>,
+    hourly_tokens: &HourTokens,
     llm: &LlmConfig,
     llm_errors: &mut Vec<String>,
 ) -> Vec<TodayBriefHour> {
     let mut hours = Vec::new();
     let mut handles = Vec::new();
+    groups.retain(|hour, _| hourly_tokens.contains_key(hour));
+    for hour in hourly_tokens.keys() {
+        groups.entry(*hour).or_default();
+    }
     for (hour, sessions) in groups {
         let session_count = sessions.len();
-        let tokens: i64 = sessions.iter().map(|(_, _, tokens)| tokens).sum();
+        let tokens = hourly_tokens.get(&hour).copied().unwrap_or_default();
         let buckets = aggregate_hour_projects(&sessions);
         // Token-only breakdown for the UI; no per-project headline.
         let projects: Vec<TodayBriefHourProject> = buckets
@@ -618,24 +659,25 @@ fn summarize_hours(
             }).collect::<Vec<_>>(),
         });
         let llm = llm.clone();
-        handles.push(std::thread::spawn(move || {
-            let summary = summarize_hour(&llm, hour, &payload);
-            (hour, session_count, tokens, projects, summary)
-        }));
+        handles.push((
+            hour,
+            session_count,
+            tokens,
+            projects,
+            std::thread::spawn(move || summarize_hour(&llm, hour, &payload)),
+        ));
     }
 
-    for handle in handles {
+    for (hour, session_count, tokens, projects, handle) in handles {
         match handle.join() {
-            Ok((hour, session_count, tokens, projects, Ok(headline))) => hours.push(
-                TodayBriefHour {
-                    hour,
-                    headline,
-                    session_count,
-                    tokens,
-                    projects,
-                },
-            ),
-            Ok((hour, session_count, tokens, projects, Err(err))) => {
+            Ok(Ok(headline)) => hours.push(TodayBriefHour {
+                hour,
+                headline,
+                session_count,
+                tokens,
+                projects,
+            }),
+            Ok(Err(err)) => {
                 llm_errors.push(format!("hour {hour}: {err}"));
                 hours.push(TodayBriefHour {
                     hour,
@@ -645,12 +687,69 @@ fn summarize_hours(
                     projects,
                 });
             }
-            Err(_) => llm_errors.push("LLM hour worker panicked".to_string()),
+            Err(_) => {
+                llm_errors.push(format!("hour {hour}: LLM worker panicked"));
+                hours.push(TodayBriefHour {
+                    hour,
+                    headline: "本小时摘要生成失败".into(),
+                    session_count,
+                    tokens,
+                    projects,
+                });
+            }
         }
     }
 
     hours.sort_by_key(|hour| hour.hour);
     hours
+}
+
+fn authoritative_hour_tokens(
+    ledger: &UsageLedger,
+    date: &str,
+    sources: &[Source],
+) -> Result<HourTokens, String> {
+    let mut totals = HourTokens::new();
+    for source in sources {
+        for row in ledger.load_hourly(*source, date)? {
+            let Some(hour) = row.get("hour").and_then(Value::as_i64) else {
+                continue;
+            };
+            let tokens = row
+                .get("totalTokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            if (0..24).contains(&hour) && tokens > 0 {
+                *totals.entry(hour).or_default() += tokens;
+            }
+        }
+    }
+    Ok(totals)
+}
+
+fn reconcile_brief_hours(
+    hours: Option<Vec<TodayBriefHour>>,
+    authoritative: &HourTokens,
+) -> Vec<TodayBriefHour> {
+    let mut existing: BTreeMap<i64, TodayBriefHour> = hours
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hour| (hour.hour, hour))
+        .collect();
+    authoritative
+        .iter()
+        .map(|(hour, tokens)| {
+            let mut item = existing.remove(hour).unwrap_or_else(|| TodayBriefHour {
+                hour: *hour,
+                headline: "仅有用量记录，无对话内容".into(),
+                session_count: 0,
+                tokens: *tokens,
+                projects: Vec::new(),
+            });
+            item.tokens = *tokens;
+            item
+        })
+        .collect()
 }
 
 /// Day-by-day entries for the brief month view: usage from the ledger plus
@@ -845,7 +944,7 @@ fn normalize_sources(raw: Option<&[String]>) -> Vec<Source> {
     unique
 }
 
-fn default_model_request() -> crate::protocol::BriefModelConfig {
+pub(crate) fn default_model_request() -> crate::protocol::BriefModelConfig {
     crate::protocol::BriefModelConfig {
         base_url: "http://127.0.0.1:8317/v1".into(),
         api_key: None,
@@ -853,7 +952,7 @@ fn default_model_request() -> crate::protocol::BriefModelConfig {
     }
 }
 
-fn ingest_source(ledger: &UsageLedger, source: Source) -> Result<(), String> {
+pub(crate) fn ingest_source(ledger: &UsageLedger, source: Source) -> Result<(), String> {
     let source_name = source.to_string();
     // Scan incrementally using the server's ingest watermark, but never write
     // it here: brief ingests sessions only, so advancing the watermark would
@@ -863,6 +962,14 @@ fn ingest_source(ledger: &UsageLedger, source: Source) -> Result<(), String> {
         sources::load_source_view_since(&source_name, "sessions", true, watermark_ms)
             .map_err(|err| err.to_string())?;
     ledger.ingest_live_sessions(source, &sessions)?;
+    let messages = sources::load_source_view_since(
+        &source_name,
+        "messages",
+        true,
+        watermark_ms,
+    )
+    .map_err(|err| err.to_string())?;
+    ledger.ingest_live_messages(source, &messages)?;
     Ok(())
 }
 
@@ -905,6 +1012,81 @@ mod tests {
     use crate::protocol::BriefModelInfo;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn summarize_hours_uses_hourly_authority_for_tokens_and_presence() {
+        let usage_only = |session_id: &str, project: &str| ExtractedSession {
+            session_id: session_id.to_string(),
+            project: project.to_string(),
+            project_key: format!("codex:{project}"),
+            title: None,
+            user_texts: Vec::new(),
+            token_hint: 0,
+            usage_only: true,
+        };
+        let groups = BTreeMap::from([
+            (
+                9,
+                vec![("codex".to_string(), usage_only("s1", "alpha"), 999)],
+            ),
+            (
+                10,
+                vec![("codex".to_string(), usage_only("s2", "beta"), 111)],
+            ),
+        ]);
+        let authoritative = BTreeMap::from([(9, 150), (11, 25)]);
+        let llm = LlmConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "unused".into(),
+            model_id: "test".into(),
+        };
+        let mut errors = Vec::new();
+
+        let hours = summarize_hours(groups, &authoritative, &llm, &mut errors);
+
+        assert!(errors.is_empty());
+        assert_eq!(hours.len(), 2);
+        assert_eq!((hours[0].hour, hours[0].tokens), (9, 150));
+        assert_eq!((hours[1].hour, hours[1].tokens), (11, 25));
+        assert_eq!(hours[0].projects[0].project, "alpha");
+        assert!(hours[1].projects.is_empty());
+    }
+
+    #[test]
+    fn cached_brief_hours_are_reconciled_without_losing_narrative() {
+        let cached = vec![
+            TodayBriefHour {
+                hour: 9,
+                headline: "保留已有摘要".into(),
+                session_count: 3,
+                tokens: 999,
+                projects: vec![TodayBriefHourProject {
+                    source: "codex".into(),
+                    project: "alpha".into(),
+                    tokens: 999,
+                    session_count: 3,
+                    headline: String::new(),
+                }],
+            },
+            TodayBriefHour {
+                hour: 10,
+                headline: "应被移除".into(),
+                session_count: 1,
+                tokens: 111,
+                projects: Vec::new(),
+            },
+        ];
+        let authoritative = BTreeMap::from([(9, 150), (11, 25)]);
+
+        let hours = reconcile_brief_hours(Some(cached), &authoritative);
+
+        assert_eq!(hours.len(), 2);
+        assert_eq!((hours[0].hour, hours[0].tokens), (9, 150));
+        assert_eq!(hours[0].headline, "保留已有摘要");
+        assert_eq!(hours[0].projects[0].project, "alpha");
+        assert_eq!((hours[1].hour, hours[1].tokens), (11, 25));
+        assert_eq!(hours[1].headline, "仅有用量记录，无对话内容");
+    }
 
     #[test]
     fn force_false_returns_cached_ok_brief() {
@@ -986,6 +1168,21 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
 
         let today = local_today();
+        let ledger = UsageLedger::default().unwrap();
+        ledger
+            .ingest_live_sessions(
+                Source::Claude,
+                &[json!({
+                    "sessionId": "cached-hour-14",
+                    "date": today,
+                    "time": "14:00",
+                    "inputTokens": 150,
+                    "outputTokens": 50,
+                    "totalTokens": 200,
+                    "totalCost": 0.2,
+                })],
+            )
+            .unwrap();
         let cached = TodayBriefResponse {
             date: today.clone(),
             status: "ok".into(),

@@ -293,6 +293,12 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     var briefDays: [BriefDayEntry] { get }
     /// Month entries for the brief all view.
     var briefMonths: [BriefMonthEntry] { get }
+    /// Bound projects for daily report generation.
+    var projects: [ProjectBinding] { get }
+    /// Daily report for the currently focused (project, date) pair.
+    var dailyReport: DailyReport? { get }
+    var isGeneratingDailyReport: Bool { get }
+    var dailyReportError: String? { get }
 
     func refresh() async
     func refreshToday() async
@@ -305,6 +311,12 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     func loadBriefDays(month: String) async
     func loadBriefMonths() async
     func generateBrief(for date: String, mode: BriefRegenerateMode) async
+    func loadProjects() async
+    @discardableResult
+    func addProject(name: String, path: String) async -> Bool
+    func removeProject(name: String) async
+    func loadDailyReport(project: String, date: String) async
+    func generateDailyReport(project: String, date: String) async
     func updateDateRangeForViewMode()
 }
 
@@ -712,6 +724,15 @@ struct TokenUsageDashboardView<Store: TokenUsageDashboardProviding>: View {
             )
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .scrollIndicators(.visible)
+    }
+
+    private var dailyPage: some View {
+        ScrollView(.vertical) {
+            DailyReportPageView(store: store)
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .scrollIndicators(.visible)
     }
@@ -6065,6 +6086,10 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     @Published private(set) var briefMissingDates: Set<String> = []
     @Published private(set) var briefDays: [BriefDayEntry] = []
     @Published private(set) var briefMonths: [BriefMonthEntry] = []
+    @Published private(set) var projects: [ProjectBinding] = []
+    @Published private(set) var dailyReport: DailyReport?
+    @Published private(set) var isGeneratingDailyReport = false
+    @Published private(set) var dailyReportError: String?
     @Published private(set) var isLoading = false
     @Published private(set) var isGeneratingBrief = false
     @Published private(set) var briefErrorMessage: String?
@@ -6166,6 +6191,17 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     func loadBriefMonths() async {}
 
     func generateBrief(for date: String, mode: BriefRegenerateMode) async {}
+
+    func loadProjects() async {}
+
+    @discardableResult
+    func addProject(name: String, path: String) async -> Bool { false }
+
+    func removeProject(name: String) async {}
+
+    func loadDailyReport(project: String, date: String) async {}
+
+    func generateDailyReport(project: String, date: String) async {}
 
     func updateDateRangeForViewMode() {
         // Mock: no-op

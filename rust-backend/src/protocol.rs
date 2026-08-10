@@ -711,6 +711,79 @@ pub struct BriefMonthEntry {
     pub top_projects: Vec<String>,
 }
 
+/// A named binding between a display name and a local project path. The path
+/// is the authoritative identity: it drives both CLI session aggregation and
+/// the project's git history lookup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBinding {
+    pub name: String,
+    pub path: String,
+    pub added_at: String,
+}
+
+/// One completed work item of a daily report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyWorkItem {
+    pub title: String,
+    pub detail: String,
+}
+
+/// A generated daily work summary for one project on one date. Sessions from
+/// every supported CLI that worked under the project path are merged with the
+/// project's git commits for that day into a two-part narrative.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyReport {
+    pub date: String,
+    pub project: String,
+    pub path: String,
+    pub status: String,
+    /// 2–3 sentence overview of the day's work.
+    pub overview: String,
+    /// Completed work items; git commits are woven into the narrative.
+    pub work_items: Vec<DailyWorkItem>,
+    pub session_count: i64,
+    pub commit_count: i64,
+    pub token_total: i64,
+    /// Best matching tier used to attribute sessions: exact | decoded |
+    /// fallback | none.
+    pub coverage: String,
+    pub generated_at: String,
+    pub model: BriefModelInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyGenerateRequest {
+    /// Name of a bound project.
+    pub project: String,
+    /// Report date (YYYY-MM-DD). Defaults to today.
+    #[serde(default)]
+    pub date: Option<String>,
+    /// Regenerate even when a cached report exists.
+    #[serde(default)]
+    pub force: Option<bool>,
+    #[serde(default)]
+    pub model: Option<BriefModelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectsResponse {
+    pub projects: Vec<ProjectBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectUpsertRequest {
+    pub name: String,
+    pub path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::Source;

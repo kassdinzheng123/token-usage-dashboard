@@ -1,6 +1,7 @@
 pub mod brief;
 pub mod cache;
 pub mod cleanup;
+pub mod daily;
 pub mod ledger;
 pub mod pricing;
 pub mod protocol;

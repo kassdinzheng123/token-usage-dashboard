@@ -17,6 +17,11 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     @Published private(set) var briefMissingDates: Set<String> = []
     @Published private(set) var briefDays: [BriefDayEntry] = []
     @Published private(set) var briefMonths: [BriefMonthEntry] = []
+    @Published private(set) var projects: [ProjectBinding] = []
+    /// Daily report for the currently focused (project, date) pair.
+    @Published private(set) var dailyReport: DailyReport?
+    @Published private(set) var isGeneratingDailyReport = false
+    @Published private(set) var dailyReportError: String?
     @Published private(set) var isLoading = false
     @Published private(set) var isGeneratingBrief = false
     @Published private(set) var briefErrorMessage: String?
@@ -89,7 +94,11 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
             while !Task.isCancelled {
                 do {
                     _ = try await self?.client.fetchHealth()
-                    await MainActor.run { self?.isBackendConnected = true }
+                    let reconnected = await MainActor.run {
+                        let reconnected = self?.isBackendConnected == false
+                        self?.isBackendConnected = true
+                        return reconnected
+                    }
                     // If the initial load raced backend startup (or hit a
                     // transient failure), records would stay empty forever —
                     // nudge a reload whenever the backend is reachable and
@@ -99,7 +108,10 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
                         if self.records.isEmpty {
                             await self.refreshDashboard()
                         }
-                        if self.todayHourly == nil {
+                        if reconnected {
+                            self.hourlyByDate.removeAll()
+                            await self.refreshToday(force: true)
+                        } else if self.todayHourly == nil {
                             await self.refreshToday()
                         }
                     }
@@ -253,6 +265,85 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
         }
     }
 
+    // MARK: - Daily reports
+
+    func loadProjects() async {
+        do {
+            try await serverProcess.ensureRunning()
+            projects = try await client.fetchProjects()
+        } catch {
+            projects = []
+            dailyReportError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func addProject(name: String, path: String) async -> Bool {
+        do {
+            try await serverProcess.ensureRunning()
+            _ = try await client.addProject(name: name, path: path)
+            projects = try await client.fetchProjects()
+            dailyReportError = nil
+            return true
+        } catch {
+            dailyReportError = error.localizedDescription
+            return false
+        }
+    }
+
+    func removeProject(name: String) async {
+        do {
+            try await serverProcess.ensureRunning()
+            projects = try await client.removeProject(name: name)
+            if dailyReport?.project == name {
+                dailyReport = nil
+            }
+            dailyReportError = nil
+        } catch {
+            dailyReportError = error.localizedDescription
+        }
+    }
+
+    /// Loads the cached daily report for (project, date); nil clears the view.
+    func loadDailyReport(project: String, date: String) async {
+        guard !isGeneratingDailyReport else { return }
+        do {
+            try await serverProcess.ensureRunning()
+            dailyReport = try await client.fetchDailyReport(project: project, date: date)
+            dailyReportError = nil
+        } catch {
+            dailyReportError = error.localizedDescription
+        }
+    }
+
+    func generateDailyReport(project: String, date: String) async {
+        guard !isGeneratingDailyReport else { return }
+        isGeneratingDailyReport = true
+        dailyReportError = nil
+        defer { isGeneratingDailyReport = false }
+
+        let model = BriefModelConfig(
+            baseUrl: preferences.briefBaseURL,
+            apiKey: preferences.resolvedBriefApiKey,
+            modelId: preferences.briefModelId
+        )
+        do {
+            try await serverProcess.ensureRunning()
+            let report = try await client.generateDailyReport(
+                project: project,
+                date: date,
+                force: true,
+                model: model
+            )
+            dailyReport = report
+            if report.status != "ok" {
+                dailyReportError = report.error ?? "生成失败"
+            }
+        } catch {
+            dailyReportError = error.localizedDescription
+        }
+    }
+
     /// Regenerates the brief for a date. `mode` scopes the regeneration to
     /// the whole day, selected hours, or selected CLIs.
     func generateBrief(for date: String, mode: BriefRegenerateMode) async {
@@ -302,6 +393,7 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
                     nextAutoBriefAttempt = nil
                 }
             }
+            await forceRefreshHourly(for: date)
             if brief.status != "ok" {
                 briefErrorMessage = brief.error
             }
@@ -332,6 +424,8 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
                 model: model
             )
             todayBrief = brief
+            briefCache[brief.date] = brief
+            await forceRefreshHourly(for: brief.date)
             if brief.status == "ok" {
                 nextAutoBriefAttempt = nil
             } else {
@@ -455,9 +549,25 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
                     nextAutoBriefAttempt = Date().addingTimeInterval(15 * 60)
                 }
             }
+            await forceRefreshHourly(for: date)
         } catch {
             briefErrorMessage = error.localizedDescription
             nextAutoBriefAttempt = Date().addingTimeInterval(15 * 60)
+        }
+    }
+
+    /// Brief text and project metadata are generated separately, but the
+    /// Activity timeline must always be replaced with the authoritative
+    /// `/api/hourly` snapshot for the same date.
+    private func forceRefreshHourly(for date: String) async {
+        do {
+            let hourly = try await client.fetchHourly(date: date, refresh: true)
+            hourlyByDate[date] = hourly
+            if date == localDateString(for: Date()) {
+                todayHourly = hourly
+            }
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 

@@ -403,6 +403,66 @@ struct BriefMonthsResponse: Codable, Hashable {
     var months: [BriefMonthEntry]
 }
 
+/// A named binding between a display name and a local project path. The path
+/// is the authoritative identity for daily report aggregation and git lookup.
+struct ProjectBinding: Codable, Hashable, Identifiable {
+    var name: String
+    var path: String
+    var addedAt: String
+
+    var id: String { name }
+}
+
+struct ProjectsResponse: Codable, Hashable {
+    var projects: [ProjectBinding]
+}
+
+/// One completed work item of a daily report.
+struct DailyWorkItem: Codable, Hashable, Identifiable {
+    var title: String
+    var detail: String
+
+    var id: String { title }
+}
+
+/// A generated daily work summary for one project on one date.
+struct DailyReport: Codable, Hashable {
+    var date: String
+    var project: String
+    var path: String
+    var status: String
+    var overview: String
+    var workItems: [DailyWorkItem]
+    var sessionCount: Int
+    var commitCount: Int
+    var tokenTotal: Int
+    var coverage: String
+    var generatedAt: String
+    var model: BriefModelInfo
+    var error: String?
+
+    var coverageLabel: String {
+        switch coverage {
+        case "exact": "路径精确匹配"
+        case "decoded": "路径解码匹配"
+        case "fallback": "含按项目名近似匹配的会话"
+        default: "无会话"
+        }
+    }
+}
+
+struct DailyGenerateRequest: Encodable {
+    var project: String
+    var date: String?
+    var force: Bool?
+    var model: BriefModelConfig?
+}
+
+struct ProjectUpsertRequest: Encodable {
+    var name: String
+    var path: String
+}
+
 protocol UsageSummary: Codable, Hashable {
     var inputTokens: Int { get }
     var outputTokens: Int { get }

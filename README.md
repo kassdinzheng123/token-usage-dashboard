@@ -62,10 +62,32 @@ GET /api/health
 GET /api/refresh
 POST /api/sync
 GET /api/today
+GET /api/hourly
+GET /api/today/brief
+POST /api/daily/generate
+GET /api/daily/{project}/{date}
+GET /api/projects
+POST /api/projects
+DELETE /api/projects/{name}
 GET /api/{source}/{view}
 ```
 
 Supported `source` values include `claude`, `codex`, `opencode`, `hermes`, `openclaw`, `pi`, `grok`, `cursor`, `cherry`, `claude-science`, `zcode`, `kimi`, and `reasonix`. Supported `view` values include `daily`, `monthly`, `sessions`, and `blocks` where available.
+
+## Daily Reports
+
+Daily reports are project-scoped, not CLI-scoped: bind a display name to a local project path (`POST /api/projects` with `name` + `path`, or the **Daily** page in the app), then generate a report for a project and date. The report aggregates that day's sessions from every supported CLI that worked under the project path, reads the project's git commits authored that day, and merges both into a two-part narrative (今日概览 / 完成的工作) via the same local LLM the Brief feature uses. Cached reports live under `daily/<project>/<date>.json` next to the briefs directory.
+
+The headless CLI exposes the same operations:
+
+```bash
+cargo run --release --manifest-path rust-backend/Cargo.toml -- daily projects list
+cargo run --release --manifest-path rust-backend/Cargo.toml -- daily projects add --name token-usage --path ~/CodeSpace/token-usage
+cargo run --release --manifest-path rust-backend/Cargo.toml -- daily projects remove --name token-usage
+cargo run --release --manifest-path rust-backend/Cargo.toml -- daily generate --project token-usage --date 2026-08-05 --api-key "..."
+```
+
+`daily generate` accepts `--date` (defaults to today), `--force`, `--api-key` (or `TOKEN_USAGE_BRIEF_API_KEY`), `--model-url`, and `--model-id`. Session attribution is path-based: recorded cwd paths match exactly, Claude's encoded directories are decoded, and same-named directories fall back to a leaf-name match reported in the report's `coverage` field.
 
 ## Run Backend Tests
 

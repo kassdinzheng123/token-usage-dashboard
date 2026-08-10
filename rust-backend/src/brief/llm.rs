@@ -109,7 +109,7 @@ fn parse_hour_summary(content: &str) -> Result<String, String> {
         .ok_or_else(|| "LLM returned empty hour headline".to_string())
 }
 
-fn chat_completion_content(
+pub(crate) fn chat_completion_content(
     config: &LlmConfig,
     system: &str,
     user: &str,
@@ -177,7 +177,7 @@ fn parse_section_summary(content: &str) -> Result<SectionSummary, String> {
     Ok(summary)
 }
 
-fn extract_json_object(text: &str) -> Option<&str> {
+pub(crate) fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let mut depth = 0i32;
     for (offset, character) in text[start..].char_indices() {
@@ -204,7 +204,7 @@ fn chat_completions_url(base_url: &str) -> String {
     }
 }
 
-fn truncate(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
     let mut result = String::new();
     for (index, character) in text.chars().enumerate() {
         if index >= max_chars {

@@ -13,7 +13,12 @@ use std::{
     str::FromStr,
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
+// v2 is the first snapshot written after Codex cumulative-event and billing
+// corrections. v1 Codex rows are intentionally not importable because their
+// inflated totals cannot be lowered by the ledger's monotonic upserts.
+const CODEX_CORRECTED_FORMAT_VERSION: u32 = 2;
 const SYNC_DIRECTORY: &str = ".token-usage-sync/v1/devices";
 const MAX_SNAPSHOT_FILE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -237,6 +242,11 @@ pub fn import_from_git_repo(
                     line_index + 1
                 )
             })?;
+            if candidate.source == Source::Codex
+                && candidate.record.version < CODEX_CORRECTED_FORMAT_VERSION
+            {
+                continue;
+            }
             let key = record_key(&candidate.record);
             match merged.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -433,10 +443,10 @@ fn device_snapshot_paths(directory: &Path, device_id: &str) -> Result<Vec<PathBu
 }
 
 fn validate_record(mut record: SyncRecord) -> Result<Candidate, String> {
-    if record.version != FORMAT_VERSION {
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&record.version) {
         return Err(format!(
-            "unsupported format version {}; expected {FORMAT_VERSION}",
-            record.version
+            "unsupported format version {}; expected {MIN_SUPPORTED_FORMAT_VERSION}..={FORMAT_VERSION}",
+            record.version,
         ));
     }
     let source = Source::from_str(&record.source).map_err(|err| err.to_string())?;
@@ -554,7 +564,7 @@ fn validate_device_id(device_id: &str) -> Result<(), String> {
     }
 }
 
-fn git_repository_root(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn git_repository_root(path: &Path) -> Result<PathBuf, String> {
     if !path.is_dir() {
         return Err(format!(
             "git repository path is not a directory: {}",
@@ -853,6 +863,60 @@ mod tests {
             target_ledger
                 .load_view(Source::Codex, View::Sessions)
                 .expect("load repeated sessions")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn import_ignores_v1_codex_rows_but_keeps_v1_other_sources() {
+        let directory = TestDirectory::new("codex-v2-boundary");
+        let repository = directory.path().join("repo");
+        init_git_repository(&repository);
+        let devices = repository.join(SYNC_DIRECTORY);
+        fs::create_dir_all(&devices).expect("create devices");
+
+        let records = [
+            SyncRecord {
+                version: 1,
+                kind: RecordKind::Session,
+                source: "codex".to_string(),
+                row: session_row("shared", "2026-08-08", "10:00", 999),
+            },
+            SyncRecord {
+                version: 1,
+                kind: RecordKind::Session,
+                source: "claude".to_string(),
+                row: session_row("legacy-claude", "2026-08-08", "10:00", 20),
+            },
+            SyncRecord {
+                version: FORMAT_VERSION,
+                kind: RecordKind::Session,
+                source: "codex".to_string(),
+                row: session_row("shared", "2026-08-08", "10:00", 100),
+            },
+        ];
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize record"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(devices.join("mixed.jsonl"), contents).expect("write snapshot");
+
+        let target =
+            UsageLedger::new(directory.path().join("target.sqlite")).expect("target ledger");
+        let imported = import_from_git_repo(&target, &repository).expect("import snapshot");
+
+        assert_eq!(imported.sessions, 2);
+        let codex = target
+            .load_view(Source::Codex, View::Sessions)
+            .expect("load Codex rows");
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0]["totalTokens"], json!(100));
+        assert_eq!(
+            target
+                .load_view(Source::Claude, View::Sessions)
+                .expect("load Claude rows")
                 .len(),
             1
         );

@@ -15,6 +15,9 @@ const PI_DEV_MODELS_URL: &str = "https://pi.dev/models";
 const MILLION: f64 = 1_000_000.0;
 const PRICING_HTTP_TIMEOUT_SECS: u64 = 15;
 const PRICING_CACHE_FRESH_SECS: u64 = 24 * 60 * 60;
+// Codex flexible-pricing credits are sold at $0.04 each. Keep these rates
+// separate from API pricing: only the Codex source should use them.
+const CODEX_CREDIT_USD: f64 = 0.04;
 // 2026-09-01T00:00:00Z — Anthropic standard Sonnet 5 pricing starts here.
 const CLAUDE_SONNET_5_STANDARD_PRICING_START_SECS: u64 = 1_788_220_800;
 
@@ -81,6 +84,58 @@ pub fn model_cost_usd(model: &str, usage: TokenUsage) -> f64 {
     };
 
     sanitize_cost(cost_for_usage(usage, pricing))
+}
+
+/// Returns the dollar-equivalent cost of Codex flexible-pricing credits.
+///
+/// The Codex rate card is expressed as credits per million input, cached
+/// input, and output tokens. Cache writes are explicitly free. Unknown and
+/// legacy models fall back to the regular model price lookup.
+pub fn codex_model_cost_usd(model: &str, usage: TokenUsage) -> f64 {
+    if is_free_model(model) {
+        return 0.0;
+    }
+
+    let normalized = normalize_key(model);
+    let candidates = candidates_for(model);
+    let has = |name: &str| candidates.iter().any(|candidate| candidate == name);
+    let credit_rates = if normalized == "codex-auto-review" {
+        // The Codex rate card states that code review uses GPT-5.3-Codex.
+        Some((43.75, 4.375, 350.0))
+    } else if has("gpt-5.6-sol") || has("gpt-5-6-sol") || has("gpt-5.6") || has("gpt-5-6") {
+        Some((125.0, 12.5, 750.0))
+    } else if has("gpt-5.6-terra") || has("gpt-5-6-terra") {
+        Some((50.0, 5.0, 300.0))
+    } else if has("gpt-5.6-luna") || has("gpt-5-6-luna") {
+        Some((5.0, 0.5, 30.0))
+    } else if has("gpt-5.5-cyber") || has("gpt-5-5-cyber") {
+        Some((312.5, 31.25, 1_875.0))
+    } else if has("gpt-5.5") || has("gpt-5-5") {
+        Some((125.0, 12.5, 750.0))
+    } else if has("gpt-5.4-mini") || has("gpt-5-4-mini") {
+        Some((18.75, 1.875, 113.0))
+    } else if has("gpt-5.4") || has("gpt-5-4") {
+        Some((62.5, 6.25, 375.0))
+    } else if normalized.contains("gpt-5.3-codex")
+        && !normalized.contains("gpt-5.3-codex-spark")
+    {
+        Some((43.75, 4.375, 350.0))
+    } else if has("gpt-5.2") || has("gpt-5-2") || has("gpt-5.2-codex") || has("gpt-5-2-codex") {
+        Some((43.75, 4.375, 350.0))
+    } else {
+        None
+    };
+
+    let Some((input_credits, cached_input_credits, output_credits)) = credit_rates else {
+        return model_cost_usd(model, usage);
+    };
+    sanitize_cost(
+        (usage.input_tokens.max(0) as f64 * input_credits
+            + usage.cache_read_tokens.max(0) as f64 * cached_input_credits
+            + usage.output_tokens.max(0) as f64 * output_credits)
+            * CODEX_CREDIT_USD
+            / MILLION,
+    )
 }
 
 fn builtin_model_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
@@ -1160,6 +1215,31 @@ mod tests {
             model_cost_usd("openai/gpt-5.6-luna:medium", usage),
             model_cost_usd("gpt-5.6-luna", usage)
         );
+    }
+
+    #[test]
+    fn calculates_codex_credit_equivalent_rates_without_changing_api_rates() {
+        let all_token_types = usage(1_000_000, 1_000_000, 1_000_000, 1_000_000);
+
+        // 5 input + 0.5 cached-input + 30 output credits at $0.04/credit.
+        assert!((codex_model_cost_usd("gpt-5.6-luna", all_token_types) - 1.42).abs() < 1e-12);
+        assert_eq!(
+            codex_model_cost_usd("gpt-5.6-luna:medium", all_token_types),
+            codex_model_cost_usd("gpt-5.6-luna", all_token_types)
+        );
+        // Cache writes are not charged by Codex.
+        let cache_write_only = usage(0, 0, 1_000_000, 0);
+        assert_eq!(codex_model_cost_usd("gpt-5.6-luna", cache_write_only), 0.0);
+
+        // The same model keeps its API rate outside the Codex source.
+        assert!((model_cost_usd("gpt-5.6-luna", all_token_types) - 8.35).abs() < 1e-12);
+    }
+
+    #[test]
+    fn maps_codex_auto_review_to_gpt_53_codex_rate() {
+        let usage = usage(1_000_000, 1_000_000, 0, 1_000_000);
+        let expected = (43.75 + 4.375 + 350.0) * CODEX_CREDIT_USD;
+        assert!((codex_model_cost_usd("codex-auto-review", usage) - expected).abs() < 1e-12);
     }
 
     #[test]

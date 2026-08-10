@@ -191,43 +191,58 @@ impl UsageLedger {
     }
 
     /// Hourly usage for a single day, grouped by the local hour of each row's
-    /// `time` ("HH:MM"). Prefers message-level rows (`usage_messages`) so a
-    /// session's tokens are spread across the hours its messages actually
-    /// happened; sources without message rows fall back to session-level
-    /// attribution (whole session lands in the bucket of its recorded time).
+    /// `time` ("HH:MM"). Prefers message-level rows (`usage_messages`) per
+    /// session so its tokens are spread across the hours its messages actually
+    /// happened. Sessions without message rows fall back to session-level
+    /// attribution (the whole session lands in its recorded hour).
     pub fn load_hourly(&self, source: Source, date: &str) -> Result<Vec<Value>, String> {
         self.with_connection(|connection| {
             let source_name = source.to_string();
-            let has_messages: bool = connection
-                .query_row(
-                    "SELECT 1 FROM usage_messages WHERE source = ?1 LIMIT 1",
-                    params![&source_name],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-
-            let (table, cost_column) = if has_messages {
-                ("usage_messages", "cost")
-            } else {
-                ("usage_sessions", "total_cost")
-            };
-            let sql = format!(
+            let mut statement = connection.prepare(
                 r#"
+                WITH hourly_rows AS (
+                    SELECT time,
+                           input_tokens,
+                           output_tokens,
+                           cache_creation_tokens,
+                           cache_read_tokens,
+                           total_tokens,
+                           cost
+                    FROM usage_messages
+                    WHERE source = ?1 AND date = ?2
+
+                    UNION ALL
+
+                    SELECT session.time,
+                           session.input_tokens,
+                           session.output_tokens,
+                           session.cache_creation_tokens,
+                           session.cache_read_tokens,
+                           session.total_tokens,
+                           session.total_cost
+                    FROM usage_sessions AS session
+                    WHERE session.source = ?1 AND session.date = ?2
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM usage_messages AS message
+                          WHERE message.source = session.source
+                            AND message.date = session.date
+                            AND message.session_id = session.session_id
+                      )
+                )
                 SELECT CAST(substr(time, 1, 2) AS INTEGER) AS hour,
                        SUM(input_tokens),
                        SUM(output_tokens),
                        SUM(cache_creation_tokens),
                        SUM(cache_read_tokens),
                        SUM(total_tokens),
-                       SUM({cost_column})
-                FROM {table}
-                WHERE source = ?1 AND date = ?2 AND length(time) >= 2
+                       SUM(cost)
+                FROM hourly_rows
+                WHERE length(time) >= 2
                 GROUP BY hour
                 ORDER BY hour
-                "#
-            );
-            let mut statement = connection.prepare(&sql)?;
+                "#,
+            )?;
             let rows = statement.query_map(params![&source_name, date], |row| {
                 Ok(json!({
                     "hour": row.get::<_, i64>(0)?,
@@ -1082,8 +1097,9 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     migrate_block_model_breakdowns(connection)?;
     migrate_pi_workflow_agent_breakdowns(connection)?;
     migrate_pi_nested_session_ids(connection)?;
+    migrate_codex_billing_rebuild(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '8')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '10')",
         [],
     )?;
     Ok(())
@@ -1260,6 +1276,37 @@ fn migrate_pi_nested_session_ids(connection: &mut Connection) -> Result<(), rusq
     transaction.execute("DELETE FROM ingest_state WHERE source = 'pi'", [])?;
     transaction.execute(
         "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '8')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Schema v10 corrects Codex credit pricing and repeated token-count events,
+/// and establishes the v2 sync boundary that rejects inflated v1 Codex rows.
+/// Existing rows cannot safely be lowered by the monotonic upsert path, so
+/// clear only Codex-derived data and its watermark for one complete rescan.
+fn migrate_codex_billing_rebuild(connection: &mut Connection) -> Result<(), rusqlite::Error> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 10 {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM usage_sessions WHERE source = 'codex'", [])?;
+    transaction.execute("DELETE FROM usage_blocks WHERE source = 'codex'", [])?;
+    transaction.execute("DELETE FROM usage_messages WHERE source = 'codex'", [])?;
+    transaction.execute("DELETE FROM ingest_state WHERE source = 'codex'", [])?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '10')",
         [],
     )?;
     transaction.commit()?;
@@ -1912,7 +1959,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "8");
+        assert_eq!(schema_version, "10");
     }
 
     #[test]
@@ -2006,7 +2053,7 @@ mod tests {
     fn v7_migration_rebuilds_pi_rows_and_preserves_other_sources() {
         let ledger = test_ledger();
         let path = ledger.path.clone();
-        for source in [Source::Pi, Source::Codex] {
+        for source in [Source::Pi, Source::Claude] {
             ledger
                 .ingest_live_sessions(
                     source,
@@ -2045,8 +2092,8 @@ mod tests {
 
         assert!(!migrated.has_source_rows(Source::Pi).unwrap());
         assert_eq!(migrated.ingest_watermark(Source::Pi).unwrap(), None);
-        assert!(migrated.has_source_rows(Source::Codex).unwrap());
-        assert_eq!(migrated.ingest_watermark(Source::Codex).unwrap(), Some(1_000));
+        assert!(migrated.has_source_rows(Source::Claude).unwrap());
+        assert_eq!(migrated.ingest_watermark(Source::Claude).unwrap(), Some(1_000));
         let message_counts: (i64, i64) = migrated
             .with_connection(|connection| {
                 Ok((
@@ -2056,7 +2103,7 @@ mod tests {
                         |row| row.get(0),
                     )?,
                     connection.query_row(
-                        "SELECT COUNT(*) FROM usage_messages WHERE source = 'codex'",
+                        "SELECT COUNT(*) FROM usage_messages WHERE source = 'claude'",
                         [],
                         |row| row.get(0),
                     )?,
@@ -2136,7 +2183,76 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "8");
+        assert_eq!(schema_version, "10");
+    }
+
+    #[test]
+    fn v10_migration_rebuilds_only_codex_rows() {
+        let ledger = test_ledger();
+        let path = ledger.path.clone();
+        for source in [Source::Codex, Source::Claude] {
+            let source_name = source.to_string();
+            ledger
+                .ingest_live_sessions(
+                    source,
+                    &[json!({
+                        "sessionId": format!("{source_name}-session"),
+                        "date": "2026-08-09",
+                        "totalTokens": 100,
+                    })],
+                )
+                .unwrap();
+            ledger
+                .ingest_live_blocks(
+                    source,
+                    &[json!({
+                        "blockId": format!("{source_name}-block"),
+                        "sessionId": format!("{source_name}-session"),
+                        "date": "2026-08-09",
+                        "totalTokens": 100,
+                    })],
+                )
+                .unwrap();
+            ledger
+                .ingest_live_messages(
+                    source,
+                    &[json!({
+                        "messageId": format!("{source_name}-message"),
+                        "sessionId": format!("{source_name}-session"),
+                        "date": "2026-08-09",
+                        "totalTokens": 100,
+                    })],
+                )
+                .unwrap();
+        }
+        ledger.record_ingest_watermark(Source::Codex, 1_000).unwrap();
+        ledger
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE ledger_meta SET value = '8' WHERE key = 'schema_version'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(ledger);
+
+        let migrated = UsageLedger::new(path).unwrap();
+        assert!(!migrated.has_source_rows(Source::Codex).unwrap());
+        assert_eq!(migrated.ingest_watermark(Source::Codex).unwrap(), None);
+        assert!(migrated.has_source_rows(Source::Claude).unwrap());
+        let codex_messages = migrated.load_message_sync_rows(Source::Codex).unwrap();
+        assert!(codex_messages.is_empty());
+        let schema_version: String = migrated
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(schema_version, "10");
     }
 
     #[test]
@@ -2225,6 +2341,33 @@ mod tests {
         assert_eq!(hourly[0]["totalCost"], 0.1);
         assert_eq!(hourly[1]["hour"], 16);
         assert_eq!(hourly[1]["totalTokens"], 60);
+
+        // A different session without message rows must still fall back to
+        // its session-level hour; message coverage is decided per session,
+        // not once for the entire source.
+        ledger
+            .upsert_view_rows(
+                source,
+                View::Sessions,
+                &[json!({
+                    "sessionId": "s2",
+                    "date": "2026-07-17",
+                    "time": "18:30",
+                    "inputTokens": 20,
+                    "outputTokens": 5,
+                    "cacheCreationTokens": 0,
+                    "cacheReadTokens": 0,
+                    "totalTokens": 25,
+                    "totalCost": 0.03,
+                })],
+            )
+            .unwrap();
+
+        let hourly = ledger.load_hourly(source, "2026-07-17").unwrap();
+        assert_eq!(hourly.len(), 3);
+        assert_eq!(hourly[2]["hour"], 18);
+        assert_eq!(hourly[2]["totalTokens"], 25);
+        assert_eq!(hourly[2]["totalCost"], 0.03);
     }
 
     #[test]

@@ -1,10 +1,12 @@
 use crate::{
     brief,
     cache::UsageCache,
+    daily,
     ledger::UsageLedger,
     protocol::{
-        BriefGenerateRequest, HourlyResponse, HourlyRow, RefreshResponse, Source, TodayModelRow,
-        TodayResponse, TodaySourceRow, View, ALL_TASKS,
+        BriefGenerateRequest, DailyGenerateRequest, HourlyResponse, HourlyRow, ProjectUpsertRequest,
+        ProjectsResponse, RefreshResponse, Source, TodayModelRow, TodayResponse, TodaySourceRow,
+        View, ALL_TASKS,
     },
     sources, sync,
 };
@@ -583,6 +585,13 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/brief/days", get(brief_days_handler))
         .route("/api/brief/months", get(brief_months_handler))
         .route("/api/brief/{date}", get(brief_date_get_handler))
+        .route(
+            "/api/projects",
+            get(projects_get_handler).post(projects_post_handler),
+        )
+        .route("/api/projects/{name}", axum::routing::delete(projects_delete_handler))
+        .route("/api/daily/generate", axum::routing::post(daily_generate_handler))
+        .route("/api/daily/{project}/{date}", get(daily_get_handler))
         .route("/api/{source}/{view}", get(source_view_handler))
         .layer(CompressionLayer::new())
         .with_state(state)
@@ -809,6 +818,93 @@ async fn brief_days_handler(Query(query): Query<BriefDaysQuery>) -> Response {
 async fn brief_months_handler() -> Response {
     match tokio::task::spawn_blocking(brief::all_months).await {
         Ok(Ok(months)) => (StatusCode::OK, Json(json!({ "months": months }))).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn projects_get_handler() -> Response {
+    match tokio::task::spawn_blocking(daily::projects::list_projects).await {
+        Ok(Ok(projects)) => (StatusCode::OK, Json(ProjectsResponse { projects })).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn projects_post_handler(Json(request): Json<ProjectUpsertRequest>) -> Response {
+    let name = request.name.trim().to_string();
+    let path = request.path.trim().to_string();
+    match tokio::task::spawn_blocking(move || daily::projects::upsert_project(&name, &path)).await {
+        Ok(Ok(binding)) => (StatusCode::OK, Json(binding)).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn projects_delete_handler(Path(name): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || daily::projects::remove_project(&name)).await {
+        Ok(Ok(projects)) => (StatusCode::OK, Json(ProjectsResponse { projects })).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn daily_generate_handler(Json(request): Json<DailyGenerateRequest>) -> Response {
+    match tokio::task::spawn_blocking(move || daily::generate_daily_report(request)).await {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn daily_get_handler(Path((project, date)): Path<(String, String)>) -> Response {
+    match tokio::task::spawn_blocking(move || daily::store::load_report(&project, &date)).await {
+        Ok(Ok(Some(report))) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "status": "missing" })),
+        )
+            .into_response(),
         Ok(Err(message)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "status": "error", "error": message })),

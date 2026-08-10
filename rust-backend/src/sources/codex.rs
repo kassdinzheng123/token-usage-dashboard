@@ -1,4 +1,4 @@
-use crate::pricing::{model_cost_usd, TokenUsage};
+use crate::pricing::{codex_model_cost_usd, TokenUsage};
 use chrono::{DateTime, Local, NaiveDate};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
@@ -42,7 +42,7 @@ impl TryFrom<&str> for SourceView {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RawUsage {
     input_tokens: i64,
     cached_input_tokens: i64,
@@ -358,11 +358,13 @@ fn append_events_from_file(
             if let Some(provider) = extract_provider(payload) {
                 current_provider = Some(provider);
             }
-            if payload
-                .get("forked_from_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_some_and(|id| !id.is_empty())
+            if ["forked_from_id", "parent_thread_id"].iter().any(|field| {
+                payload
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|id| !id.is_empty())
+            })
             {
                 is_forked_rollout = true;
             }
@@ -411,12 +413,19 @@ fn append_events_from_file(
         let usage_scope = usage_scope(current_provider.as_deref(), payload);
 
         let raw_usage = match (last_usage, total_usage) {
-            (Some(last), total) => {
-                if let Some(total) = total {
-                    previous_totals_by_scope.insert(usage_scope.clone(), total);
+            (Some(last), Some(total)) => {
+                let previous = previous_totals_by_scope.get(&usage_scope).copied();
+                previous_totals_by_scope.insert(usage_scope.clone(), total);
+                // Codex may emit the same last-turn usage repeatedly while its
+                // cumulative total is unchanged. Count the turn only when the
+                // cumulative counter advances (or resets to a different value).
+                if previous == Some(total) {
+                    Some(RawUsage::default())
+                } else {
+                    Some(last)
                 }
-                Some(last)
             }
+            (Some(last), None) => Some(last),
             (None, Some(total)) => {
                 let previous_totals = previous_totals_by_scope.get(&usage_scope).copied();
                 let delta = subtract_raw_usage(total, previous_totals);
@@ -536,7 +545,7 @@ fn push_token_usage_event(
     let cost = if pending_event.explicit_cost > 0.0 {
         pending_event.explicit_cost
     } else {
-        model_cost_usd(
+        codex_model_cost_usd(
             if is_fallback_model {
                 FALLBACK_PRICING_MODEL
             } else {
@@ -1275,6 +1284,27 @@ pub mod tests {
         // totalTokens unchanged: 170+110 = 280
         assert_eq!(rows[0]["totalTokens"], 280);
         assert_eq!(rows[0]["modelsUsed"], json!(["gpt-5-codex", "gpt-5-mini"]));
+    }
+
+    #[test]
+    fn skips_repeated_last_usage_when_cumulative_total_is_unchanged() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = TestCodexHome::new();
+        let turn = usage(120, 50);
+        fixture.write_session(
+            "repeated-last-usage.jsonl",
+            &[
+                turn_context("gpt-5.6-luna", "2026-08-09"),
+                token_count("2026-08-09T10:00:00.000Z", &turn, &turn),
+                token_count("2026-08-09T10:00:01.000Z", &turn, &turn),
+            ],
+        );
+
+        let rows = load_source_view("blocks", false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["inputTokens"], 120);
+        assert_eq!(rows[0]["outputTokens"], 50);
+        assert_eq!(rows[0]["totalTokens"], 170);
     }
 
     #[test]
@@ -2035,7 +2065,7 @@ pub mod tests {
         fixture.write_session(
             "rollout-2026-06-09T20-46-23-fork.jsonl",
             &[
-                session_meta_forked("gpt-5.5"),
+                session_meta_parent_thread("gpt-5.5"),
                 turn_context("gpt-5.5", "2026-06-09"),
                 token_count("2026-06-09T20:46:23.100Z", &r0, &cum(&[&r0])),
                 token_count("2026-06-09T20:46:23.101Z", &r1, &cum(&[&r0, &r1])),
@@ -2220,6 +2250,17 @@ pub mod tests {
             "type": "session_meta",
             "payload": {
                 "forked_from_id": "019e095c-c041-7b40-b7cb-43ddb153086c",
+                "model": model
+            }
+        })
+    }
+
+    fn session_meta_parent_thread(model: &str) -> Value {
+        json!({
+            "timestamp": "2026-06-09T20:46:23.000Z",
+            "type": "session_meta",
+            "payload": {
+                "parent_thread_id": "019e095c-c041-7b40-b7cb-43ddb153086c",
                 "model": model
             }
         })
