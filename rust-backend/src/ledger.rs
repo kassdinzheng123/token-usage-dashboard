@@ -1098,8 +1098,9 @@ fn init_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
     migrate_pi_workflow_agent_breakdowns(connection)?;
     migrate_pi_nested_session_ids(connection)?;
     migrate_codex_billing_rebuild(connection)?;
+    migrate_pi_subagent_accounting(connection)?;
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '10')",
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '11')",
         [],
     )?;
     Ok(())
@@ -1307,6 +1308,36 @@ fn migrate_codex_billing_rebuild(connection: &mut Connection) -> Result<(), rusq
     transaction.execute("DELETE FROM ingest_state WHERE source = 'codex'", [])?;
     transaction.execute(
         "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '10')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Schema v11 counts persisted Pi subagent transcripts under their parent
+/// session and ignores the duplicate aggregate copied into the tool result.
+/// Rebuild all Pi-derived rows because monotonic upserts cannot remove the old
+/// child sessions or lower the previously doubled parent totals.
+fn migrate_pi_subagent_accounting(connection: &mut Connection) -> Result<(), rusqlite::Error> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    if version >= 11 {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM usage_sessions WHERE source = 'pi'", [])?;
+    transaction.execute("DELETE FROM usage_messages WHERE source = 'pi'", [])?;
+    transaction.execute("DELETE FROM ingest_state WHERE source = 'pi'", [])?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('schema_version', '11')",
         [],
     )?;
     transaction.commit()?;
@@ -1959,7 +1990,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "10");
+        assert_eq!(schema_version, "11");
     }
 
     #[test]
@@ -2116,7 +2147,6 @@ mod tests {
     #[test]
     fn v8_migration_removes_only_generic_pi_session_rows() {
         let ledger = test_ledger();
-        let path = ledger.path.clone();
         ledger
             .ingest_live_sessions(
                 Source::Pi,
@@ -2163,18 +2193,18 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        drop(ledger);
+        ledger
+            .with_connection(migrate_pi_nested_session_ids)
+            .unwrap();
 
-        let migrated = UsageLedger::new(path).unwrap();
-
-        assert_eq!(migrated.ingest_watermark(Source::Pi).unwrap(), None);
-        let sessions = migrated.load_view(Source::Pi, View::Sessions).unwrap();
+        assert_eq!(ledger.ingest_watermark(Source::Pi).unwrap(), None);
+        let sessions = ledger.load_view(Source::Pi, View::Sessions).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["sessionId"], "real-pi-session");
-        let messages = migrated.load_message_sync_rows(Source::Pi).unwrap();
+        let messages = ledger.load_message_sync_rows(Source::Pi).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["messageId"], "real-message");
-        let schema_version: String = migrated
+        let schema_version: String = ledger
             .with_connection(|connection| {
                 connection.query_row(
                     "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
@@ -2183,7 +2213,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "10");
+        assert_eq!(schema_version, "8");
     }
 
     #[test]
@@ -2252,7 +2282,71 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema_version, "10");
+        assert_eq!(schema_version, "11");
+    }
+
+    #[test]
+    fn v11_migration_rebuilds_only_pi_rows() {
+        let ledger = test_ledger();
+        let path = ledger.path.clone();
+        for source in [Source::Pi, Source::Claude] {
+            let source_name = source.to_string();
+            ledger
+                .ingest_live_sessions(
+                    source,
+                    &[json!({
+                        "sessionId": format!("{source_name}-session"),
+                        "date": "2026-08-14",
+                        "totalTokens": 100,
+                    })],
+                )
+                .unwrap();
+            ledger
+                .ingest_live_messages(
+                    source,
+                    &[json!({
+                        "messageId": format!("{source_name}-message"),
+                        "sessionId": format!("{source_name}-session"),
+                        "date": "2026-08-14",
+                        "totalTokens": 100,
+                    })],
+                )
+                .unwrap();
+            ledger.record_ingest_watermark(source, 1_000).unwrap();
+        }
+        ledger
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE ledger_meta SET value = '10' WHERE key = 'schema_version'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(ledger);
+
+        let migrated = UsageLedger::new(path).unwrap();
+        assert!(!migrated.has_source_rows(Source::Pi).unwrap());
+        assert_eq!(migrated.ingest_watermark(Source::Pi).unwrap(), None);
+        assert!(migrated
+            .load_message_sync_rows(Source::Pi)
+            .unwrap()
+            .is_empty());
+        assert!(migrated.has_source_rows(Source::Claude).unwrap());
+        assert_eq!(
+            migrated.ingest_watermark(Source::Claude).unwrap(),
+            Some(1_000)
+        );
+        let schema_version: String = migrated
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT value FROM ledger_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(schema_version, "11");
     }
 
     #[test]

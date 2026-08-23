@@ -719,6 +719,11 @@ pub struct BriefMonthEntry {
 pub struct ProjectBinding {
     pub name: String,
     pub path: String,
+    /// Additional project paths attributed to this binding (e.g. alternate
+    /// checkouts). Sessions under any alias are aggregated into the same daily
+    /// report; git commits are still read from the primary `path`.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub added_at: String,
 }
 
@@ -782,6 +787,32 @@ pub struct ProjectsResponse {
 pub struct ProjectUpsertRequest {
     pub name: String,
     pub path: String,
+}
+
+/// A project path discovered from recorded CLI sessions but not yet bound.
+/// `sources` lists the CLIs that produced sessions under the path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredProject {
+    pub path: String,
+    pub suggested_name: String,
+    pub sources: Vec<String>,
+    pub session_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredProjectsResponse {
+    pub projects: Vec<DiscoveredProject>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMergeRequest {
+    /// Name of the binding to fold into `target` and then remove.
+    pub source: String,
+    /// Name of the binding that absorbs the source's paths.
+    pub target: String,
 }
 
 #[cfg(test)]

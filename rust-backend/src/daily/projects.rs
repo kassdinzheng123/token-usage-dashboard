@@ -1,10 +1,7 @@
 use crate::protocol::ProjectBinding;
 use chrono::{Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 const PROJECTS_PATH_ENV: &str = "TOKEN_USAGE_PROJECTS_PATH";
 const APP_SUPPORT_DIR: &str = "Library/Application Support/Token Usage Dashboard";
@@ -34,8 +31,7 @@ fn load_file() -> Result<ProjectsFile, String> {
     }
     let text = fs::read_to_string(&path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    serde_json::from_str(&text)
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+    serde_json::from_str(&text).map_err(|err| format!("failed to parse {}: {err}", path.display()))
 }
 
 fn save_file(file: &ProjectsFile) -> Result<PathBuf, String> {
@@ -65,41 +61,180 @@ pub fn find_project(name: &str) -> Result<Option<ProjectBinding>, String> {
 /// path is made absolute without canonicalizing (macOS resolves `/var` to
 /// `/private/var`, which would not match the paths CLIs record). The name
 /// must be a safe filesystem token because it becomes the daily report cache
-/// directory name.
+/// directory name. Existing aliases are preserved when re-binding the same
+/// name; an alias equal to the new primary path is dropped to avoid a path
+/// matching itself twice.
 pub fn upsert_project(name: &str, path: &str) -> Result<ProjectBinding, String> {
     let name = name.trim().to_string();
     validate_name(&name)?;
-    let raw = path.trim();
-    if raw.is_empty() {
-        return Err("project path is required".to_string());
-    }
-    let expanded = expand_home(raw);
-    let expanded = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir()
-            .map_err(|err| format!("failed to resolve current directory: {err}"))?
-            .join(expanded)
-    };
-    if !expanded.is_dir() {
-        return Err(format!(
-            "project path is not a directory: {}",
-            expanded.display()
-        ));
-    }
-    let binding = ProjectBinding {
+    let resolved = resolve_project_path(path)?;
+
+    let mut file = load_file()?;
+    let template = ProjectBinding {
         name: name.clone(),
-        path: expanded.to_string_lossy().into_owned(),
+        path: resolved.clone(),
+        aliases: Vec::new(),
         added_at: Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
     };
-    let mut file = load_file()?;
-    match file.projects.iter_mut().find(|entry| entry.name == name) {
-        Some(entry) => *entry = binding.clone(),
-        None => file.projects.push(binding.clone()),
-    }
-    file.projects.sort_by(|left, right| left.name.cmp(&right.name));
+    let binding = match file.projects.iter_mut().find(|entry| entry.name == name) {
+        Some(entry) => {
+            let preserved: Vec<String> = entry
+                .aliases
+                .iter()
+                .filter(|alias| normalize_path(alias) != normalize_path(&resolved))
+                .cloned()
+                .collect();
+            let mut next = template.clone();
+            next.aliases = preserved;
+            next.added_at = entry.added_at.clone();
+            *entry = next.clone();
+            next
+        }
+        None => {
+            file.projects.push(template.clone());
+            template
+        }
+    };
+    file.projects
+        .sort_by(|left, right| left.name.cmp(&right.name));
     save_file(&file)?;
     Ok(binding)
+}
+
+/// Adds `alias_path` as an alias of the bound project. The path must be an
+/// existing directory distinct from the primary path and existing aliases.
+pub fn add_alias(name: &str, alias_path: &str) -> Result<ProjectBinding, String> {
+    let name = name.trim().to_string();
+    let alias = resolve_project_path(alias_path)?;
+    let alias_norm = normalize_path(&alias);
+
+    let mut file = load_file()?;
+    let updated = {
+        let binding = file
+            .projects
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| format!("no such project: {name}"))?;
+        if normalize_path(&binding.path) == alias_norm {
+            return Err("alias is already the primary path".to_string());
+        }
+        if binding
+            .aliases
+            .iter()
+            .any(|existing| normalize_path(existing) == alias_norm)
+        {
+            return Ok(binding.clone());
+        }
+        binding.aliases.push(alias);
+        binding.clone()
+    };
+    save_file(&file)?;
+    Ok(updated)
+}
+
+/// Removes an alias from the bound project. No-op (returns the binding) if
+/// the path is not a registered alias; errors if it is the primary path.
+pub fn remove_alias(name: &str, alias_path: &str) -> Result<ProjectBinding, String> {
+    let name = name.trim().to_string();
+    let alias_norm = normalize_path(alias_path.trim());
+    if alias_norm.is_empty() {
+        return Err("alias path is required".to_string());
+    }
+    let mut file = load_file()?;
+    let updated = {
+        let binding = file
+            .projects
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| format!("no such project: {name}"))?;
+        if normalize_path(&binding.path) == alias_norm {
+            return Err("cannot remove the primary path; remove the project instead".to_string());
+        }
+        let before = binding.aliases.len();
+        binding
+            .aliases
+            .retain(|existing| normalize_path(existing) != alias_norm);
+        if binding.aliases.len() == before {
+            return Ok(binding.clone());
+        }
+        binding.clone()
+    };
+    save_file(&file)?;
+    Ok(updated)
+}
+
+/// Folds the `source` binding into `target`: the source's primary path and
+/// aliases become aliases of `target`, then the source binding is removed.
+/// Paths already covered by `target` (primary or existing aliases) are
+/// skipped. Cached daily reports under the source name are reassigned to the
+/// target so their history is preserved.
+pub fn merge_projects(source: &str, target: &str) -> Result<Vec<ProjectBinding>, String> {
+    let source = source.trim();
+    let target = target.trim();
+    if source.is_empty() || target.is_empty() {
+        return Err("source and target names are required".to_string());
+    }
+    if source == target {
+        return Err("source and target must be different projects".to_string());
+    }
+
+    let mut file = load_file()?;
+    let source_binding = file
+        .projects
+        .iter()
+        .find(|entry| entry.name == source)
+        .cloned()
+        .ok_or_else(|| format!("no such project: {source}"))?;
+    if !file.projects.iter().any(|entry| entry.name == target) {
+        return Err(format!("no such project: {target}"));
+    }
+
+    // Collect the source's full path set, deduplicated and normalized-collapsed.
+    let mut incoming: Vec<String> = Vec::with_capacity(1 + source_binding.aliases.len());
+    let push_unique = |path: String, list: &mut Vec<String>| {
+        let norm = normalize_path(&path);
+        if norm.is_empty() {
+            return;
+        }
+        if !list.iter().any(|existing| normalize_path(existing) == norm) {
+            list.push(path);
+        }
+    };
+    push_unique(source_binding.path, &mut incoming);
+    for alias in &source_binding.aliases {
+        push_unique(alias.clone(), &mut incoming);
+    }
+
+    for entry in file.projects.iter_mut() {
+        if entry.name != target {
+            continue;
+        }
+        for path in &incoming {
+            let norm = normalize_path(path);
+            if norm == normalize_path(&entry.path) {
+                continue;
+            }
+            if entry
+                .aliases
+                .iter()
+                .any(|existing| normalize_path(existing) == norm)
+            {
+                continue;
+            }
+            entry.aliases.push(path.clone());
+        }
+        break;
+    }
+
+    file.projects.retain(|entry| entry.name != source);
+    file.projects
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    save_file(&file)?;
+
+    // Preserve cached reports: move <source>/<date>.json into <target>/.
+    let _ = super::store::reassign_project_reports(source, target);
+
+    Ok(file.projects)
 }
 
 pub fn remove_project(name: &str) -> Result<Vec<ProjectBinding>, String> {
@@ -129,6 +264,34 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves a user-supplied path to an absolute, non-canonicalized string
+/// and verifies it is an existing directory.
+fn resolve_project_path(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("project path is required".to_string());
+    }
+    let expanded = expand_home(trimmed);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(expanded)
+    };
+    if !absolute.is_dir() {
+        return Err(format!(
+            "project path is not a directory: {}",
+            absolute.display()
+        ));
+    }
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
+pub(crate) fn normalize_path(path: &str) -> String {
+    path.trim().trim_end_matches('/').to_string()
+}
+
 fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -146,7 +309,7 @@ mod tests {
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    fn temp_paths() -> (PathBuf, PathBuf) {
+    fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -154,20 +317,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("token-usage-projects-{stamp}"));
         let projects_file = dir.join("projects.json");
         let project_dir = dir.join("token-usage");
+        let alias_dir = dir.join("token-usage-worktree");
         fs::create_dir_all(&project_dir).unwrap();
-        (projects_file, project_dir)
+        fs::create_dir_all(&alias_dir).unwrap();
+        (projects_file, project_dir, alias_dir)
     }
 
     #[test]
     fn upsert_lists_and_removes_bindings() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let (file, dir) = temp_paths();
+        let (file, dir, _alias) = temp_paths();
         let previous = std::env::var_os(PROJECTS_PATH_ENV);
         std::env::set_var(PROJECTS_PATH_ENV, &file);
 
         let binding = upsert_project("token-usage", dir.to_str().unwrap()).unwrap();
         assert_eq!(binding.name, "token-usage");
         assert!(binding.path.ends_with("token-usage"));
+        assert!(binding.aliases.is_empty());
 
         // Upserting an existing name updates its path in place.
         let other = dir.parent().unwrap();
@@ -185,6 +351,61 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].name, "summer");
         assert!(remove_project("missing").is_err());
+
+        restore_env(PROJECTS_PATH_ENV, previous);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn add_and_remove_aliases() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let (file, dir, alias_dir) = temp_paths();
+        let previous = std::env::var_os(PROJECTS_PATH_ENV);
+        std::env::set_var(PROJECTS_PATH_ENV, &file);
+
+        upsert_project("token-usage", dir.to_str().unwrap()).unwrap();
+        let binding = add_alias("token-usage", alias_dir.to_str().unwrap()).unwrap();
+        assert_eq!(binding.aliases.len(), 1);
+        assert!(binding.aliases[0].ends_with("token-usage-worktree"));
+
+        // Idempotent: adding the same alias again is a no-op.
+        let again = add_alias("token-usage", alias_dir.to_str().unwrap()).unwrap();
+        assert_eq!(again.aliases.len(), 1);
+
+        // The primary path cannot become an alias.
+        assert!(add_alias("token-usage", dir.to_str().unwrap()).is_err());
+
+        let removed = remove_alias("token-usage", alias_dir.to_str().unwrap()).unwrap();
+        assert!(removed.aliases.is_empty());
+        // Removing the primary path via remove_alias is rejected.
+        assert!(remove_alias("token-usage", dir.to_str().unwrap()).is_err());
+
+        restore_env(PROJECTS_PATH_ENV, previous);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn merge_folds_source_paths_into_target_aliases() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let (file, dir, alias_dir) = temp_paths();
+        let previous = std::env::var_os(PROJECTS_PATH_ENV);
+        std::env::set_var(PROJECTS_PATH_ENV, &file);
+
+        upsert_project("alpha", dir.to_str().unwrap()).unwrap();
+        upsert_project("beta", alias_dir.to_str().unwrap()).unwrap();
+
+        let remaining = merge_projects("beta", "alpha").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "alpha");
+        assert!(remaining[0]
+            .aliases
+            .iter()
+            .any(|alias| alias.ends_with("token-usage-worktree")));
+        assert!(find_project("beta").unwrap().is_none());
+
+        // Merging a missing source or self is rejected.
+        assert!(merge_projects("beta", "alpha").is_err());
+        assert!(merge_projects("alpha", "alpha").is_err());
 
         restore_env(PROJECTS_PATH_ENV, previous);
         let _ = fs::remove_dir_all(dir.parent().unwrap());

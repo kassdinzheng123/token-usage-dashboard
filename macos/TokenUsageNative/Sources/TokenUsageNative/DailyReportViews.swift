@@ -234,7 +234,9 @@ struct DailyReportPageView<Store: TokenUsageDashboardProviding>: View {
     }
 }
 
-/// Sheet for managing project bindings: upsert by name + path, delete rows.
+/// Sheet for managing project bindings: upsert by name + path, discover
+/// unbound projects from recorded CLI sessions, show aliases, and merge one
+/// binding into another.
 private struct ProjectBindingEditor<Store: TokenUsageDashboardProviding>: View {
     @ObservedObject var store: Store
     @Environment(\.dismiss) private var dismiss
@@ -253,7 +255,7 @@ private struct ProjectBindingEditor<Store: TokenUsageDashboardProviding>: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("项目绑定")
                 .font(.headline)
-            Text("名称用于展示与选择；路径用于聚合该目录下所有 CLI 的会话，并读取其中的 git 提交。")
+            Text("名称用于展示与选择；路径用于聚合该目录下所有 CLI 的会话，并读取其中的 git 提交。合并会将一个绑定归并到另一个（作为别名），聚合其会话。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -290,6 +292,8 @@ private struct ProjectBindingEditor<Store: TokenUsageDashboardProviding>: View {
                 .disabled(!canSave)
             }
 
+            discoverySection
+
             if !store.projects.isEmpty {
                 Divider()
                 Text("已绑定")
@@ -297,34 +301,137 @@ private struct ProjectBindingEditor<Store: TokenUsageDashboardProviding>: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(store.projects) { project in
+                            boundRow(project)
+                        }
+                    }
+                }
+                .frame(maxHeight: 240)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+        .onAppear { Task { await store.discoverProjects() } }
+    }
+
+    // MARK: - Discovery
+
+    @ViewBuilder
+    private var discoverySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("发现项目")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Button {
+                    Task { await store.discoverProjects() }
+                } label: {
+                    if store.isDiscoveringProjects {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("扫描未绑定项目", systemImage: "magnifyingglass")
+                    }
+                }
+            }
+            if !store.discoveredProjects.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(store.discoveredProjects) { candidate in
                             HStack(spacing: 8) {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(project.name)
+                                    Text(candidate.suggestedName)
                                         .font(.callout.weight(.medium))
-                                    Text(project.path)
+                                    Text(candidate.path)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
+                                    Text("\(candidate.sessionCount) 会话 · \(candidate.sources.joined(separator: " · "))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
                                 }
                                 Spacer()
-                                Button(role: .destructive) {
-                                    Task { await store.removeProject(name: project.name) }
-                                } label: {
-                                    Image(systemName: "trash")
+                                Button("添加") {
+                                    Task {
+                                        _ = await store.addProject(
+                                            name: candidate.suggestedName,
+                                            path: candidate.path
+                                        )
+                                    }
                                 }
-                                .buttonStyle(.borderless)
-                                .help("删除绑定")
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
                             }
                             .padding(8)
                             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
                         }
                     }
                 }
-                .frame(maxHeight: 200)
+                .frame(maxHeight: 180)
             }
         }
-        .padding(20)
-        .frame(width: 440)
+    }
+
+    // MARK: - Bound rows
+
+    @ViewBuilder
+    private func boundRow(_ project: ProjectBinding) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(project.name)
+                        .font(.callout.weight(.medium))
+                    Text(project.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                if store.projects.count > 1 {
+                    Menu {
+                        ForEach(store.projects.filter { $0.name != project.name }) { other in
+                            Button("合并到「\(other.name)」") {
+                                Task {
+                                    _ = await store.mergeProjects(
+                                        source: project.name,
+                                        target: other.name
+                                    )
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "rectangle.stack.badge.plus")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .help("合并到另一个项目（作为别名）")
+                }
+                Button(role: .destructive) {
+                    Task { await store.removeProject(name: project.name) }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("删除绑定")
+            }
+            if !project.aliases.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(project.aliases, id: \.self) { alias in
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Text(alias)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                }
+                .padding(.leading, 4)
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
     }
 }

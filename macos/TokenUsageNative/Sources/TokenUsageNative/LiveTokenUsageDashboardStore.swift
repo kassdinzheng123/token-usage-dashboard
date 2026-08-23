@@ -18,6 +18,8 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
     @Published private(set) var briefDays: [BriefDayEntry] = []
     @Published private(set) var briefMonths: [BriefMonthEntry] = []
     @Published private(set) var projects: [ProjectBinding] = []
+    @Published private(set) var discoveredProjects: [DiscoveredProject] = []
+    @Published private(set) var isDiscoveringProjects = false
     /// Daily report for the currently focused (project, date) pair.
     @Published private(set) var dailyReport: DailyReport?
     @Published private(set) var isGeneratingDailyReport = false
@@ -283,6 +285,39 @@ final class LiveTokenUsageDashboardStore: TokenUsageDashboardProviding {
             try await serverProcess.ensureRunning()
             _ = try await client.addProject(name: name, path: path)
             projects = try await client.fetchProjects()
+            // A newly bound path is no longer a discovery candidate.
+            discoveredProjects = discoveredProjects.filter { candidate in
+                candidate.path.trimmingCharacters(in: .whitespaces) != path.trimmingCharacters(in: .whitespaces)
+            }
+            dailyReportError = nil
+            return true
+        } catch {
+            dailyReportError = error.localizedDescription
+            return false
+        }
+    }
+
+    func discoverProjects() async {
+        isDiscoveringProjects = true
+        defer { isDiscoveringProjects = false }
+        do {
+            try await serverProcess.ensureRunning()
+            discoveredProjects = try await client.discoverProjects()
+            dailyReportError = nil
+        } catch {
+            discoveredProjects = []
+            dailyReportError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func mergeProjects(source: String, target: String) async -> Bool {
+        do {
+            try await serverProcess.ensureRunning()
+            projects = try await client.mergeProjects(source: source, target: target)
+            if dailyReport?.project == source {
+                dailyReport = nil
+            }
             dailyReportError = nil
             return true
         } catch {

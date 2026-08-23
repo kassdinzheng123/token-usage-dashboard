@@ -199,8 +199,12 @@ fn load_usage_entries(watermark_ms: Option<i64>) -> Result<Vec<UsageEntry>, Stri
         let mut files = Vec::new();
         collect_jsonl_files(&sessions_dir, &mut files)?;
         files.sort();
+        let aggregated_subagent_files = collect_aggregated_subagent_files(&files);
 
         for file in files {
+            if aggregated_subagent_files.contains(&file) {
+                continue;
+            }
             if let Some(watermark) = watermark_ms {
                 if !super::file_modified_after(&file, watermark) {
                     continue;
@@ -218,6 +222,66 @@ fn load_usage_entries(watermark_ms: Option<i64>) -> Result<Vec<UsageEntry>, Stri
 
     entries.sort_by_key(|entry| entry.timestamp.timestamp_millis());
     Ok(entries)
+}
+
+fn collect_aggregated_subagent_files(files: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let available = files.iter().cloned().collect::<BTreeSet<_>>();
+    let mut aggregated = BTreeSet::new();
+    for file_path in files {
+        let Ok(file) = File::open(file_path) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            let Some(results) = value
+                .get("message")
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
+                .filter(|message| {
+                    message.get("toolName").and_then(Value::as_str) == Some("subagent")
+                })
+                .and_then(|message| message.get("details"))
+                .and_then(|details| details.get("results"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for result in results {
+                let Some(usage) = result.get("usage").and_then(Value::as_object) else {
+                    continue;
+                };
+                let total_tokens = ["input", "output", "cacheWrite", "cacheRead"]
+                    .iter()
+                    .map(|key| usage.get(*key).map(to_i64).unwrap_or_default())
+                    .sum::<i64>();
+                let total_cost = usage.get("cost").map(num).unwrap_or_default();
+                if total_tokens <= 0 && total_cost <= 0.0 {
+                    continue;
+                }
+                let Some(session_file) = result
+                    .get("sessionFile")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                else {
+                    continue;
+                };
+                if session_file.is_absolute() && available.contains(&session_file) {
+                    aggregated.insert(session_file);
+                } else if let Some(matched) = available
+                    .iter()
+                    .find(|available_file| available_file.ends_with(&session_file))
+                {
+                    aggregated.insert(matched.clone());
+                }
+            }
+        }
+    }
+    aggregated
 }
 
 pub(crate) fn discover_sessions_dirs() -> Vec<PathBuf> {
@@ -1582,9 +1646,10 @@ mod tests {
         let mut entries = Vec::new();
         let mut seen = BTreeSet::new();
         let mut workflow_runs_by_cwd = BTreeMap::new();
+        let session_file = project_sessions_dir.join("2026-01-02T03-04-05-000Z_session-1.jsonl");
         append_entries_from_file(
             &sessions_dir,
-            &project_sessions_dir.join("2026-01-02T03-04-05-000Z_session-1.jsonl"),
+            &session_file,
             &mut seen,
             &mut entries,
             &mut workflow_runs_by_cwd,
@@ -1789,6 +1854,158 @@ mod tests {
         assert_eq!(daily.len(), 2);
         assert_eq!(daily[0]["totalTokens"], 30);
         assert_eq!(daily[1]["totalTokens"], 70);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_tool_result_is_counted_once_and_its_transcript_is_skipped() {
+        let root = temp_root("pi-nested-subagent");
+        let sessions_dir = root.join("sessions");
+        let project_dir = sessions_dir.join("project-1");
+        let parent_stem = "2026-01-02T03-04-05-000Z_parent-session";
+        let parent = project_dir.join(format!("{parent_stem}.jsonl"));
+        let child = project_dir.join(format!("{parent_stem}/agent-a/run-0/session.jsonl"));
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        fs::write(
+            &parent,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({
+                    "type": "session",
+                    "id": "parent-session",
+                    "timestamp": "2026-01-02T03:04:05Z",
+                    "cwd": root.join("project")
+                }),
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-01-02T03:05:05Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "parent-model",
+                        "usage": { "input": 10, "output": 5 }
+                    }
+                }),
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-01-02T03:06:05Z",
+                    "message": {
+                        "role": "toolResult",
+                        "toolName": "subagent",
+                        "details": {
+                            "results": [{
+                                "agent": "explorer",
+                                "model": "child-model",
+                                "sessionFile": child,
+                                "usage": { "input": 100, "output": 20, "cost": 0.25 }
+                            }]
+                        }
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session",
+                    "id": "child-session",
+                    "timestamp": "2026-01-02T03:05:30Z",
+                    "cwd": root.join("project")
+                }),
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-01-02T03:05:30Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "child-model",
+                        "usage": {
+                            "input": 100,
+                            "output": 20,
+                            "cost": { "total": 0.25 }
+                        }
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        collect_jsonl_files(&sessions_dir, &mut files).unwrap();
+        files.sort();
+        let mut entries = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut workflow_runs_by_cwd = BTreeMap::new();
+        let aggregated_subagent_files = collect_aggregated_subagent_files(&files);
+        for path in &files {
+            if aggregated_subagent_files.contains(path) {
+                continue;
+            }
+            append_entries_from_file(
+                &sessions_dir,
+                path,
+                &mut seen,
+                &mut entries,
+                &mut workflow_runs_by_cwd,
+            )
+            .unwrap();
+        }
+
+        let sessions = entries_to_sessions(&entries);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "parent-session");
+        assert_eq!(sessions[0]["totalTokens"], 135);
+        assert_eq!(
+            sessions[0]["modelsUsed"],
+            json!(["child-model", "parent-model"])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_transcript_is_kept_when_tool_result_has_no_usage() {
+        let root = temp_root("pi-subagent-transcript-fallback");
+        let parent = root.join("parent.jsonl");
+        let child = root.join("parent/agent-a/run-0/session.jsonl");
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        fs::write(
+            &parent,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-01-02T03:06:05Z",
+                    "message": {
+                        "role": "toolResult",
+                        "toolName": "subagent",
+                        "details": { "results": [{ "sessionFile": child }] }
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-01-02T03:05:30Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "child-model",
+                        "usage": { "input": 100, "output": 20 }
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let files = vec![parent, child.clone()];
+        assert!(!collect_aggregated_subagent_files(&files).contains(&child));
 
         let _ = fs::remove_dir_all(root);
     }

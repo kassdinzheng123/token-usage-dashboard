@@ -1,8 +1,5 @@
 use crate::protocol::DailyReport;
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 const DAILY_DIR_ENV: &str = "TOKEN_USAGE_DAILY_DIR";
 const APP_SUPPORT_DIR: &str = "Library/Application Support/Token Usage Dashboard";
@@ -47,6 +44,43 @@ pub fn load_report(project: &str, date: &str) -> Result<Option<DailyReport>, Str
     let report: DailyReport = serde_json::from_str(&text)
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
     Ok(Some(report))
+}
+
+/// Moves cached daily reports from the `source` project directory into the
+/// `target` project directory so a merged binding keeps its history. Reports
+/// that already exist under `target` are left untouched (the merged binding
+/// regenerates them on demand). Used by `projects::merge_projects`.
+pub fn reassign_project_reports(source: &str, target: &str) -> Result<(), String> {
+    super::projects::validate_name(source)?;
+    super::projects::validate_name(target)?;
+    if source == target {
+        return Ok(());
+    }
+    let root = daily_dir()?;
+    let source_dir = root.join(source);
+    if !source_dir.is_dir() {
+        return Ok(());
+    }
+    let target_dir = root.join(target);
+    fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("failed to create {}: {err}", target_dir.display()))?;
+
+    let entries = match fs::read_dir(&source_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("failed to read {}: {err}", source_dir.display())),
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = target_dir.join(entry.file_name());
+        if to.exists() {
+            continue;
+        }
+        fs::rename(&from, &to)
+            .map_err(|err| format!("failed to move {}: {err}", from.display()))?;
+    }
+    let _ = fs::remove_dir(&source_dir);
+    Ok(())
 }
 
 #[cfg(test)]

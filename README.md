@@ -64,10 +64,13 @@ POST /api/sync
 GET /api/today
 GET /api/hourly
 GET /api/today/brief
+GET /api/daily/generate
 POST /api/daily/generate
 GET /api/daily/{project}/{date}
 GET /api/projects
 POST /api/projects
+GET /api/projects/discover
+POST /api/projects/merge
 DELETE /api/projects/{name}
 GET /api/{source}/{view}
 ```
@@ -87,7 +90,25 @@ cargo run --release --manifest-path rust-backend/Cargo.toml -- daily projects re
 cargo run --release --manifest-path rust-backend/Cargo.toml -- daily generate --project token-usage --date 2026-08-05 --api-key "..."
 ```
 
-`daily generate` accepts `--date` (defaults to today), `--force`, `--api-key` (or `TOKEN_USAGE_BRIEF_API_KEY`), `--model-url`, and `--model-id`. Session attribution is path-based: recorded cwd paths match exactly, Claude's encoded directories are decoded, and same-named directories fall back to a leaf-name match reported in the report's `coverage` field.
+`daily projects discover` scans every supported CLI's recorded sessions and
+lists project paths that have not been bound yet, each with the CLIs that
+produced sessions under it and a session count:
+
+```bash
+cargo run --release --manifest-path rust-backend/Cargo.toml -- daily projects discover
+```
+
+A binding can fold another binding into itself as an alias, so sessions from
+several paths (e.g. alternate checkouts or encoded directories) aggregate
+into the same daily report. `merge --source A --target B` moves `A`'s path and
+aliases into `B`'s aliases, removes `A`, and reassigns `A`'s cached reports to
+`B`:
+
+```bash
+cargo run --release --manifest-path rust-backend/Cargo.toml -- daily projects merge --source token-usage-worktree --target token-usage
+```
+
+`daily generate` accepts `--date` (defaults to today), `--force`, `--api-key` (or `TOKEN_USAGE_BRIEF_API_KEY`), `--model-url`, and `--model-id`. Session attribution is path-based: recorded cwd paths match exactly, Claude's encoded directories are decoded, same-named directories fall back to a leaf-name match reported in the report's `coverage` field, and a binding's aliases match at the exact tier so multiple paths aggregate into one report.
 
 ## Run Backend Tests
 

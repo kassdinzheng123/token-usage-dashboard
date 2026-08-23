@@ -405,16 +405,52 @@ struct BriefMonthsResponse: Codable, Hashable {
 
 /// A named binding between a display name and a local project path. The path
 /// is the authoritative identity for daily report aggregation and git lookup.
+/// Aliases are additional paths (e.g. alternate checkouts) whose sessions are
+/// aggregated into the same daily report.
 struct ProjectBinding: Codable, Hashable, Identifiable {
     var name: String
     var path: String
+    var aliases: [String]
     var addedAt: String
 
     var id: String { name }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, path, aliases, addedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        path = try container.decode(String.self, forKey: .path)
+        aliases = try container.decodeIfPresent([String].self, forKey: .aliases) ?? []
+        addedAt = try container.decode(String.self, forKey: .addedAt)
+    }
+
+    init(name: String, path: String, aliases: [String] = [], addedAt: String = "") {
+        self.name = name
+        self.path = path
+        self.aliases = aliases
+        self.addedAt = addedAt
+    }
 }
 
 struct ProjectsResponse: Codable, Hashable {
     var projects: [ProjectBinding]
+}
+
+/// A project path discovered from recorded CLI sessions but not yet bound.
+struct DiscoveredProject: Codable, Hashable, Identifiable {
+    var path: String
+    var suggestedName: String
+    var sources: [String]
+    var sessionCount: Int
+
+    var id: String { path }
+}
+
+struct DiscoveredProjectsResponse: Codable, Hashable {
+    var projects: [DiscoveredProject]
 }
 
 /// One completed work item of a daily report.
@@ -461,6 +497,11 @@ struct DailyGenerateRequest: Encodable {
 struct ProjectUpsertRequest: Encodable {
     var name: String
     var path: String
+}
+
+struct ProjectMergeRequest: Encodable {
+    var source: String
+    var target: String
 }
 
 protocol UsageSummary: Codable, Hashable {

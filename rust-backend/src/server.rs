@@ -4,9 +4,9 @@ use crate::{
     daily,
     ledger::UsageLedger,
     protocol::{
-        BriefGenerateRequest, DailyGenerateRequest, HourlyResponse, HourlyRow, ProjectUpsertRequest,
-        ProjectsResponse, RefreshResponse, Source, TodayModelRow, TodayResponse, TodaySourceRow,
-        View, ALL_TASKS,
+        BriefGenerateRequest, DailyGenerateRequest, DiscoveredProjectsResponse, HourlyResponse,
+        HourlyRow, ProjectMergeRequest, ProjectUpsertRequest, ProjectsResponse, RefreshResponse,
+        Source, TodayModelRow, TodayResponse, TodaySourceRow, View, ALL_TASKS,
     },
     sources, sync,
 };
@@ -166,9 +166,8 @@ fn ingest_source_into_ledger(ledger: &UsageLedger, source: Source) -> Result<(),
     let scan_started_at_ms = now_epoch_millis();
     let watermark_ms = ledger.ingest_watermark(source).unwrap_or(None);
 
-    let sessions =
-        sources::load_source_view_since(&source_name, "sessions", true, watermark_ms)
-            .map_err(|err| err.to_string())?;
+    let sessions = sources::load_source_view_since(&source_name, "sessions", true, watermark_ms)
+        .map_err(|err| err.to_string())?;
     ledger.ingest_live_sessions(source, &sessions)?;
 
     if source == Source::Claude || source == Source::Codex {
@@ -179,9 +178,8 @@ fn ingest_source_into_ledger(ledger: &UsageLedger, source: Source) -> Result<(),
 
     // Message-level rows power hourly aggregation; sources without them emit
     // an empty view and keep session-level hourly attribution.
-    let messages =
-        sources::load_source_view_since(&source_name, "messages", true, watermark_ms)
-            .map_err(|err| err.to_string())?;
+    let messages = sources::load_source_view_since(&source_name, "messages", true, watermark_ms)
+        .map_err(|err| err.to_string())?;
     ledger.ingest_live_messages(source, &messages)?;
 
     ledger.record_ingest_watermark(source, scan_started_at_ms)?;
@@ -589,8 +587,19 @@ pub fn create_app(state: AppState) -> Router {
             "/api/projects",
             get(projects_get_handler).post(projects_post_handler),
         )
-        .route("/api/projects/{name}", axum::routing::delete(projects_delete_handler))
-        .route("/api/daily/generate", axum::routing::post(daily_generate_handler))
+        .route("/api/projects/discover", get(projects_discover_handler))
+        .route(
+            "/api/projects/merge",
+            axum::routing::post(projects_merge_handler),
+        )
+        .route(
+            "/api/projects/{name}",
+            axum::routing::delete(projects_delete_handler),
+        )
+        .route(
+            "/api/daily/generate",
+            axum::routing::post(daily_generate_handler),
+        )
         .route("/api/daily/{project}/{date}", get(daily_get_handler))
         .route("/api/{source}/{view}", get(source_view_handler))
         .layer(CompressionLayer::new())
@@ -772,11 +781,9 @@ async fn today_brief_post_handler(Json(request): Json<BriefGenerateRequest>) -> 
 async fn brief_date_get_handler(Path(date): Path<String>) -> Response {
     match tokio::task::spawn_blocking(move || brief::load_brief_for_date(&date)).await {
         Ok(Ok(Some(brief))) => (StatusCode::OK, Json(brief)).into_response(),
-        Ok(Ok(None)) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "status": "missing" })),
-        )
-            .into_response(),
+        Ok(Ok(None)) => {
+            (StatusCode::NOT_FOUND, Json(json!({ "status": "missing" }))).into_response()
+        }
         Ok(Err(message)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "status": "error", "error": message })),
@@ -881,6 +888,46 @@ async fn projects_delete_handler(Path(name): Path<String>) -> Response {
     }
 }
 
+async fn projects_discover_handler() -> Response {
+    match tokio::task::spawn_blocking(daily::discover_projects).await {
+        Ok(Ok(projects)) => (
+            StatusCode::OK,
+            Json(DiscoveredProjectsResponse { projects }),
+        )
+            .into_response(),
+        Ok(Err(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn projects_merge_handler(Json(request): Json<ProjectMergeRequest>) -> Response {
+    let source = request.source;
+    let target = request.target;
+    match tokio::task::spawn_blocking(move || daily::projects::merge_projects(&source, &target))
+        .await
+    {
+        Ok(Ok(projects)) => (StatusCode::OK, Json(ProjectsResponse { projects })).into_response(),
+        Ok(Err(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": "error", "error": message })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn daily_generate_handler(Json(request): Json<DailyGenerateRequest>) -> Response {
     match tokio::task::spawn_blocking(move || daily::generate_daily_report(request)).await {
         Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
@@ -900,11 +947,9 @@ async fn daily_generate_handler(Json(request): Json<DailyGenerateRequest>) -> Re
 async fn daily_get_handler(Path((project, date)): Path<(String, String)>) -> Response {
     match tokio::task::spawn_blocking(move || daily::store::load_report(&project, &date)).await {
         Ok(Ok(Some(report))) => (StatusCode::OK, Json(report)).into_response(),
-        Ok(Ok(None)) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "status": "missing" })),
-        )
-            .into_response(),
+        Ok(Ok(None)) => {
+            (StatusCode::NOT_FOUND, Json(json!({ "status": "missing" }))).into_response()
+        }
         Ok(Err(message)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "status": "error", "error": message })),
@@ -2294,7 +2339,11 @@ mod tests {
         // refresh=false must serve ledger rows without requiring source files.
         let daily_after = provider_after.load(View::Daily, false).await.unwrap();
 
-        assert_eq!(daily_after.len(), 2, "ledger should persist after source removal");
+        assert_eq!(
+            daily_after.len(),
+            2,
+            "ledger should persist after source removal"
+        );
         assert_eq!(daily_after[0]["date"], "2026-06-01");
         assert_eq!(daily_after[0]["totalTokens"], 170);
         assert_eq!(daily_after[1]["date"], "2026-06-02");

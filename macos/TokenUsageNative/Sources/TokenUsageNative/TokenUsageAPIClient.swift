@@ -159,6 +159,31 @@ actor TokenUsageAPIClient {
         return result.projects
     }
 
+    /// Scans recorded CLI sessions for project paths that have not been bound.
+    func discoverProjects() async throws -> [DiscoveredProject] {
+        let response: DiscoveredProjectsResponse = try await fetch("projects/discover", queryItems: [])
+        return response.projects
+    }
+
+    /// Folds the `source` binding into `target` and returns the remaining list.
+    func mergeProjects(source: String, target: String) async throws -> [ProjectBinding] {
+        let url = try makeURL(path: "projects/merge", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(ProjectMergeRequest(source: source, target: target))
+
+        let (data, response) = try await session.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode),
+           let payload = try? decoder.decode(GitSyncErrorResponse.self, from: data) {
+            throw ClientError.server(payload.error)
+        }
+        try validate(response: response)
+        let result: ProjectsResponse = try decoder.decode(ProjectsResponse.self, from: data)
+        return result.projects
+    }
+
     func generateDailyReport(
         project: String,
         date: String?,

@@ -298,6 +298,9 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     var briefMonths: [BriefMonthEntry] { get }
     /// Bound projects for daily report generation.
     var projects: [ProjectBinding] { get }
+    /// Projects discovered from recorded CLI sessions but not yet bound.
+    var discoveredProjects: [DiscoveredProject] { get }
+    var isDiscoveringProjects: Bool { get }
     /// Daily report for the currently focused (project, date) pair.
     var dailyReport: DailyReport? { get }
     var isGeneratingDailyReport: Bool { get }
@@ -315,6 +318,9 @@ protocol TokenUsageDashboardProviding: ObservableObject {
     func loadBriefMonths() async
     func generateBrief(for date: String, mode: BriefRegenerateMode) async
     func loadProjects() async
+    func discoverProjects() async
+    @discardableResult
+    func mergeProjects(source: String, target: String) async -> Bool
     @discardableResult
     func addProject(name: String, path: String) async -> Bool
     func removeProject(name: String) async
@@ -6095,6 +6101,8 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     @Published private(set) var briefDays: [BriefDayEntry] = []
     @Published private(set) var briefMonths: [BriefMonthEntry] = []
     @Published private(set) var projects: [ProjectBinding] = []
+    @Published private(set) var discoveredProjects: [DiscoveredProject] = []
+    @Published private(set) var isDiscoveringProjects = false
     @Published private(set) var dailyReport: DailyReport?
     @Published private(set) var isGeneratingDailyReport = false
     @Published private(set) var dailyReportError: String?
@@ -6201,6 +6209,11 @@ final class TokenUsageDashboardMockStore: TokenUsageDashboardProviding {
     func generateBrief(for date: String, mode: BriefRegenerateMode) async {}
 
     func loadProjects() async {}
+
+    func discoverProjects() async {}
+
+    @discardableResult
+    func mergeProjects(source: String, target: String) async -> Bool { false }
 
     @discardableResult
     func addProject(name: String, path: String) async -> Bool { false }

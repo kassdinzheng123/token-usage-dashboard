@@ -177,7 +177,9 @@ async fn handle_daily(args: Vec<String>) -> Result<(), Box<dyn Error>> {
 
 fn handle_daily_projects(args: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(action) = args.first().map(String::as_str) else {
-        return Err(invalid_input("daily projects requires list, add, or remove").into());
+        return Err(
+            invalid_input("daily projects requires list, add, remove, discover, or merge").into(),
+        );
     };
     match action {
         "list" => {
@@ -192,20 +194,41 @@ fn handle_daily_projects(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         "add" => {
             let (name, path) = parse_name_path(&args[1..])?;
-            let binding =
-                daily::projects::upsert_project(&name, &path).map_err(invalid_input)?;
+            let binding = daily::projects::upsert_project(&name, &path).map_err(invalid_input)?;
             println!("added: {} -> {}", binding.name, binding.path);
+        }
+        "discover" => {
+            let projects = daily::discover_projects().map_err(invalid_input)?;
+            if projects.is_empty() {
+                println!("no unbound projects discovered");
+                return Ok(());
+            }
+            for project in projects {
+                println!(
+                    "{}\t{} sessions\t{}",
+                    project.path,
+                    project.session_count,
+                    project.sources.join(",")
+                );
+            }
+        }
+        "merge" => {
+            let source = flag_value(&args[1..], "--source")?;
+            let target = flag_value(&args[1..], "--target")?;
+            let remaining =
+                daily::projects::merge_projects(&source, &target).map_err(invalid_input)?;
+            println!("merged: {source} -> {target}");
+            println!("remaining: {}", remaining.len());
         }
         "remove" => {
             let name = flag_value(&args[1..], "--name")?;
-            let remaining =
-                daily::projects::remove_project(&name).map_err(invalid_input)?;
+            let remaining = daily::projects::remove_project(&name).map_err(invalid_input)?;
             println!("removed: {name}");
             println!("remaining: {}", remaining.len());
         }
         _ => {
             return Err(invalid_input(format!(
-                "unknown daily projects action: {action}; expected list, add, or remove"
+                "unknown daily projects action: {action}; expected list, add, remove, discover, or merge"
             ))
             .into());
         }
@@ -268,14 +291,17 @@ async fn handle_daily_generate(args: &[String]) -> Result<(), Box<dyn Error>> {
                 index += 2;
             }
             "--project" | "--date" | "--force" | "--api-key" | "--model-url" | "--model-id" => {
-                return Err(invalid_input(format!("duplicate daily option: {}", args[index])).into());
+                return Err(
+                    invalid_input(format!("duplicate daily option: {}", args[index])).into(),
+                );
             }
             other => {
                 return Err(invalid_input(format!("unknown daily option: {other}")).into());
             }
         }
     }
-    let project = project.ok_or_else(|| invalid_input("daily generate requires --project <name>"))?;
+    let project =
+        project.ok_or_else(|| invalid_input("daily generate requires --project <name>"))?;
     let api_key = api_key.or_else(|| {
         env::var("TOKEN_USAGE_BRIEF_API_KEY")
             .ok()
